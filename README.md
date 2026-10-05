@@ -5,19 +5,49 @@ Grok / Claude アプリから呼べる **MCP ゲートウェイ**（Rust / Axum�
 参考実装は pascal 上の `~/Github/mcp-test`（Python / Starlette）。
 公開は Cloudflare Tunnel で `https://mcp.duxca.com` に載せる。バックエンドは `McpBackend` で差し替え可能。
 
+## 起動モード（唯一のサポート）
+
+**シェルからフォアグラウンドで起動し、Ctrl+C で全部止める。** Daemon / systemd / nohup はサポートしない。
+
+- オフ単位はゲートウェイ全体（サービス単位の常駐オンオフはしない）
+- Cloudflare Tunnel も同じセッションで起動する
+- 止める = CLI を終了する（MCP 子プロセスも `kill_on_drop` で一緒に落ちる）
+
+```sh
+cp .env.example .env   # または .secrets/runtime.env を用意
+./scripts/run.sh
+# Ctrl+C → gateway + tunnel + MCP children を停止
+```
+
+オプション:
+
+| 変数 / 使い方 | 意味 |
+|---------------|------|
+| `MCP_BIN=./target/debug/mcp-duxca-com` | ビルド済みバイナリを直接起動（未設定時は `cargo run`） |
+| `MCP_USE_RELEASE=1` | `target/release/mcp-duxca-com` があればそれを使う |
+| `CLOUDFLARED_TOKEN` / `TUNNEL_TOKEN` | Tunnel トークン（環境変数。値はログに出さない） |
+| `CLOUDFLARED_TOKEN_FILE` | トークンファイルパス。未設定時の探索順: `/home/box/.cloudflared/mcp-duxca-com.token` → `.secrets/tunnel.token` |
+
+トークンが無い／`cloudflared` が無い場合は **ゲートウェイのみ** で起動し（ローカル確認・テスト向け）、警告を出す。
+
+```sh
+cargo test
+cargo run   # Tunnel 無しのゲートウェイ単体でも可（PUBLIC_URL 必須）
+```
+
 ## アーキテクチャ
 
 ```
 [Grok / Claude クラウド]
         │ HTTPS
         ▼
- Cloudflare Tunnel  ──►  mcp.duxca.com ゲートウェイ (Axum)
+ Cloudflare Tunnel  ──►  mcp.duxca.com ゲートウェイ (Axum)   ← 同じシェル／Ctrl+C で両方停止
                               │
                               ├─ OAuth 認可サーバ（動的登録 / CIMD / PKCE）※オリジン共通 1 本
                               ├─ GitHub OAuth で本人確認（数値 id allowlist）
                               ├─ 自前 Bearer で POST /{service}/{version} を保護
                               └─ 設定駆動の複数 McpBackend
-                                    ├─ StdioMcpBackend（サービスごと）
+                                    ├─ StdioMcpBackend（サービスごと・親終了で kill_on_drop）
                                     └─ （将来）HTTP MCP など差し替え
 ```
 
@@ -77,16 +107,9 @@ MCP_ADB_V1_COMMAND=
 - サービス名: `[a-z0-9]` またはハイフン付き。バージョン: `v` + 数字（`v1`, `v2`, `v10` …）
 - `MCP_SERVICES` が空のときは `default/v1` を 1 本立て、`CLAUDE_MCP_COMMAND` / `CLAUDE_CWD` を使う
 - 認可時の `resource`（RFC 8707）はサービスが複数なら必須。1 本だけのときは省略可
+- サービスをオフにするには **CLI（`./scripts/run.sh`）を止める**。常駐プロセスは持たない。
 
-## ローカル起動
-
-```sh
-cp .env.example .env
-cargo run
-cargo test
-```
-
-確認:
+## ローカル確認
 
 ```sh
 curl -s http://127.0.0.1:8000/health
@@ -110,6 +133,8 @@ curl -si -X POST http://127.0.0.1:8000/default/v1 \
 | `MCP_<NAME>_<VER>_CWD` | サービスごとの cwd（省略時は下記） |
 | `CLAUDE_MCP_COMMAND` | `MCP_SERVICES` 未設定時のフォールバック（既定 `claude mcp serve`） |
 | `CLAUDE_CWD` | 上記フォールバック / 個別 CWD 未設定時の cwd（省略時 `$HOME`） |
+| `CLOUDFLARED_TOKEN_FILE` | Tunnel トークンファイル（`scripts/run.sh`） |
+| `MCP_BIN` | ゲートウェイ実行ファイル（`scripts/run.sh`） |
 
 ## これから
 
@@ -126,3 +151,4 @@ curl -si -X POST http://127.0.0.1:8000/default/v1 \
 - 旧パス `/github/callback` と `/mcp/v3` は廃止。
 - CIMD 取得は公開 IP だけに接続する。ローカル DNS が合成アドレスを返すときは Cloudflare DoH にフォールバックする。
 - ループバック redirect（`http://localhost/callback`）は RFC 8252 どおりポート違いを許す。
+- 起動は `./scripts/run.sh` のみサポート。常時起動前提の運用はしない。

@@ -86,7 +86,19 @@ async fn main() -> anyhow::Result<()> {
 
     let addr = format!("0.0.0.0:{}", config.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!("listening on {addr}");
-    axum::serve(listener, app).await?;
+    tracing::info!("listening on {addr} (Ctrl+C for graceful shutdown)");
+    // StdioMcpBackend uses kill_on_drop(true); dropping AppState on shutdown
+    // tears down MCP child processes with the gateway.
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    tracing::info!("gateway stopped");
     Ok(())
+}
+
+async fn shutdown_signal() {
+    match tokio::signal::ctrl_c().await {
+        Ok(()) => tracing::info!("received Ctrl+C; shutting down"),
+        Err(err) => tracing::error!(%err, "failed to install Ctrl+C handler"),
+    }
 }
