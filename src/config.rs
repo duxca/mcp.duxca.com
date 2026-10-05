@@ -79,8 +79,4 @@ impl Config {
         }
         Ok(value)
     }
-
-    pub fn github_configured(&self) -> bool {
-        !self.github_client_id.is_empty() && !self.github_client_secret.is_empty()
-    }
 }

@@ -2,12 +2,15 @@ mod auth;
 mod backend;
 mod config;
 mod routes;
+#[cfg(test)]
+mod tests;
 
+use auth::{GitHubLogin, GitHubOAuth, HttpClientMetadataFetcher, OAuthServer};
 use backend::StdioMcpBackend;
 use config::Config;
 use routes::{router, AppState};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
@@ -21,15 +24,29 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::from_env()?;
     let public_url = config.normalize_public_url()?;
-    if !config.github_configured() {
+    let github = Arc::new(GitHubOAuth::new(
+        config.github_client_id.clone(),
+        config.github_client_secret.clone(),
+        format!("{public_url}{}", auth::GITHUB_CALLBACK_PATH),
+    ));
+    if !github.configured() {
         tracing::warn!("GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET 未設定。OAuth は動かない");
     }
+
+    let allowed_ids = Arc::new(RwLock::new(config.allowed_ids()));
     tracing::info!(
         %public_url,
         port = config.port,
-        allowed = ?config.allowed_ids(),
+        allowed = ?allowed_ids.read().ok().as_deref(),
         "starting mcp.duxca.com gateway"
     );
+
+    let oauth = Arc::new(OAuthServer::new(
+        &public_url,
+        allowed_ids,
+        github,
+        Arc::new(HttpClientMetadataFetcher),
+    ));
 
     let cwd = config
         .claude_cwd
@@ -43,9 +60,9 @@ async fn main() -> anyhow::Result<()> {
     let backend = StdioMcpBackend::new(config.claude_command_argv(), cwd);
 
     let state = AppState {
-        config: Arc::new(config.clone()),
         public_url,
         backend,
+        oauth,
     };
 
     let app = router(state)
