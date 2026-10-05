@@ -2,7 +2,8 @@
 //!
 //! pascal の `~/Github/mcp-test/auth.py`（MCP Python SDK の OAuth サーバ）の移植。
 //! - 動的クライアント登録（RFC 7591）と Client ID Metadata Document（CIMD）
-//! - /authorize → GitHub ログイン → /github/callback → 認可コード → /token
+//! - /authorize → GitHub ログイン → /oauth/callback/github → 認可コード → /token
+//! - GitHub クライアント側は river.duxca.com と同じ oauth2 クレート + `/oauth/callback/github`
 //! - 許可は GitHub の数値 id（login は改名で再利用されうるので使わない）
 //! - トークンはメモリだけ。プロセスを再起動すると消える（mcp-test と同じ）
 
@@ -20,11 +21,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 
 pub const MCP_PATH: &str = "/mcp/v3";
-pub const GITHUB_CALLBACK_PATH: &str = "/github/callback";
-pub const GITHUB_SETUP_PATH: &str = "/github/setup";
+/// river.duxca.com と同じ GitHub OAuth コールバックパス。
+pub const REDIRECT_PATH: &str = "/oauth/callback/github";
+/// GitHub OAuth App 未設定時の案内。
+pub const GITHUB_SETUP_PATH: &str = "/oauth/setup/github";
 pub const AUTHORIZATION_PATH: &str = "/authorize";
 pub const TOKEN_PATH: &str = "/token";
 pub const REGISTRATION_PATH: &str = "/register";
+
+pub const GITHUB_AUTH_URL: &str = "https://github.com/login/oauth/authorize";
+pub const GITHUB_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
+pub const GITHUB_USER_URL: &str = "https://api.github.com/user";
 
 pub const ACCESS_TTL: i64 = 60 * 60;
 pub const REFRESH_TTL: i64 = 14 * 24 * 60 * 60;
@@ -135,15 +142,15 @@ pub trait GitHubLogin: Send + Sync {
 }
 
 pub struct GitHubOAuth {
-    client_id: String,
-    client_secret: String,
-    redirect_uri: String,
+    client_id: oauth2::ClientId,
+    client_secret: oauth2::ClientSecret,
+    redirect_uri: oauth2::RedirectUrl,
     http: reqwest::Client,
 }
 
 impl std::fmt::Debug for GitHubOAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // client_secret はログに出さない。
+        // client_secret はログに出さない（oauth2::ClientSecret も redacted）。
         f.debug_struct("GitHubOAuth")
             .field("client_id", &self.client_id)
             .field("redirect_uri", &self.redirect_uri)
@@ -156,83 +163,89 @@ impl GitHubOAuth {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .user_agent(USER_AGENT)
+            // oauth2 クレート推奨: トークン交換でリダイレクトを追わない（SSRF 対策）。
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("reqwest client");
         Self {
-            client_id,
-            client_secret,
-            redirect_uri,
+            client_id: oauth2::ClientId::new(client_id),
+            client_secret: oauth2::ClientSecret::new(client_secret),
+            redirect_uri: oauth2::RedirectUrl::new(redirect_uri).expect("github redirect uri"),
             http,
         }
+    }
+
+    /// river / webrtc と同じ BasicClient 組み立て。
+    fn basic_client(
+        &self,
+    ) -> oauth2::basic::BasicClient<
+        oauth2::EndpointSet,
+        oauth2::EndpointNotSet,
+        oauth2::EndpointNotSet,
+        oauth2::EndpointNotSet,
+        oauth2::EndpointSet,
+    > {
+        oauth2::basic::BasicClient::new(self.client_id.clone())
+            .set_client_secret(self.client_secret.clone())
+            .set_auth_uri(oauth2::AuthUrl::new(GITHUB_AUTH_URL.to_string()).unwrap())
+            .set_token_uri(oauth2::TokenUrl::new(GITHUB_TOKEN_URL.to_string()).unwrap())
+            .set_redirect_uri(self.redirect_uri.clone())
     }
 }
 
 #[async_trait]
 impl GitHubLogin for GitHubOAuth {
     fn configured(&self) -> bool {
-        !self.client_id.is_empty() && !self.client_secret.is_empty()
+        !self.client_id.is_empty() && !self.client_secret.secret().is_empty()
     }
 
     fn redirect_uri(&self) -> &str {
-        &self.redirect_uri
+        self.redirect_uri.as_str()
     }
 
     fn authorization_url(&self, state: &str) -> String {
-        let mut url = Url::parse("https://github.com/login/oauth/authorize").expect("static url");
-        url.query_pairs_mut()
-            .append_pair("client_id", &self.client_id)
-            .append_pair("redirect_uri", &self.redirect_uri)
-            .append_pair("scope", "read:user")
-            .append_pair("state", state)
-            .append_pair("allow_signup", "false");
+        // MCP AS 側で発行した pending state をそのまま GitHub の state に載せる。
+        let state = state.to_string();
+        let (url, _) = self
+            .basic_client()
+            .authorize_url(|| oauth2::CsrfToken::new(state))
+            .add_scope(oauth2::Scope::new("read:user".to_string()))
+            .add_extra_param("allow_signup", "false")
+            .url();
         url.to_string()
     }
 
     async fn login_for_code(&self, code: &str) -> Result<(String, String), GitHubLoginError> {
-        let lookup = |e: reqwest::Error| {
-            tracing::info!("github account lookup failed: {}", e.without_url());
-            GitHubLoginError("lookup".into())
-        };
-        let token_response = self
-            .http
-            .post("https://github.com/login/oauth/access_token")
-            .header("Accept", "application/json")
-            .form(&[
-                ("client_id", self.client_id.as_str()),
-                ("client_secret", self.client_secret.as_str()),
-                ("code", code),
-                ("redirect_uri", self.redirect_uri.as_str()),
-            ])
-            .send()
+        use oauth2::TokenResponse;
+
+        let token_res = self
+            .basic_client()
+            .exchange_code(oauth2::AuthorizationCode::new(code.to_string()))
+            .request_async(&self.http)
             .await
-            .map_err(lookup)?;
-        if token_response.status() != reqwest::StatusCode::OK {
-            return Err(GitHubLoginError(token_response.status().to_string()));
-        }
-        let body: Value = token_response.json().await.map_err(lookup)?;
-        let Some(access_token) = body
-            .get("access_token")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-        else {
-            tracing::info!(
-                "github token error {}",
-                body.get("error").and_then(|v| v.as_str()).unwrap_or("-")
-            );
-            return Err(GitHubLoginError("token".into()));
-        };
+            .map_err(|e| {
+                tracing::info!("github token exchange failed: {e}");
+                GitHubLoginError("token".into())
+            })?;
+
         let user_response = self
             .http
-            .get("https://api.github.com/user")
-            .bearer_auth(access_token)
+            .get(GITHUB_USER_URL)
+            .bearer_auth(token_res.access_token().secret())
             .header("Accept", "application/vnd.github+json")
             .send()
             .await
-            .map_err(lookup)?;
+            .map_err(|e| {
+                tracing::info!("github account lookup failed: {}", e.without_url());
+                GitHubLoginError("lookup".into())
+            })?;
         if user_response.status() != reqwest::StatusCode::OK {
             return Err(GitHubLoginError(user_response.status().to_string()));
         }
-        let user: Value = user_response.json().await.map_err(lookup)?;
+        let user: Value = user_response.json().await.map_err(|e| {
+            tracing::info!("github account lookup failed: {}", e.without_url());
+            GitHubLoginError("lookup".into())
+        })?;
         // id は改名で変わらない。正の整数だけ受ける。
         let user_id = user
             .get("id")
@@ -551,14 +564,21 @@ pub fn client_from_registration(body: &Value) -> Result<ClientRecord, String> {
     }
     let redirect_uris = normalized_uris(redirect_uris, "redirect_uris")?;
 
-    let method = optional_string(obj.get("token_endpoint_auth_method"), "token_endpoint_auth_method")?
-        .unwrap_or_else(|| "client_secret_post".into());
+    let method = optional_string(
+        obj.get("token_endpoint_auth_method"),
+        "token_endpoint_auth_method",
+    )?
+    .unwrap_or_else(|| "client_secret_post".into());
     match method.as_str() {
         "none" | "client_secret_post" | "client_secret_basic" => {}
         "private_key_jwt" => {
             return Err("token_endpoint_auth_method 'private_key_jwt' is not supported".into())
         }
-        other => return Err(format!("token_endpoint_auth_method: '{other}' is not supported")),
+        other => {
+            return Err(format!(
+                "token_endpoint_auth_method: '{other}' is not supported"
+            ))
+        }
     }
     let grant_types = string_list(obj.get("grant_types"), "grant_types")?
         .unwrap_or_else(|| vec!["authorization_code".into(), "refresh_token".into()]);
@@ -571,8 +591,8 @@ pub fn client_from_registration(body: &Value) -> Result<ClientRecord, String> {
              the identity-assertion grant requires a pre-registered client"
         ));
     }
-    let response_types =
-        string_list(obj.get("response_types"), "response_types")?.unwrap_or_else(|| vec!["code".into()]);
+    let response_types = string_list(obj.get("response_types"), "response_types")?
+        .unwrap_or_else(|| vec!["code".into()]);
     if !response_types.iter().any(|r| r == "code") {
         return Err("response_types must include 'code' for authorization_code grant".into());
     }
@@ -588,7 +608,13 @@ pub fn client_from_registration(body: &Value) -> Result<ClientRecord, String> {
             extra.insert(key.into(), Value::String(s));
         }
     }
-    for key in ["client_uri", "logo_uri", "tos_uri", "policy_uri", "jwks_uri"] {
+    for key in [
+        "client_uri",
+        "logo_uri",
+        "tos_uri",
+        "policy_uri",
+        "jwks_uri",
+    ] {
         if let Some(s) = optional_string(obj.get(key), key)?.filter(|s| !s.is_empty()) {
             let ok = Url::parse(&s)
                 .map(|u| u.scheme() == "http" || u.scheme() == "https")
@@ -663,7 +689,10 @@ pub fn client_from_cimd(url: &str, document: &Value) -> Option<ClientRecord> {
         grant_types,
         response_types,
         scope: obj.get("scope").and_then(Value::as_str).map(str::to_string),
-        client_name: obj.get("client_name").and_then(Value::as_str).map(str::to_string),
+        client_name: obj
+            .get("client_name")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         application_type: None,
         extra: Map::new(),
     })
@@ -811,7 +840,10 @@ impl OAuthServer {
     }
 
     pub fn resource_metadata_url(&self) -> String {
-        format!("{}/.well-known/oauth-protected-resource{MCP_PATH}", self.issuer)
+        format!(
+            "{}/.well-known/oauth-protected-resource{MCP_PATH}",
+            self.issuer
+        )
     }
 
     fn store(&self) -> std::sync::MutexGuard<'_, Store> {
@@ -950,7 +982,10 @@ impl OAuthServer {
     ) -> CallbackOutcome {
         let pending = state.and_then(|s| self.store().pending.remove(s));
         let Some(pending) = pending.filter(|p| p.expires_at >= now()) else {
-            return CallbackOutcome::Text(400, "認可の手続きが見つからない。\n接続をやり直す。\n".into());
+            return CallbackOutcome::Text(
+                400,
+                "認可の手続きが見つからない。\n接続をやり直す。\n".into(),
+            );
         };
         let code = match (error, code) {
             (None, Some(code)) if !code.is_empty() => code,
@@ -974,7 +1009,9 @@ impl OAuthServer {
             tracing::info!("github login denied {login} (id {user_id})");
             return CallbackOutcome::Text(
                 403,
-                format!("この GitHub アカウントは許可されていない。\nlogin: {login}\nid: {user_id}\n"),
+                format!(
+                    "この GitHub アカウントは許可されていない。\nlogin: {login}\nid: {user_id}\n"
+                ),
             );
         }
         let resource = match self.bound_resource(pending.params.resource.as_deref()) {
@@ -994,7 +1031,9 @@ impl OAuthServer {
                     expires_at: now + CODE_TTL,
                     code_challenge: pending.params.code_challenge.clone(),
                     redirect_uri: pending.params.redirect_uri.clone(),
-                    redirect_uri_provided_explicitly: pending.params.redirect_uri_provided_explicitly,
+                    redirect_uri_provided_explicitly: pending
+                        .params
+                        .redirect_uri_provided_explicitly,
                     resource,
                     subject: user_id.clone(),
                 },
@@ -1011,7 +1050,11 @@ impl OAuthServer {
     }
 
     /// クライアントが一致すれば取り出す（一度きり）。
-    pub fn load_authorization_code(&self, client: &ClientRecord, code: &str) -> Option<AuthorizationCode> {
+    pub fn load_authorization_code(
+        &self,
+        client: &ClientRecord,
+        code: &str,
+    ) -> Option<AuthorizationCode> {
         let mut store = self.store();
         match store.codes.get(code) {
             Some(found) if found.client_id == client.client_id => store.codes.remove(code),
@@ -1025,9 +1068,17 @@ impl OAuthServer {
         code: &AuthorizationCode,
     ) -> Result<OAuthToken, TokenError> {
         if code.subject.is_empty() || !self.allows(&code.subject) {
-            return Err(TokenError::new("invalid_grant", "github login is not allowed"));
+            return Err(TokenError::new(
+                "invalid_grant",
+                "github login is not allowed",
+            ));
         }
-        Ok(self.issue(&client.client_id, code.scopes.clone(), &code.subject, &code.resource))
+        Ok(self.issue(
+            &client.client_id,
+            code.scopes.clone(),
+            &code.subject,
+            &code.resource,
+        ))
     }
 
     pub fn load_refresh_token(&self, client: &ClientRecord, token: &str) -> Option<IssuedToken> {
@@ -1048,7 +1099,10 @@ impl OAuthServer {
             let mut store = self.store();
             let current = store.refresh_tokens.remove(refresh_token);
             let Some(current) = current.filter(|c| c.client_id == client.client_id) else {
-                return Err(TokenError::new("invalid_grant", "refresh token does not exist"));
+                return Err(TokenError::new(
+                    "invalid_grant",
+                    "refresh token does not exist",
+                ));
             };
             if let Some(old_access) = store.refresh_to_access.remove(refresh_token) {
                 store.access_tokens.remove(&old_access);
@@ -1056,9 +1110,17 @@ impl OAuthServer {
             current
         };
         if current.subject.is_empty() || !self.allows(&current.subject) {
-            return Err(TokenError::new("invalid_grant", "github login is not allowed"));
+            return Err(TokenError::new(
+                "invalid_grant",
+                "github login is not allowed",
+            ));
         }
-        Ok(self.issue(&client.client_id, scopes, &current.subject, &current.resource))
+        Ok(self.issue(
+            &client.client_id,
+            scopes,
+            &current.subject,
+            &current.resource,
+        ))
     }
 
     /// Bearer を照合する。期限・許可 id・resource（RFC 8707）を見る。
@@ -1077,7 +1139,8 @@ impl OAuthServer {
         }
         let same_resource = normalize_url(&found.resource)
             .map(|r| r.trim_end_matches('/').to_ascii_lowercase())
-            == normalize_url(&self.resource_url).map(|r| r.trim_end_matches('/').to_ascii_lowercase());
+            == normalize_url(&self.resource_url)
+                .map(|r| r.trim_end_matches('/').to_ascii_lowercase());
         if !same_resource {
             tracing::warn!("bearer token resource is not this server");
             return None;
@@ -1085,7 +1148,13 @@ impl OAuthServer {
         Some(found)
     }
 
-    fn issue(&self, client_id: &str, scopes: Vec<String>, subject: &str, resource: &str) -> OAuthToken {
+    fn issue(
+        &self,
+        client_id: &str,
+        scopes: Vec<String>,
+        subject: &str,
+        resource: &str,
+    ) -> OAuthToken {
         let now = now();
         let access_token = token_urlsafe();
         let refresh_token = token_urlsafe();
@@ -1134,7 +1203,9 @@ impl OAuthServer {
             "client_secret_basic" => {
                 let header = authorization.unwrap_or("");
                 let Some(encoded) = header.strip_prefix("Basic ") else {
-                    return Err("Missing or invalid Basic authentication in Authorization header".into());
+                    return Err(
+                        "Missing or invalid Basic authentication in Authorization header".into(),
+                    );
                 };
                 let decoded = STANDARD
                     .decode(encoded.trim())
@@ -1156,7 +1227,10 @@ impl OAuthServer {
             other => return Err(format!("Unsupported auth method: {other}")),
         };
         if client.token_endpoint_auth_method != "none" && client.client_secret.is_none() {
-            return Err("Client is registered for secret-based authentication but has no stored secret".into());
+            return Err(
+                "Client is registered for secret-based authentication but has no stored secret"
+                    .into(),
+            );
         }
         if let Some(stored) = &client.client_secret {
             let Some(given) = request_secret.filter(|s| !s.is_empty()) else {

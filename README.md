@@ -36,15 +36,15 @@ Grok / Claude アプリから呼べる **MCP ゲートウェイ**（Rust / Axum�
 | POST | `/register` | 動的クライアント登録（RFC 7591） |
 | GET/POST | `/authorize` | 認可（→ GitHub） |
 | POST | `/token` | 認可コード / refresh → bearer |
-| GET | `/github/callback` | GitHub OAuth コールバック |
-| GET | `/github/setup` | GitHub App 未設定時の案内（503） |
+| GET | `/oauth/callback/github` | GitHub OAuth コールバック（river と同じ） |
+| GET | `/oauth/setup/github` | GitHub OAuth App 未設定時の案内（503） |
 | POST | `/mcp/v3` | MCP JSON-RPC（有効な Bearer 必須） |
 
 ## GitHub OAuth App の設定
 
-1. [GitHub → Settings → Developer settings → OAuth Apps](https://github.com/settings/developers) で新規作成
-2. **Authorization callback URL**: `https://mcp.duxca.com/github/callback`
-3. Client ID / Client Secret を環境変数へ（リポやチャットに書かない）
+1. **新規は作らない**。pascal の `~/Github/mcp-test` が使っている GitHub OAuth App を流用する
+2. その App の **Authorization callback URL** に `https://mcp.duxca.com/oauth/callback/github` を追加（または差し替え）
+3. Client ID / Client Secret は mcp-test 側の env（mise 等）からコピーして環境変数へ（リポやチャットに書かない）
 
 ```sh
 PUBLIC_URL=https://mcp.duxca.com
@@ -95,5 +95,8 @@ curl -si -X POST http://127.0.0.1:8000/mcp/v3 \
 ## 開発メモ
 
 - webrtc.duxca.com / river.duxca.com と同じく Axum 0.8 + envy + tracing。
+- GitHub 側の authorize URL 生成とコード交換は river と同じ `oauth2` クレート（`BasicClient`）。コールバックも river と同じ `/oauth/callback/github`。
+- MCP 側の認可サーバ（`/authorize` `/token` `/register` well-known）は自前実装のまま。GitHub の `state` には MCP 側の pending state をそのまま載せる。
+- 旧パス `/github/callback` は廃止。GitHub OAuth App の callback URL を差し替えること。
 - CIMD 取得は公開 IP だけに接続する。ローカル DNS が合成アドレスを返すときは Cloudflare DoH にフォールバックする。
 - ループバック redirect（`http://localhost/callback`）は RFC 8252 どおりポート違いを許す。

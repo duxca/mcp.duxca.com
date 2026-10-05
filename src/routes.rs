@@ -2,8 +2,8 @@
 
 use crate::auth::{
     construct_redirect_uri, normalize_url, pkce_s256, AuthorizationParams, CallbackOutcome,
-    ClientRecord, OAuthServer, TokenError, AUTHORIZATION_PATH, GITHUB_CALLBACK_PATH,
-    GITHUB_SETUP_PATH, MCP_PATH, REGISTRATION_PATH, TOKEN_PATH,
+    ClientRecord, OAuthServer, TokenError, AUTHORIZATION_PATH, GITHUB_SETUP_PATH, MCP_PATH,
+    REDIRECT_PATH, REGISTRATION_PATH, TOKEN_PATH,
 };
 use crate::backend::McpBackend;
 use axum::body::Bytes;
@@ -29,14 +29,20 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(index))
         .route("/health", get(health))
         .route(MCP_PATH, post(mcp_v3))
-        .route("/.well-known/oauth-authorization-server", get(oauth_metadata))
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(oauth_metadata),
+        )
         .route(&resource_metadata_path, get(resource_metadata))
         // RFC 9728 のパス挿入を試さないクライアント向けの予備。
-        .route("/.well-known/oauth-protected-resource", get(resource_metadata))
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(resource_metadata),
+        )
         .route(AUTHORIZATION_PATH, get(authorize).post(authorize))
         .route(TOKEN_PATH, post(token))
         .route(REGISTRATION_PATH, post(register))
-        .route(GITHUB_CALLBACK_PATH, get(github_callback))
+        .route(REDIRECT_PATH, get(github_callback))
         .route(GITHUB_SETUP_PATH, get(github_setup))
         .with_state(state)
 }
@@ -126,7 +132,13 @@ struct AuthorizeContext {
 
 impl AuthorizeContext {
     /// RFC 6749 4.1.2.1: client と redirect_uri が確かなら戻し先へ、そうでなければ 400 JSON。
-    async fn error(mut self, oauth: &OAuthServer, error: &str, description: &str, load_client: bool) -> Response {
+    async fn error(
+        mut self,
+        oauth: &OAuthServer,
+        error: &str,
+        description: &str,
+        load_client: bool,
+    ) -> Response {
         if self.client.is_none() && load_client {
             if let Some(id) = self.params.get("client_id").filter(|s| !s.is_empty()) {
                 self.client = oauth.get_client(id).await;
@@ -218,14 +230,20 @@ async fn authorize(
     let client_id = ctx.params["client_id"].clone();
     let Some(client) = oauth.get_client(&client_id).await else {
         let description = format!("Client ID '{client_id}' not found");
-        return ctx.error(oauth, "invalid_request", &description, false).await;
+        return ctx
+            .error(oauth, "invalid_request", &description, false)
+            .await;
     };
     ctx.client = Some(client.clone());
 
     let requested_redirect = ctx.params.get("redirect_uri").cloned();
     let redirect_uri = match client.validate_redirect_uri(requested_redirect.as_deref()) {
         Ok(uri) => uri,
-        Err(description) => return ctx.error(oauth, "invalid_request", &description, true).await,
+        Err(description) => {
+            return ctx
+                .error(oauth, "invalid_request", &description, true)
+                .await
+        }
     };
     ctx.redirect_uri = Some(redirect_uri.clone());
 
@@ -249,7 +267,7 @@ async fn authorize(
 }
 
 // ---------------------------------------------------------------------------
-// /github/callback, /github/setup
+// /oauth/callback/github, /oauth/setup/github
 
 async fn github_callback(State(state): State<AppState>, RawQuery(query): RawQuery) -> Response {
     let q = parse_form(query.unwrap_or_default().as_bytes());
@@ -342,7 +360,12 @@ async fn token(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -
         let token_redirect = match form.get("redirect_uri") {
             Some(raw) => match normalize_url(raw) {
                 Some(uri) => Some(uri),
-                None => return token_error("invalid_request", "redirect_uri: Input should be a valid URL"),
+                None => {
+                    return token_error(
+                        "invalid_request",
+                        "redirect_uri: Input should be a valid URL",
+                    )
+                }
             },
             None => None,
         };
@@ -356,7 +379,8 @@ async fn token(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -
         let redirect_ok = if auth_code.redirect_uri_provided_explicitly {
             token_redirect.as_deref() == Some(auth_code.redirect_uri.as_str())
         } else {
-            token_redirect.is_none() || token_redirect.as_deref() == Some(auth_code.redirect_uri.as_str())
+            token_redirect.is_none()
+                || token_redirect.as_deref() == Some(auth_code.redirect_uri.as_str())
         };
         if !redirect_ok {
             return token_error(
@@ -396,7 +420,10 @@ async fn token(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -
             Err(e) => return e.into(),
         }
     };
-    token_response(StatusCode::OK, serde_json::to_value(tokens).unwrap_or_default())
+    token_response(
+        StatusCode::OK,
+        serde_json::to_value(tokens).unwrap_or_default(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -442,7 +469,9 @@ fn unauthorized(oauth: &OAuthServer) -> Response {
     )
         .into_response();
     if let Ok(value) = HeaderValue::from_str(&www) {
-        response.headers_mut().insert(header::WWW_AUTHENTICATE, value);
+        response
+            .headers_mut()
+            .insert(header::WWW_AUTHENTICATE, value);
     }
     response
 }

@@ -100,10 +100,7 @@ impl StdioMcpBackend {
 impl McpBackend for StdioMcpBackend {
     async fn handle(&self, message: Value) -> Option<Value> {
         let id = message.get("id").cloned();
-        let method = message
-            .get("method")
-            .and_then(|m| m.as_str())
-            .unwrap_or("");
+        let method = message.get("method").and_then(|m| m.as_str()).unwrap_or("");
 
         // 通知は応答しない
         if method.starts_with("notifications/") {

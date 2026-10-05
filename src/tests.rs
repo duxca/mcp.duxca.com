@@ -35,7 +35,7 @@ impl GitHubLogin for FakeGitHub {
         self.configured
     }
     fn redirect_uri(&self) -> &str {
-        "https://demo.trycloudflare.com/github/callback"
+        "https://demo.trycloudflare.com/oauth/callback/github"
     }
     fn authorization_url(&self, state: &str) -> String {
         format!("https://github.com/login/oauth/authorize?state={state}")
@@ -125,7 +125,9 @@ async fn send(app: &Router, request: Request<Body>) -> Reply {
     let response = app.clone().oneshot(request).await.unwrap();
     let status = response.status();
     let headers = response.headers().clone();
-    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
     Reply {
         status,
         headers,
@@ -184,7 +186,10 @@ async fn register(app: &Router, method: &str) -> Value {
 }
 
 async fn register_client(app: &Router) -> String {
-    register(app, "none").await["client_id"].as_str().unwrap().to_string()
+    register(app, "none").await["client_id"]
+        .as_str()
+        .unwrap()
+        .to_string()
 }
 
 fn pkce() -> (String, String) {
@@ -209,16 +214,29 @@ fn authorize_path(client_id: &str, challenge: &str, resource: Option<&str>) -> S
 }
 
 async fn github_state(app: &Router, client_id: &str, challenge: &str) -> String {
-    let started = get(app, &authorize_path(client_id, challenge, Some(&resource()))).await;
+    let started = get(
+        app,
+        &authorize_path(client_id, challenge, Some(&resource())),
+    )
+    .await;
     assert_eq!(started.status, StatusCode::FOUND, "{}", started.body);
     let location = started.location();
-    assert!(location.as_str().starts_with("https://github.com/login/oauth/authorize"));
+    assert!(location
+        .as_str()
+        .starts_with("https://github.com/login/oauth/authorize"));
     query(&location)["state"].clone()
 }
 
 async fn authorization_code(app: &Router, client_id: &str, challenge: &str) -> String {
     let state = github_state(app, client_id, challenge).await;
-    let finished = get(app, &format!("/github/callback?{}", encode(&[("code", "ok"), ("state", &state)]))).await;
+    let finished = get(
+        app,
+        &format!(
+            "/oauth/callback/github?{}",
+            encode(&[("code", "ok"), ("state", &state)])
+        ),
+    )
+    .await;
     assert_eq!(finished.status, StatusCode::FOUND, "{}", finished.body);
     let location = finished.location();
     assert!(location.as_str().starts_with(REDIRECT_URI));
@@ -270,7 +288,16 @@ fn cimd_client_id_rejects_local_and_root_urls() {
 #[test]
 fn private_addresses_are_not_global() {
     use crate::auth::is_global_ip;
-    for ip in ["127.0.0.1", "10.0.0.1", "192.168.1.1", "169.254.169.254", "100.64.0.1", "::1", "fd00::1", "::ffff:10.0.0.1"] {
+    for ip in [
+        "127.0.0.1",
+        "10.0.0.1",
+        "192.168.1.1",
+        "169.254.169.254",
+        "100.64.0.1",
+        "::1",
+        "fd00::1",
+        "::ffff:10.0.0.1",
+    ] {
         assert!(!is_global_ip(ip.parse().unwrap()), "{ip}");
     }
     for ip in ["1.1.1.1", "140.82.112.3", "2606:4700::1111"] {
@@ -285,15 +312,31 @@ async fn metadata_advertises_public_clients_and_mcp_requires_a_bearer() {
     assert_eq!(metadata.status, StatusCode::OK);
     let body = metadata.json();
     assert_eq!(body["issuer"], PUBLIC_URL);
-    assert_eq!(body["authorization_endpoint"], format!("{PUBLIC_URL}/authorize"));
+    assert_eq!(
+        body["authorization_endpoint"],
+        format!("{PUBLIC_URL}/authorize")
+    );
     assert_eq!(body["token_endpoint"], format!("{PUBLIC_URL}/token"));
     assert_eq!(body["code_challenge_methods_supported"], json!(["S256"]));
-    assert!(body["grant_types_supported"].as_array().unwrap().contains(&json!("authorization_code")));
-    assert!(body["token_endpoint_auth_methods_supported"].as_array().unwrap().contains(&json!("none")));
+    assert!(body["grant_types_supported"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("authorization_code")));
+    assert!(body["token_endpoint_auth_methods_supported"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("none")));
     assert_eq!(body["client_id_metadata_document_supported"], true);
-    assert_eq!(body["registration_endpoint"], format!("{PUBLIC_URL}/register"));
+    assert_eq!(
+        body["registration_endpoint"],
+        format!("{PUBLIC_URL}/register")
+    );
 
-    let prm = get(&h.app, &format!("/.well-known/oauth-protected-resource{MCP_PATH}")).await;
+    let prm = get(
+        &h.app,
+        &format!("/.well-known/oauth-protected-resource{MCP_PATH}"),
+    )
+    .await;
     assert_eq!(prm.status, StatusCode::OK);
     assert_eq!(prm.json()["resource"], resource());
     assert_eq!(prm.json()["authorization_servers"], json!([PUBLIC_URL]));
@@ -301,7 +344,10 @@ async fn metadata_advertises_public_clients_and_mcp_requires_a_bearer() {
     let denied = mcp(&h.app, None, 1).await;
     assert_eq!(denied.status, StatusCode::UNAUTHORIZED);
     let www = denied.headers[header::WWW_AUTHENTICATE].to_str().unwrap();
-    assert!(www.contains(&format!("/.well-known/oauth-protected-resource{MCP_PATH}")), "{www}");
+    assert!(
+        www.contains(&format!("/.well-known/oauth-protected-resource{MCP_PATH}")),
+        "{www}"
+    );
     assert!(www.starts_with("Bearer error=\"invalid_token\""));
 
     let bogus = mcp(&h.app, Some("not-a-token"), 1).await;
@@ -319,18 +365,35 @@ async fn allowed_github_login_can_call_tools_and_refresh() {
     let refreshed = post_form(
         &h.app,
         "/token",
-        &[("grant_type", "refresh_token"), ("refresh_token", &refresh), ("client_id", &client_id)],
+        &[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", &refresh),
+            ("client_id", &client_id),
+        ],
     )
     .await;
     assert_eq!(refreshed.status, StatusCode::OK, "{}", refreshed.body);
-    let new_access = refreshed.json()["access_token"].as_str().unwrap().to_string();
-    assert_eq!(mcp(&h.app, Some(&new_access), 3).await.status, StatusCode::OK);
-    assert_eq!(mcp(&h.app, Some(&access), 4).await.status, StatusCode::UNAUTHORIZED);
+    let new_access = refreshed.json()["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        mcp(&h.app, Some(&new_access), 3).await.status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        mcp(&h.app, Some(&access), 4).await.status,
+        StatusCode::UNAUTHORIZED
+    );
 
     let reused = post_form(
         &h.app,
         "/token",
-        &[("grant_type", "refresh_token"), ("refresh_token", &refresh), ("client_id", &client_id)],
+        &[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", &refresh),
+            ("client_id", &client_id),
+        ],
     )
     .await;
     assert_eq!(reused.status, StatusCode::BAD_REQUEST);
@@ -343,10 +406,15 @@ async fn other_github_login_gets_no_code() {
     let client_id = register_client(&h.app).await;
     let (_verifier, challenge) = pkce();
     let state = github_state(&h.app, &client_id, &challenge).await;
-    let path = format!("/github/callback?{}", encode(&[("code", "ok"), ("state", &state)]));
+    let path = format!(
+        "/oauth/callback/github?{}",
+        encode(&[("code", "ok"), ("state", &state)])
+    );
     let denied = get(&h.app, &path).await;
     assert_eq!(denied.status, StatusCode::FORBIDDEN);
-    assert!(denied.body.contains("この GitHub アカウントは許可されていない。"));
+    assert!(denied
+        .body
+        .contains("この GitHub アカウントは許可されていない。"));
     assert!(denied.body.contains("login: someoneelse"));
     assert!(denied.body.contains("id: 1"));
     let replay = get(&h.app, &path).await;
@@ -360,7 +428,14 @@ async fn reused_login_with_another_id_gets_no_code() {
     let client_id = register_client(&h.app).await;
     let (_verifier, challenge) = pkce();
     let state = github_state(&h.app, &client_id, &challenge).await;
-    let denied = get(&h.app, &format!("/github/callback?{}", encode(&[("code", "ok"), ("state", &state)]))).await;
+    let denied = get(
+        &h.app,
+        &format!(
+            "/oauth/callback/github?{}",
+            encode(&[("code", "ok"), ("state", &state)])
+        ),
+    )
+    .await;
     assert_eq!(denied.status, StatusCode::FORBIDDEN);
     assert!(denied.body.contains("id: 99999999"));
 }
@@ -370,7 +445,10 @@ async fn removing_a_login_rejects_an_existing_bearer() {
     let h = harness();
     let (access, _refresh, _client_id) = issue_token(&h.app).await;
     h.allowed.write().unwrap().clear();
-    assert_eq!(mcp(&h.app, Some(&access), 1).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        mcp(&h.app, Some(&access), 1).await.status,
+        StatusCode::UNAUTHORIZED
+    );
 }
 
 #[tokio::test]
@@ -379,17 +457,24 @@ async fn cimd_client_id_is_fetched_and_a_mismatch_is_rejected() {
     let h = harness_with(
         &[("ok", "2429307", "legokichi")],
         true,
-        Some(json!({ "client_id": url, "redirect_uris": [REDIRECT_URI], "token_endpoint_auth_method": "none" })),
+        Some(
+            json!({ "client_id": url, "redirect_uris": [REDIRECT_URI], "token_endpoint_auth_method": "none" }),
+        ),
     );
     let (_verifier, challenge) = pkce();
     let started = get(&h.app, &authorize_path(url, &challenge, Some(&resource()))).await;
     assert_eq!(started.status, StatusCode::FOUND, "{}", started.body);
-    assert!(started.location().as_str().starts_with("https://github.com/login/oauth/authorize"));
+    assert!(started
+        .location()
+        .as_str()
+        .starts_with("https://github.com/login/oauth/authorize"));
 
     let h = harness_with(
         &[],
         true,
-        Some(json!({ "client_id": "https://other.example/oauth.json", "redirect_uris": [REDIRECT_URI] })),
+        Some(
+            json!({ "client_id": "https://other.example/oauth.json", "redirect_uris": [REDIRECT_URI] }),
+        ),
     );
     let rejected = get(&h.app, &authorize_path(url, &challenge, None)).await;
     assert_eq!(rejected.status, StatusCode::BAD_REQUEST);
@@ -402,11 +487,14 @@ async fn missing_github_app_explains_the_callback() {
     let (_verifier, challenge) = pkce();
     let started = get(&h.app, &authorize_path(&client_id, &challenge, None)).await;
     assert_eq!(started.status, StatusCode::FOUND);
-    assert_eq!(started.location().as_str(), format!("{PUBLIC_URL}/github/setup"));
-    let page = get(&h.app, "/github/setup").await;
+    assert_eq!(
+        started.location().as_str(),
+        format!("{PUBLIC_URL}/oauth/setup/github")
+    );
+    let page = get(&h.app, "/oauth/setup/github").await;
     assert_eq!(page.status, StatusCode::SERVICE_UNAVAILABLE);
     assert!(page.body.contains("GITHUB_CLIENT_ID"));
-    assert!(page.body.contains("/github/callback"));
+    assert!(page.body.contains("/oauth/callback/github"));
 }
 
 #[tokio::test]
@@ -452,7 +540,11 @@ async fn wrong_resource_is_redirected_back_with_invalid_target() {
     let h = harness();
     let client_id = register_client(&h.app).await;
     let (_verifier, challenge) = pkce();
-    let started = get(&h.app, &authorize_path(&client_id, &challenge, Some("https://evil.example/mcp"))).await;
+    let started = get(
+        &h.app,
+        &authorize_path(&client_id, &challenge, Some("https://evil.example/mcp")),
+    )
+    .await;
     assert_eq!(started.status, StatusCode::FOUND);
     let location = started.location();
     assert!(location.as_str().starts_with(REDIRECT_URI));
@@ -562,7 +654,14 @@ async fn loopback_redirect_accepts_any_port_for_cimd_clients() {
     let started = get(&h.app, &path).await;
     assert_eq!(started.status, StatusCode::FOUND, "{}", started.body);
     let state = query(&started.location())["state"].clone();
-    let finished = get(&h.app, &format!("/github/callback?{}", encode(&[("code", "ok"), ("state", &state)]))).await;
+    let finished = get(
+        &h.app,
+        &format!(
+            "/oauth/callback/github?{}",
+            encode(&[("code", "ok"), ("state", &state)])
+        ),
+    )
+    .await;
     assert_eq!(finished.status, StatusCode::FOUND, "{}", finished.body);
     assert!(finished.location().as_str().starts_with(redirect));
     let code = query(&finished.location())["code"].clone();
@@ -591,4 +690,27 @@ async fn loopback_redirect_accepts_any_port_for_cimd_clients() {
         ])
     );
     assert_eq!(get(&h.app, &other).await.status, StatusCode::BAD_REQUEST);
+}
+
+#[test]
+fn github_oauth_uses_river_style_callback_and_keeps_state() {
+    use crate::auth::{GitHubOAuth, REDIRECT_PATH};
+    let redirect = format!("https://mcp.duxca.com{REDIRECT_PATH}");
+    let github = GitHubOAuth::new("cid".into(), "dummy-secret".into(), redirect.clone());
+    assert!(github.configured());
+    assert_eq!(
+        github.redirect_uri(),
+        "https://mcp.duxca.com/oauth/callback/github"
+    );
+    let url = Url::parse(&github.authorization_url("pending-state")).unwrap();
+    assert_eq!(url.origin().ascii_serialization(), "https://github.com");
+    assert_eq!(url.path(), "/login/oauth/authorize");
+    let q = query(&url);
+    assert_eq!(q["client_id"], "cid");
+    assert_eq!(q["redirect_uri"], redirect);
+    assert_eq!(q["state"], "pending-state");
+    assert_eq!(q["scope"], "read:user");
+    assert_eq!(q["response_type"], "code");
+    assert!(!url.as_str().contains("dummy-secret"));
+    assert!(!format!("{github:?}").contains("dummy-secret"));
 }

@@ -27,7 +27,7 @@ async fn main() -> anyhow::Result<()> {
     let github = Arc::new(GitHubOAuth::new(
         config.github_client_id.clone(),
         config.github_client_secret.clone(),
-        format!("{public_url}{}", auth::GITHUB_CALLBACK_PATH),
+        format!("{public_url}{}", auth::REDIRECT_PATH),
     ));
     if !github.configured() {
         tracing::warn!("GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET 未設定。OAuth は動かない");
