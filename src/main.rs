@@ -6,10 +6,9 @@ mod routes;
 mod tests;
 
 use auth::{GitHubLogin, GitHubOAuth, HttpClientMetadataFetcher, OAuthServer};
-use backend::StdioMcpBackend;
+use backend::{BackendRegistry, StdioMcpBackend};
 use config::Config;
 use routes::{router, AppState};
-use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -33,11 +32,26 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET 未設定。OAuth は動かない");
     }
 
+    let services = config.services()?;
+    if services.is_empty() {
+        anyhow::bail!("no MCP services configured");
+    }
+    let service_paths: Vec<String> = services.iter().map(|s| s.path.clone()).collect();
+    for svc in &services {
+        tracing::info!(
+            path = %svc.path,
+            command = %svc.command.join(" "),
+            cwd = %svc.cwd.display(),
+            "configured MCP service"
+        );
+    }
+
     let allowed_ids = Arc::new(RwLock::new(config.allowed_ids()));
     tracing::info!(
         %public_url,
         port = config.port,
         allowed = ?allowed_ids.read().ok().as_deref(),
+        services = ?service_paths,
         "starting mcp.duxca.com gateway"
     );
 
@@ -46,22 +60,23 @@ async fn main() -> anyhow::Result<()> {
         allowed_ids,
         github,
         Arc::new(HttpClientMetadataFetcher),
+        service_paths.clone(),
     ));
 
-    let cwd = config
-        .claude_cwd
-        .clone()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("."))
-        });
-    let backend = StdioMcpBackend::new(config.claude_command_argv(), cwd);
+    let mut backends = BackendRegistry::new();
+    for svc in &services {
+        let backend = StdioMcpBackend::named(
+            format!("{}/{}", svc.name, svc.version),
+            svc.command.clone(),
+            svc.cwd.clone(),
+        );
+        backends.insert(svc.path.clone(), backend);
+    }
 
     let state = AppState {
         public_url,
-        backend,
+        backends: Arc::new(backends),
+        service_paths,
         oauth,
     };
 

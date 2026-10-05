@@ -13,32 +13,36 @@ Grok / Claude アプリから呼べる **MCP ゲートウェイ**（Rust / Axum�
         ▼
  Cloudflare Tunnel  ──►  mcp.duxca.com ゲートウェイ (Axum)
                               │
-                              ├─ OAuth 認可サーバ（動的登録 / CIMD / PKCE）
+                              ├─ OAuth 認可サーバ（動的登録 / CIMD / PKCE）※オリジン共通 1 本
                               ├─ GitHub OAuth で本人確認（数値 id allowlist）
-                              ├─ 自前 Bearer で POST /mcp/v3 を保護
-                              └─ McpBackend
-                                    ├─ StdioMcpBackend（claude mcp serve）← 骨格
+                              ├─ 自前 Bearer で POST /{service}/{version} を保護
+                              └─ 設定駆動の複数 McpBackend
+                                    ├─ StdioMcpBackend（サービスごと）
                                     └─ （将来）HTTP MCP など差し替え
 ```
 
 - 許可アカウントは GitHub **数値 id**（login は改名で再利用されうる）。既定: `2429307`（legokichi）。
 - トークンはメモリだけ。再起動で消える（mcp-test と同じ）。
-- MCP は JSON-RPC 1 本（`POST /mcp/v3`）。
+- MCP は JSON-RPC（`POST /{service}/{version}`）。サービス名・バージョンは環境変数で追加・差し替え。
+- OAuth（`/authorize` `/token` `/register` GitHub コールバック）はホスト共通のまま。GitHub Client Secret は増やさない。
 
 ## ルート
 
 | Method | Path | 説明 |
 |--------|------|------|
-| GET | `/` | 案内 |
-| GET | `/health` | 生存確認 |
+| GET | `/` | 登録済み MCP パス一覧 |
+| GET | `/health` | 生存確認（`services` 含む） |
 | GET | `/.well-known/oauth-authorization-server` | OAuth AS メタデータ（`none` + CIMD） |
-| GET | `/.well-known/oauth-protected-resource/mcp/v3` | 保護リソースメタデータ（RFC 9728） |
+| GET | `/.well-known/oauth-protected-resource` | 全リソース URL 一覧 |
+| GET | `/.well-known/oauth-protected-resource/{service}/{version}` | 保護リソースメタデータ（RFC 9728） |
 | POST | `/register` | 動的クライアント登録（RFC 7591） |
 | GET/POST | `/authorize` | 認可（→ GitHub） |
 | POST | `/token` | 認可コード / refresh → bearer |
 | GET | `/oauth/callback/github` | GitHub OAuth コールバック（river と同じ） |
 | GET | `/oauth/setup/github` | GitHub OAuth App 未設定時の案内（503） |
-| POST | `/mcp/v3` | MCP JSON-RPC（有効な Bearer 必須） |
+| POST | `/{service}/{version}` | MCP JSON-RPC（有効な Bearer 必須） |
+
+旧パス `/mcp/v3` は廃止（サブドメイン `mcp.` と重複するため）。
 
 ## GitHub OAuth App の設定
 
@@ -56,6 +60,24 @@ PORT=8000
 
 ローカルだけなら `PUBLIC_URL=http://127.0.0.1:8000` で可（HTTPS 以外は localhost のみ）。
 
+## 複数 MCP サービス
+
+```sh
+# 例: /codex-sub/v1, /claude-sub/v1, /adb/v1（いずれも設定駆動）
+# 起動コマンドは pascal に各 MCP を入れたあとで指定する（パスはここで決めない）
+MCP_SERVICES=codex-sub/v1,claude-sub/v1,adb/v1
+MCP_CODEX_SUB_V1_COMMAND=
+MCP_CLAUDE_SUB_V1_COMMAND=
+MCP_ADB_V1_COMMAND=
+```
+
+- `MCP_SERVICES` … カンマ区切りの `name/version`
+- 各サービスに `MCP_<NAME>_<VERSION>_COMMAND`（必須）と任意の `_CWD`
+- 名前・バージョンの非英数字は `_` に置換して大文字化（`my-notes/v1` → `MCP_MY_NOTES_V1_COMMAND`）
+- サービス名: `[a-z0-9]` またはハイフン付き。バージョン: `v` + 数字（`v1`, `v2`, `v10` …）
+- `MCP_SERVICES` が空のときは `default/v1` を 1 本立て、`CLAUDE_MCP_COMMAND` / `CLAUDE_CWD` を使う
+- 認可時の `resource`（RFC 8707）はサービスが複数なら必須。1 本だけのときは省略可
+
 ## ローカル起動
 
 ```sh
@@ -70,7 +92,7 @@ cargo test
 curl -s http://127.0.0.1:8000/health
 curl -s http://127.0.0.1:8000/.well-known/oauth-authorization-server
 # Bearer 無しは 401 + WWW-Authenticate
-curl -si -X POST http://127.0.0.1:8000/mcp/v3 \
+curl -si -X POST http://127.0.0.1:8000/default/v1 \
   -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
@@ -83,20 +105,24 @@ curl -si -X POST http://127.0.0.1:8000/mcp/v3 \
 | `PORT` | 待受（既定 8000） |
 | `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | GitHub OAuth App |
 | `ALLOWED_GITHUB_IDS` | カンマ区切り数値 id |
-| `CLAUDE_MCP_COMMAND` | 既定 `claude mcp serve` |
-| `CLAUDE_CWD` | stdio 子プロセスの cwd（省略時 `$HOME`） |
+| `MCP_SERVICES` | カンマ区切り `name/version`（空なら `default/v1`） |
+| `MCP_<NAME>_<VER>_COMMAND` | サービスごとの起動コマンド |
+| `MCP_<NAME>_<VER>_CWD` | サービスごとの cwd（省略時は下記） |
+| `CLAUDE_MCP_COMMAND` | `MCP_SERVICES` 未設定時のフォールバック（既定 `claude mcp serve`） |
+| `CLAUDE_CWD` | 上記フォールバック / 個別 CWD 未設定時の cwd（省略時 `$HOME`） |
 
 ## これから
 
 1. ~~GitHub OAuth + bearer~~ ← 済
-2. `StdioMcpBackend` の本格 stdio JSON-RPC ブリッジ
-3. duxca VPC（GCP）へ移設し、Tunnel コネクタをそこへ
+2. ~~パスベース複数 MCP~~ ← 済（stdio ブリッジは骨格のまま）
+3. `StdioMcpBackend` の本格 stdio JSON-RPC ブリッジ
+4. duxca VPC（GCP）へ移設し、Tunnel コネクタをそこへ
 
 ## 開発メモ
 
 - webrtc.duxca.com / river.duxca.com と同じく Axum 0.8 + envy + tracing。
 - GitHub 側の authorize URL 生成とコード交換は river と同じ `oauth2` クレート（`BasicClient`）。コールバックも river と同じ `/oauth/callback/github`。
 - MCP 側の認可サーバ（`/authorize` `/token` `/register` well-known）は自前実装のまま。GitHub の `state` には MCP 側の pending state をそのまま載せる。
-- 旧パス `/github/callback` は廃止。GitHub OAuth App の callback URL を差し替えること。
+- 旧パス `/github/callback` と `/mcp/v3` は廃止。
 - CIMD 取得は公開 IP だけに接続する。ローカル DNS が合成アドレスを返すときは Cloudflare DoH にフォールバックする。
 - ループバック redirect（`http://localhost/callback`）は RFC 8252 どおりポート違いを許す。

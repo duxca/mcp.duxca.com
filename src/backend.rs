@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -14,10 +15,15 @@ pub trait McpBackend: Send + Sync {
     async fn handle(&self, message: Value) -> Option<Value>;
 }
 
+/// パス (`/name/version`) → バックエンド。
+pub type BackendRegistry = HashMap<String, Arc<dyn McpBackend>>;
+
 /// `claude mcp serve` など stdio JSON-RPC プロセスへの橋渡し（骨格）。
 ///
 /// いまはプロセス起動と健全性チェック程度。本格的な request/response 対応は後続。
 pub struct StdioMcpBackend {
+    /// 表示用（serverInfo.name）。未設定なら mcp.duxca.com。
+    service_name: String,
     command: Vec<String>,
     cwd: PathBuf,
     inner: Mutex<StdioState>,
@@ -29,8 +35,14 @@ struct StdioState {
 }
 
 impl StdioMcpBackend {
+    #[allow(dead_code)]
     pub fn new(command: Vec<String>, cwd: PathBuf) -> Arc<Self> {
+        Self::named("mcp.duxca.com", command, cwd)
+    }
+
+    pub fn named(service_name: impl Into<String>, command: Vec<String>, cwd: PathBuf) -> Arc<Self> {
         Arc::new(Self {
+            service_name: service_name.into(),
             command,
             cwd,
             inner: Mutex::new(StdioState { child: None }),
@@ -65,7 +77,7 @@ impl StdioMcpBackend {
         }
 
         if self.command.is_empty() {
-            return Err("CLAUDE_MCP_COMMAND is empty".into());
+            return Err("MCP command is empty".into());
         }
 
         let mut cmd = Command::new(&self.command[0]);
@@ -81,6 +93,7 @@ impl StdioMcpBackend {
         match cmd.spawn() {
             Ok(child) => {
                 tracing::info!(
+                    service = %self.service_name,
                     command = %self.command.join(" "),
                     cwd = %self.cwd.display(),
                     "spawned stdio MCP backend"
@@ -128,7 +141,7 @@ impl McpBackend for StdioMcpBackend {
                     "protocolVersion": version,
                     "capabilities": { "tools": {} },
                     "serverInfo": {
-                        "name": "mcp.duxca.com",
+                        "name": self.service_name,
                         "version": env!("CARGO_PKG_VERSION"),
                     },
                     "instructions": "骨格段階。stdio バックエンドの本実装はこれから。",

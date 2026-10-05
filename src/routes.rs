@@ -2,12 +2,12 @@
 
 use crate::auth::{
     construct_redirect_uri, normalize_url, pkce_s256, AuthorizationParams, CallbackOutcome,
-    ClientRecord, OAuthServer, TokenError, AUTHORIZATION_PATH, GITHUB_SETUP_PATH, MCP_PATH,
-    REDIRECT_PATH, REGISTRATION_PATH, TOKEN_PATH,
+    ClientRecord, OAuthServer, TokenError, AUTHORIZATION_PATH, GITHUB_SETUP_PATH, REDIRECT_PATH,
+    REGISTRATION_PATH, TOKEN_PATH,
 };
-use crate::backend::McpBackend;
+use crate::backend::BackendRegistry;
 use axum::body::Bytes;
-use axum::extract::{RawQuery, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -19,25 +19,31 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct AppState {
     pub public_url: String,
-    pub backend: Arc<dyn McpBackend>,
+    /// パス (`/name/version`) → バックエンド
+    pub backends: Arc<BackendRegistry>,
+    /// 登録順のサービスパス一覧
+    pub service_paths: Vec<String>,
     pub oauth: Arc<OAuthServer>,
 }
 
 pub fn router(state: AppState) -> Router {
-    let resource_metadata_path = format!("/.well-known/oauth-protected-resource{MCP_PATH}");
     Router::new()
         .route("/", get(index))
         .route("/health", get(health))
-        .route(MCP_PATH, post(mcp_v3))
+        // パスベース MCP: /{service}/{version}
+        .route("/{service}/{version}", post(mcp_post))
         .route(
             "/.well-known/oauth-authorization-server",
             get(oauth_metadata),
         )
-        .route(&resource_metadata_path, get(resource_metadata))
-        // RFC 9728 のパス挿入を試さないクライアント向けの予備。
+        .route(
+            "/.well-known/oauth-protected-resource/{service}/{version}",
+            get(resource_metadata_for_path),
+        )
+        // 全リソース一覧（拡張）。パス固有エンドポイントが本命。
         .route(
             "/.well-known/oauth-protected-resource",
-            get(resource_metadata),
+            get(resource_metadata_index),
         )
         .route(AUTHORIZATION_PATH, get(authorize).post(authorize))
         .route(TOKEN_PATH, post(token))
@@ -79,8 +85,17 @@ fn parse_form(raw: &[u8]) -> HashMap<String, String> {
     url::form_urlencoded::parse(raw).into_owned().collect()
 }
 
+fn service_path(service: &str, version: &str) -> String {
+    format!("/{service}/{version}")
+}
+
 async fn index(State(state): State<AppState>) -> impl IntoResponse {
-    format!("MCP endpoint: POST {}{MCP_PATH}\n", state.public_url)
+    let mut lines = vec!["MCP endpoints (POST, Bearer required):".to_string()];
+    for path in &state.service_paths {
+        lines.push(format!("  {}{path}", state.public_url));
+    }
+    lines.push(String::new());
+    lines.join("\n")
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
@@ -91,6 +106,16 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         .map(|ids| ids.iter().cloned().collect())
         .unwrap_or_default();
     allowed.sort();
+    let services: Vec<Value> = state
+        .service_paths
+        .iter()
+        .map(|path| {
+            json!({
+                "path": path,
+                "resource": format!("{}{path}", state.public_url),
+            })
+        })
+        .collect();
     Json(json!({
         "ok": true,
         "service": "mcp.duxca.com",
@@ -98,6 +123,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         "public_url": state.public_url,
         "github_configured": state.oauth.github.configured(),
         "allowed_github_ids": allowed,
+        "services": services,
     }))
 }
 
@@ -112,12 +138,34 @@ async fn oauth_metadata(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
-async fn resource_metadata(State(state): State<AppState>) -> Response {
+async fn resource_metadata_index(State(state): State<AppState>) -> Response {
     (
         [(header::CACHE_CONTROL, "public, max-age=3600")],
-        Json(state.oauth.protected_resource_metadata()),
+        Json(state.oauth.protected_resources_index()),
     )
         .into_response()
+}
+
+async fn resource_metadata_for_path(
+    State(state): State<AppState>,
+    Path((service, version)): Path<(String, String)>,
+) -> Response {
+    let path = service_path(&service, &version);
+    match state.oauth.protected_resource_metadata_for(&path) {
+        Some(meta) => (
+            [(header::CACHE_CONTROL, "public, max-age=3600")],
+            Json(meta),
+        )
+            .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "not_found",
+                "error_description": format!("no MCP service at {path}"),
+            })),
+        )
+            .into_response(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -456,12 +504,12 @@ async fn register(State(state): State<AppState>, body: Bytes) -> Response {
 }
 
 // ---------------------------------------------------------------------------
-// POST /mcp/v3
+// POST /{service}/{version}
 
-fn unauthorized(oauth: &OAuthServer) -> Response {
+fn unauthorized(oauth: &OAuthServer, service_path: &str) -> Response {
     let www = format!(
         "Bearer error=\"invalid_token\", error_description=\"Authentication required\", resource_metadata=\"{}\"",
-        oauth.resource_metadata_url()
+        oauth.resource_metadata_url_for(service_path)
     );
     let mut response = (
         StatusCode::UNAUTHORIZED,
@@ -485,24 +533,53 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
     }
 }
 
-async fn mcp_v3(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    let Some(token) = bearer(&headers) else {
-        return unauthorized(&state.oauth);
+async fn mcp_post(
+    State(state): State<AppState>,
+    Path((service, version)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let path = service_path(&service, &version);
+    let Some(backend) = state.backends.get(&path).cloned() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "not_found",
+                "error_description": format!("no MCP service at {path}"),
+            })),
+        )
+            .into_response();
     };
-    let Some(principal) = state.oauth.load_access_token(token) else {
-        return unauthorized(&state.oauth);
+    let Some(resource_url) = state.oauth.resource_url_for_path(&path) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "not_found",
+                "error_description": format!("no MCP service at {path}"),
+            })),
+        )
+            .into_response();
+    };
+
+    let Some(token) = bearer(&headers) else {
+        return unauthorized(&state.oauth, &path);
+    };
+    let Some(principal) = state.oauth.load_access_token(token, &resource_url) else {
+        return unauthorized(&state.oauth, &path);
     };
     let payload: Value = match serde_json::from_slice(&body) {
         Ok(v @ Value::Object(_)) => v,
         _ => return (StatusCode::BAD_REQUEST, Json(json!({ "error": "json" }))).into_response(),
     };
     tracing::info!(
+        path = %path,
         subject = %principal.subject,
         method = payload.get("method").and_then(|v| v.as_str()).unwrap_or("?"),
         "mcp"
     );
-    match state.backend.handle(payload).await {
+    match backend.handle(payload).await {
         Some(reply) => Json(reply).into_response(),
         None => StatusCode::ACCEPTED.into_response(),
     }
 }
+

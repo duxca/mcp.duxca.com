@@ -2,9 +2,9 @@
 
 use crate::auth::{
     is_cimd_client_id, pkce_s256, token_urlsafe, ClientMetadataFetcher, GitHubLogin,
-    GitHubLoginError, OAuthServer, MCP_PATH,
+    GitHubLoginError, OAuthServer,
 };
-use crate::backend::McpBackend;
+use crate::backend::{BackendRegistry, McpBackend};
 use crate::routes::{router, AppState};
 use async_trait::async_trait;
 use axum::body::Body;
@@ -18,9 +18,11 @@ use url::Url;
 
 const PUBLIC_URL: &str = "https://demo.trycloudflare.com";
 const REDIRECT_URI: &str = "http://127.0.0.1:9/cb";
+/// テスト用の単一サービスパス（設定駆動の例）。
+const TEST_MCP_PATH: &str = "/default/v1";
 
 fn resource() -> String {
-    format!("{PUBLIC_URL}{MCP_PATH}")
+    format!("{PUBLIC_URL}{TEST_MCP_PATH}")
 }
 
 struct FakeGitHub {
@@ -89,10 +91,14 @@ fn harness_with(logins: &[(&str, &str, &str)], configured: bool, cimd: Option<Va
         allowed.clone(),
         Arc::new(github),
         Arc::new(FakeFetcher(cimd)),
+        vec![TEST_MCP_PATH.to_string()],
     ));
+    let mut backends = BackendRegistry::new();
+    backends.insert(TEST_MCP_PATH.to_string(), Arc::new(FakeBackend));
     let app = router(AppState {
         public_url: PUBLIC_URL.into(),
-        backend: Arc::new(FakeBackend),
+        backends: Arc::new(backends),
+        service_paths: vec![TEST_MCP_PATH.to_string()],
         oauth,
     });
     Harness { app, allowed }
@@ -157,7 +163,7 @@ async fn post_form(app: &Router, path: &str, pairs: &[(&str, &str)]) -> Reply {
 }
 
 async fn mcp(app: &Router, token: Option<&str>, id: i64) -> Reply {
-    let mut req = Request::post(MCP_PATH).header(header::CONTENT_TYPE, "application/json");
+    let mut req = Request::post(TEST_MCP_PATH).header(header::CONTENT_TYPE, "application/json");
     if let Some(token) = token {
         req = req.header(header::AUTHORIZATION, format!("Bearer {token}"));
     }
@@ -334,7 +340,7 @@ async fn metadata_advertises_public_clients_and_mcp_requires_a_bearer() {
 
     let prm = get(
         &h.app,
-        &format!("/.well-known/oauth-protected-resource{MCP_PATH}"),
+        &format!("/.well-known/oauth-protected-resource{TEST_MCP_PATH}"),
     )
     .await;
     assert_eq!(prm.status, StatusCode::OK);
@@ -345,7 +351,7 @@ async fn metadata_advertises_public_clients_and_mcp_requires_a_bearer() {
     assert_eq!(denied.status, StatusCode::UNAUTHORIZED);
     let www = denied.headers[header::WWW_AUTHENTICATE].to_str().unwrap();
     assert!(
-        www.contains(&format!("/.well-known/oauth-protected-resource{MCP_PATH}")),
+        www.contains(&format!("/.well-known/oauth-protected-resource{TEST_MCP_PATH}")),
         "{www}"
     );
     assert!(www.starts_with("Bearer error=\"invalid_token\""));
@@ -713,4 +719,104 @@ fn github_oauth_uses_river_style_callback_and_keeps_state() {
     assert_eq!(q["response_type"], "code");
     assert!(!url.as_str().contains("dummy-secret"));
     assert!(!format!("{github:?}").contains("dummy-secret"));
+}
+
+
+#[tokio::test]
+async fn two_services_require_resource_and_isolate_tokens() {
+    let allowed = Arc::new(RwLock::new(HashSet::from(["2429307".to_string()])));
+    let github = FakeGitHub {
+        logins: HashMap::from([("ok".into(), ("2429307".into(), "legokichi".into()))]),
+        configured: true,
+    };
+    let paths = vec!["/claude/v1".to_string(), "/adb/v1".to_string()];
+    let oauth = Arc::new(OAuthServer::new(
+        PUBLIC_URL,
+        allowed,
+        Arc::new(github),
+        Arc::new(FakeFetcher(None)),
+        paths.clone(),
+    ));
+    let mut backends = BackendRegistry::new();
+    backends.insert("/claude/v1".into(), Arc::new(FakeBackend));
+    backends.insert("/adb/v1".into(), Arc::new(FakeBackend));
+    let app = router(AppState {
+        public_url: PUBLIC_URL.into(),
+        backends: Arc::new(backends),
+        service_paths: paths,
+        oauth,
+    });
+
+    // 複数サービス時、resource 無しの authorize は invalid_target
+    let client_id = register_client(&app).await;
+    let (_verifier, challenge) = pkce();
+    let started = get(&app, &authorize_path(&client_id, &challenge, None)).await;
+    assert_eq!(started.status, StatusCode::FOUND, "{}", started.body);
+    let q = query(&started.location());
+    assert_eq!(q["error"], "invalid_target");
+
+    // adb/v1 向けトークンは claude/v1 では 401
+    let adb_resource = format!("{PUBLIC_URL}/adb/v1");
+    let (verifier, challenge) = pkce();
+    let started = get(
+        &app,
+        &authorize_path(&client_id, &challenge, Some(&adb_resource)),
+    )
+    .await;
+    assert_eq!(started.status, StatusCode::FOUND, "{}", started.body);
+    let state = query(&started.location())["state"].clone();
+    let finished = get(
+        &app,
+        &format!(
+            "/oauth/callback/github?{}",
+            encode(&[("code", "ok"), ("state", &state)])
+        ),
+    )
+    .await;
+    assert_eq!(finished.status, StatusCode::FOUND, "{}", finished.body);
+    let code = query(&finished.location())["code"].clone();
+    let token = post_form(
+        &app,
+        "/token",
+        &[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("redirect_uri", REDIRECT_URI),
+            ("client_id", &client_id),
+            ("code_verifier", &verifier),
+        ],
+    )
+    .await;
+    assert_eq!(token.status, StatusCode::OK, "{}", token.body);
+    let access = token.json()["access_token"].as_str().unwrap().to_string();
+
+    async fn mcp_at(app: &Router, path: &str, token: &str) -> Reply {
+        let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }).to_string();
+        send(
+            app,
+            Request::post(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+    }
+
+    assert_eq!(mcp_at(&app, "/adb/v1", &access).await.status, StatusCode::OK);
+    assert_eq!(
+        mcp_at(&app, "/claude/v1", &access).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+
+    let prm = get(&app, "/.well-known/oauth-protected-resource/adb/v1").await;
+    assert_eq!(prm.status, StatusCode::OK);
+    assert_eq!(prm.json()["resource"], adb_resource);
+
+    let index = get(&app, "/.well-known/oauth-protected-resource").await;
+    assert_eq!(index.status, StatusCode::OK);
+    let index_body = index.json();
+    let resources = index_body["resources"].as_array().unwrap();
+    assert!(resources.iter().any(|r| r == &json!(format!("{PUBLIC_URL}/claude/v1"))));
+    assert!(resources.iter().any(|r| r == &json!(adb_resource)));
 }
