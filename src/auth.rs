@@ -3,7 +3,8 @@
 //! pascal の `~/Github/mcp-test/auth.py`（MCP Python SDK の OAuth サーバ）の移植。
 //! - 動的クライアント登録（RFC 7591）と Client ID Metadata Document（CIMD）
 //! - /authorize → GitHub ログイン → /oauth/callback/github → 認可コード → /token
-//! - GitHub クライアント側は river.duxca.com と同じ oauth2 クレート + `/oauth/callback/github`
+//! - GitHub 認可 URL は river と同じ oauth2 クレート + `/oauth/callback/github`
+//! - トークン交換は Accept: application/json の手書き POST（JSON エラーをログ可能）
 //! - 許可は GitHub の数値 id（login は改名で再利用されうるので使わない）
 //! - トークンはメモリだけ。プロセスを再起動すると消える（mcp-test と同じ）
 
@@ -216,22 +217,67 @@ impl GitHubLogin for GitHubOAuth {
     }
 
     async fn login_for_code(&self, code: &str) -> Result<(String, String), GitHubLoginError> {
-        use oauth2::TokenResponse;
-
-        let token_res = self
-            .basic_client()
-            .exchange_code(oauth2::AuthorizationCode::new(code.to_string()))
-            .request_async(&self.http)
+        // Hand-rolled token POST with Accept: application/json.
+        // oauth2::exchange_code failed to parse GitHub's default form-urlencoded
+        // error bodies ("Failed to parse server response" → opaque 502). JSON
+        // lets us log error / error_description without leaking secrets or codes.
+        let form = [
+            ("client_id", self.client_id.as_str()),
+            ("client_secret", self.client_secret.secret()),
+            ("code", code),
+            ("redirect_uri", self.redirect_uri.as_str()),
+        ];
+        let token_response = self
+            .http
+            .post(GITHUB_TOKEN_URL)
+            .header("Accept", "application/json")
+            .form(&form)
+            .send()
             .await
             .map_err(|e| {
-                tracing::info!("github token exchange failed: {e}");
+                tracing::info!(
+                    "github token exchange transport failed: {}",
+                    e.without_url()
+                );
+                GitHubLoginError("token".into())
+            })?;
+        let status = token_response.status();
+        let body: Value = token_response.json().await.map_err(|e| {
+            tracing::info!(
+                "github token exchange body parse failed: status={status} err={}",
+                e.without_url()
+            );
+            GitHubLoginError("token".into())
+        })?;
+        if let Some(err) = body.get("error").and_then(Value::as_str) {
+            let desc = body
+                .get("error_description")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            tracing::info!(
+                "github token exchange failed: status={status} error={err} description={desc}"
+            );
+            return Err(GitHubLoginError("token".into()));
+        }
+        if !status.is_success() {
+            tracing::info!("github token exchange failed: status={status} (no error field)");
+            return Err(GitHubLoginError("token".into()));
+        }
+        let access_token = body
+            .get("access_token")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                tracing::info!(
+                    "github token exchange failed: status={status} missing access_token"
+                );
                 GitHubLoginError("token".into())
             })?;
 
         let user_response = self
             .http
             .get(GITHUB_USER_URL)
-            .bearer_auth(token_res.access_token().secret())
+            .bearer_auth(access_token)
             .header("Accept", "application/vnd.github+json")
             .send()
             .await
@@ -240,6 +286,10 @@ impl GitHubLogin for GitHubOAuth {
                 GitHubLoginError("lookup".into())
             })?;
         if user_response.status() != reqwest::StatusCode::OK {
+            tracing::info!(
+                "github account lookup failed: status={}",
+                user_response.status()
+            );
             return Err(GitHubLoginError(user_response.status().to_string()));
         }
         let user: Value = user_response.json().await.map_err(|e| {
