@@ -1,9 +1,6 @@
 /target
 .env
+.secrets/
 *.swp
 *.swo
 .DS_Store
-
-.secrets/
-.env
-
