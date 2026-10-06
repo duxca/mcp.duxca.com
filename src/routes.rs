@@ -154,7 +154,9 @@ impl AuthorizeContext {
             if let Some(client) = &self.client {
                 let raw = self.params.get("redirect_uri").map(String::as_str);
                 if raw.is_none() || raw.and_then(normalize_url).is_some() {
-                    self.redirect_uri = client.validate_redirect_uri(raw).ok();
+                    self.redirect_uri = client
+                        .validate_redirect_uri(raw, &oauth.redirect_allowlist)
+                        .ok();
                 }
             }
         }
@@ -243,7 +245,9 @@ async fn authorize(
     ctx.client = Some(client.clone());
 
     let requested_redirect = ctx.params.get("redirect_uri").cloned();
-    let redirect_uri = match client.validate_redirect_uri(requested_redirect.as_deref()) {
+    let redirect_uri = match client
+        .validate_redirect_uri(requested_redirect.as_deref(), &oauth.redirect_allowlist)
+    {
         Ok(uri) => uri,
         Err(description) => {
             return ctx
@@ -447,10 +451,11 @@ async fn register(State(state): State<AppState>, body: Bytes) -> Response {
         Ok(v) => v,
         Err(e) => return invalid(format!("Invalid JSON: {e}")),
     };
-    let client = match crate::auth::client_from_registration(&value) {
-        Ok(client) => client,
-        Err(description) => return invalid(description),
-    };
+    let client =
+        match crate::auth::client_from_registration(&value, &state.oauth.redirect_allowlist) {
+            Ok(client) => client,
+            Err(description) => return invalid(description),
+        };
     tracing::info!(
         client_name = client.client_name.as_deref().unwrap_or("-"),
         method = %client.token_endpoint_auth_method,

@@ -151,7 +151,7 @@ if [[ -n "$TOKEN" ]]; then
   unset CLOUDFLARED_TOKEN TUNNEL_TOKEN TOKEN 2>/dev/null || true
 else
   echo "warning: no Cloudflare Tunnel token (CLOUDFLARED_TOKEN / TUNNEL_TOKEN / CLOUDFLARED_TOKEN_FILE)." >&2
-  echo "         running gateway only on 0.0.0.0:${PORT} (local / tests OK)." >&2
+  echo "         running gateway only on ${BIND_ADDR:-127.0.0.1}:${PORT} (local / tests OK)." >&2
 fi
 
 # --- gateway (foreground wait) ---
