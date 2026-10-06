@@ -820,3 +820,11 @@ async fn two_services_require_resource_and_isolate_tokens() {
     assert!(resources.iter().any(|r| r == &json!(format!("{PUBLIC_URL}/claude/v1"))));
     assert!(resources.iter().any(|r| r == &json!(adb_resource)));
 }
+
+#[tokio::test]
+async fn root_is_an_empty_404() {
+    let h = harness();
+    let r = get(&h.app, "/").await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    assert!(r.body.is_empty());
+}

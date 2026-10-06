@@ -28,7 +28,6 @@ pub struct AppState {
 
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/", get(index))
         .route("/health", get(health))
         // パスベース MCP: /{service}/{version}
         .route("/{service}/{version}", post(mcp_post))
@@ -87,15 +86,6 @@ fn parse_form(raw: &[u8]) -> HashMap<String, String> {
 
 fn service_path(service: &str, version: &str) -> String {
     format!("/{service}/{version}")
-}
-
-async fn index(State(state): State<AppState>) -> impl IntoResponse {
-    let mut lines = vec!["MCP endpoints (POST, Bearer required):".to_string()];
-    for path in &state.service_paths {
-        lines.push(format!("  {}{path}", state.public_url));
-    }
-    lines.push(String::new());
-    lines.join("\n")
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
