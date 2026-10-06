@@ -18,17 +18,14 @@ use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub public_url: String,
     /// パス (`/name/version`) → バックエンド
     pub backends: Arc<BackendRegistry>,
     /// 登録順のサービスパス一覧
-    pub service_paths: Vec<String>,
     pub oauth: Arc<OAuthServer>,
 }
 
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/health", get(health))
         // パスベース MCP: /{service}/{version}
         .route("/{service}/{version}", post(mcp_post))
         .route(
@@ -86,35 +83,6 @@ fn parse_form(raw: &[u8]) -> HashMap<String, String> {
 
 fn service_path(service: &str, version: &str) -> String {
     format!("/{service}/{version}")
-}
-
-async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    let mut allowed: Vec<String> = state
-        .oauth
-        .allowed_ids
-        .read()
-        .map(|ids| ids.iter().cloned().collect())
-        .unwrap_or_default();
-    allowed.sort();
-    let services: Vec<Value> = state
-        .service_paths
-        .iter()
-        .map(|path| {
-            json!({
-                "path": path,
-                "resource": format!("{}{path}", state.public_url),
-            })
-        })
-        .collect();
-    Json(json!({
-        "ok": true,
-        "service": "mcp.duxca.com",
-        "version": env!("CARGO_PKG_VERSION"),
-        "public_url": state.public_url,
-        "github_configured": state.oauth.github.configured(),
-        "allowed_github_ids": allowed,
-        "services": services,
-    }))
 }
 
 // ---------------------------------------------------------------------------

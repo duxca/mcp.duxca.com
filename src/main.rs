@@ -74,9 +74,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let state = AppState {
-        public_url,
         backends: Arc::new(backends),
-        service_paths,
         oauth,
     };
 

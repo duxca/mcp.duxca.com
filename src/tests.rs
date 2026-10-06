@@ -96,9 +96,7 @@ fn harness_with(logins: &[(&str, &str, &str)], configured: bool, cimd: Option<Va
     let mut backends = BackendRegistry::new();
     backends.insert(TEST_MCP_PATH.to_string(), Arc::new(FakeBackend));
     let app = router(AppState {
-        public_url: PUBLIC_URL.into(),
         backends: Arc::new(backends),
-        service_paths: vec![TEST_MCP_PATH.to_string()],
         oauth,
     });
     Harness { app, allowed }
@@ -741,9 +739,7 @@ async fn two_services_require_resource_and_isolate_tokens() {
     backends.insert("/claude/v1".into(), Arc::new(FakeBackend));
     backends.insert("/adb/v1".into(), Arc::new(FakeBackend));
     let app = router(AppState {
-        public_url: PUBLIC_URL.into(),
         backends: Arc::new(backends),
-        service_paths: paths,
         oauth,
     });
 
@@ -825,6 +821,14 @@ async fn two_services_require_resource_and_isolate_tokens() {
 async fn root_is_an_empty_404() {
     let h = harness();
     let r = get(&h.app, "/").await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    assert!(r.body.is_empty());
+}
+
+#[tokio::test]
+async fn health_is_an_empty_404() {
+    let h = harness();
+    let r = get(&h.app, "/health").await;
     assert_eq!(r.status, StatusCode::NOT_FOUND);
     assert!(r.body.is_empty());
 }
