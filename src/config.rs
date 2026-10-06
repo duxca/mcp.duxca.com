@@ -121,14 +121,11 @@ fn split_command(raw: &str) -> Vec<String> {
 }
 
 fn default_cwd(claude_cwd: &Option<String>) -> PathBuf {
-    claude_cwd
-        .as_ref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("."))
-        })
+    claude_cwd.as_ref().map(PathBuf::from).unwrap_or_else(|| {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+    })
 }
 
 impl Config {
@@ -207,9 +204,8 @@ impl Config {
             let suffix = env_key_suffix(name, version);
             let cmd_key = format!("MCP_{suffix}_COMMAND");
             let cwd_key = format!("MCP_{suffix}_CWD");
-            let command_raw = std::env::var(&cmd_key).map_err(|_| {
-                anyhow::anyhow!("{cmd_key} が必要（サービス {name}/{version}）")
-            })?;
+            let command_raw = std::env::var(&cmd_key)
+                .map_err(|_| anyhow::anyhow!("{cmd_key} が必要（サービス {name}/{version}）"))?;
             let command = split_command(&command_raw);
             if command.is_empty() {
                 anyhow::bail!("{cmd_key} が空");

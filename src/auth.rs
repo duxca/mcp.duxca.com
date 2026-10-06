@@ -705,9 +705,16 @@ pub fn client_from_cimd(url: &str, document: &Value) -> Option<ClientRecord> {
     if obj.get("client_id").and_then(Value::as_str) != Some(url) {
         return None;
     }
+    // ChatGPT は private_key_jwt を既定にしつつ token_endpoint_auth_methods_supported に
+    // "none" も載せる。その場合は公開クライアント（PKCE 必須）として受ける。
+    let supports_none = obj
+        .get("token_endpoint_auth_methods_supported")
+        .and_then(Value::as_array)
+        .is_some_and(|m| m.iter().any(|v| v.as_str() == Some("none")));
     match obj.get("token_endpoint_auth_method") {
         None | Some(Value::Null) => {}
         Some(Value::String(s)) if s == "none" => {}
+        Some(Value::String(_)) if supports_none => {}
         _ => return None,
     }
     let redirect_uris = string_list(obj.get("redirect_uris"), "redirect_uris").ok()??;
@@ -947,10 +954,7 @@ impl OAuthServer {
         } else {
             format!("/{path}")
         };
-        format!(
-            "{}/.well-known/oauth-protected-resource{path}",
-            self.issuer
-        )
+        format!("{}/.well-known/oauth-protected-resource{path}", self.issuer)
     }
 
     /// ルート well-known 用。全リソースを列挙する。

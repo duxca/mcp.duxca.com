@@ -540,4 +540,3 @@ async fn mcp_post(
         None => StatusCode::ACCEPTED.into_response(),
     }
 }
-

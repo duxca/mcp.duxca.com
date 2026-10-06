@@ -349,7 +349,9 @@ async fn metadata_advertises_public_clients_and_mcp_requires_a_bearer() {
     assert_eq!(denied.status, StatusCode::UNAUTHORIZED);
     let www = denied.headers[header::WWW_AUTHENTICATE].to_str().unwrap();
     assert!(
-        www.contains(&format!("/.well-known/oauth-protected-resource{TEST_MCP_PATH}")),
+        www.contains(&format!(
+            "/.well-known/oauth-protected-resource{TEST_MCP_PATH}"
+        )),
         "{www}"
     );
     assert!(www.starts_with("Bearer error=\"invalid_token\""));
@@ -719,7 +721,6 @@ fn github_oauth_uses_river_style_callback_and_keeps_state() {
     assert!(!format!("{github:?}").contains("dummy-secret"));
 }
 
-
 #[tokio::test]
 async fn two_services_require_resource_and_isolate_tokens() {
     let allowed = Arc::new(RwLock::new(HashSet::from(["2429307".to_string()])));
@@ -799,7 +800,10 @@ async fn two_services_require_resource_and_isolate_tokens() {
         .await
     }
 
-    assert_eq!(mcp_at(&app, "/adb/v1", &access).await.status, StatusCode::OK);
+    assert_eq!(
+        mcp_at(&app, "/adb/v1", &access).await.status,
+        StatusCode::OK
+    );
     assert_eq!(
         mcp_at(&app, "/claude/v1", &access).await.status,
         StatusCode::UNAUTHORIZED
@@ -813,7 +817,9 @@ async fn two_services_require_resource_and_isolate_tokens() {
     assert_eq!(index.status, StatusCode::OK);
     let index_body = index.json();
     let resources = index_body["resources"].as_array().unwrap();
-    assert!(resources.iter().any(|r| r == &json!(format!("{PUBLIC_URL}/claude/v1"))));
+    assert!(resources
+        .iter()
+        .any(|r| r == &json!(format!("{PUBLIC_URL}/claude/v1"))));
     assert!(resources.iter().any(|r| r == &json!(adb_resource)));
 }
 
@@ -831,4 +837,28 @@ async fn health_is_an_empty_404() {
     let r = get(&h.app, "/health").await;
     assert_eq!(r.status, StatusCode::NOT_FOUND);
     assert!(r.body.is_empty());
+}
+
+#[test]
+fn cimd_private_key_jwt_is_accepted_only_when_none_is_also_supported() {
+    use crate::auth::client_from_cimd;
+    let url = "https://chatgpt.com/oauth/abc/client.json";
+    let chatgpt = json!({
+        "client_id": url,
+        "redirect_uris": ["https://chatgpt.com/connector/oauth/abc"],
+        "token_endpoint_auth_method": "private_key_jwt",
+        "token_endpoint_auth_methods_supported": ["none", "private_key_jwt"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+    });
+    let client = client_from_cimd(url, &chatgpt).expect("chatgpt cimd accepted");
+    assert_eq!(client.token_endpoint_auth_method, "none");
+    assert!(client.client_secret.is_none());
+
+    let jwt_only = json!({
+        "client_id": url,
+        "redirect_uris": ["https://chatgpt.com/connector/oauth/abc"],
+        "token_endpoint_auth_method": "private_key_jwt",
+    });
+    assert!(client_from_cimd(url, &jwt_only).is_none());
 }

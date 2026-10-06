@@ -78,7 +78,10 @@ impl StdioMcpBackend {
             command,
             cwd,
             timeout,
-            inner: Mutex::new(StdioState { running: None, next_id: 1 }),
+            inner: Mutex::new(StdioState {
+                running: None,
+                next_id: 1,
+            }),
         })
     }
 
@@ -105,7 +108,11 @@ impl StdioMcpBackend {
             .write_all(line.as_bytes())
             .await
             .map_err(|e| format!("write to child: {e}"))?;
-        running.stdin.flush().await.map_err(|e| format!("flush: {e}"))?;
+        running
+            .stdin
+            .flush()
+            .await
+            .map_err(|e| format!("flush: {e}"))?;
 
         let fut = async {
             loop {
@@ -130,7 +137,8 @@ impl StdioMcpBackend {
                     (Some(id), false) if id == want_id => return Ok(v),
                     (Some(id), true) => {
                         // サーバ発リクエスト（roots/list, sampling など）は未対応
-                        let reply = Self::error(Some(id.clone()), -32601, "not supported by gateway");
+                        let reply =
+                            Self::error(Some(id.clone()), -32601, "not supported by gateway");
                         let mut l = serde_json::to_string(&reply).unwrap_or_default();
                         l.push('\n');
                         let _ = running.stdin.write_all(l.as_bytes()).await;
@@ -150,8 +158,12 @@ impl StdioMcpBackend {
         if let Some(r) = state.running.as_mut() {
             match r.child.try_wait() {
                 Ok(None) => return Ok(()),
-                Ok(Some(status)) => tracing::warn!(service = %self.service_name, ?status, "stdio MCP child exited; restarting"),
-                Err(err) => tracing::warn!(service = %self.service_name, %err, "poll child failed; restarting"),
+                Ok(Some(status)) => {
+                    tracing::warn!(service = %self.service_name, ?status, "stdio MCP child exited; restarting")
+                }
+                Err(err) => {
+                    tracing::warn!(service = %self.service_name, %err, "poll child failed; restarting")
+                }
             }
             state.running = None;
         }
@@ -172,7 +184,12 @@ impl StdioMcpBackend {
         let stdout = BufReader::new(child.stdout.take().ok_or("no stdout")?).lines();
         tracing::info!(service = %self.service_name, command = %self.command.join(" "), cwd = %self.cwd.display(), "spawned stdio MCP backend");
 
-        let mut running = Running { child, stdin, stdout, init_result: Value::Null };
+        let mut running = Running {
+            child,
+            stdin,
+            stdout,
+            init_result: Value::Null,
+        };
         let id = json!(format!("gw-init-{}", state.next_id));
         state.next_id += 1;
         let init = json!({
@@ -185,13 +202,28 @@ impl StdioMcpBackend {
                 "clientInfo": { "name": "mcp.duxca.com", "version": env!("CARGO_PKG_VERSION") }
             }
         });
-        let reply = Self::roundtrip(&mut running, &init, &id, self.timeout.min(Duration::from_secs(60))).await?;
+        let reply = Self::roundtrip(
+            &mut running,
+            &init,
+            &id,
+            self.timeout.min(Duration::from_secs(60)),
+        )
+        .await?;
         let Some(result) = reply.get("result").cloned() else {
-            return Err(format!("initialize failed: {}", reply.get("error").cloned().unwrap_or(Value::Null)));
+            return Err(format!(
+                "initialize failed: {}",
+                reply.get("error").cloned().unwrap_or(Value::Null)
+            ));
         };
-        let mut l = serde_json::to_string(&json!({"jsonrpc":"2.0","method":"notifications/initialized"})).unwrap();
+        let mut l =
+            serde_json::to_string(&json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+                .unwrap();
         l.push('\n');
-        running.stdin.write_all(l.as_bytes()).await.map_err(|e| e.to_string())?;
+        running
+            .stdin
+            .write_all(l.as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
         running.stdin.flush().await.map_err(|e| e.to_string())?;
         running.init_result = result;
         state.running = Some(running);
@@ -203,7 +235,11 @@ impl StdioMcpBackend {
 impl McpBackend for StdioMcpBackend {
     async fn handle(&self, message: Value) -> Option<Value> {
         let id = message.get("id").cloned();
-        let method = message.get("method").and_then(|m| m.as_str()).unwrap_or("").to_string();
+        let method = message
+            .get("method")
+            .and_then(|m| m.as_str())
+            .unwrap_or("")
+            .to_string();
 
         // クライアント側の通知はゲートウェイで吸収する（子は初期化済み）
         if method.starts_with("notifications/") || id.is_none() {
@@ -279,7 +315,12 @@ for line in sys.stdin:
     }
 
     fn backend() -> Arc<StdioMcpBackend> {
-        StdioMcpBackend::with_timeout("fake/v1", fake_server(), std::env::temp_dir(), Duration::from_secs(10))
+        StdioMcpBackend::with_timeout(
+            "fake/v1",
+            fake_server(),
+            std::env::temp_dir(),
+            Duration::from_secs(10),
+        )
     }
 
     #[tokio::test]
@@ -292,9 +333,15 @@ for line in sys.stdin:
         assert_eq!(init["id"], 7);
         assert_eq!(init["result"]["serverInfo"]["name"], "fake");
 
-        assert!(b.handle(json!({"jsonrpc":"2.0","method":"notifications/initialized"})).await.is_none());
+        assert!(b
+            .handle(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+            .await
+            .is_none());
 
-        let list = b.handle(json!({"jsonrpc":"2.0","id":"abc","method":"tools/list"})).await.unwrap();
+        let list = b
+            .handle(json!({"jsonrpc":"2.0","id":"abc","method":"tools/list"}))
+            .await
+            .unwrap();
         assert_eq!(list["id"], "abc");
         assert_eq!(list["result"]["tools"][0]["name"], "echo");
     }
@@ -302,21 +349,38 @@ for line in sys.stdin:
     #[tokio::test]
     async fn error_passthrough_and_restart_after_exit() {
         let b = backend();
-        let e = b.handle(json!({"jsonrpc":"2.0","id":1,"method":"unknown"})).await.unwrap();
+        let e = b
+            .handle(json!({"jsonrpc":"2.0","id":1,"method":"unknown"}))
+            .await
+            .unwrap();
         assert_eq!(e["error"]["code"], -32601);
         assert_eq!(e["id"], 1);
 
-        let d = b.handle(json!({"jsonrpc":"2.0","id":2,"method":"die"})).await.unwrap();
+        let d = b
+            .handle(json!({"jsonrpc":"2.0","id":2,"method":"die"}))
+            .await
+            .unwrap();
         assert_eq!(d["error"]["code"], -32000);
 
-        let list = b.handle(json!({"jsonrpc":"2.0","id":3,"method":"tools/list"})).await.unwrap();
+        let list = b
+            .handle(json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}))
+            .await
+            .unwrap();
         assert_eq!(list["result"]["tools"][0]["name"], "echo");
     }
 
     #[tokio::test]
     async fn spawn_failure_is_jsonrpc_error() {
-        let b = StdioMcpBackend::with_timeout("x/v1", vec!["/nonexistent/bin".into()], std::env::temp_dir(), Duration::from_secs(2));
-        let e = b.handle(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})).await.unwrap();
+        let b = StdioMcpBackend::with_timeout(
+            "x/v1",
+            vec!["/nonexistent/bin".into()],
+            std::env::temp_dir(),
+            Duration::from_secs(2),
+        );
+        let e = b
+            .handle(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+            .await
+            .unwrap();
         assert_eq!(e["error"]["code"], -32000);
     }
 }
