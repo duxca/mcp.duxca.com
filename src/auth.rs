@@ -109,6 +109,105 @@ pub fn normalize_url(raw: &str) -> Option<String> {
     Url::parse(raw).ok().map(|u| u.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// redirect_uri の allowlist
+
+/// 末尾 `/*` は 1 セグメントだけ、末尾 `/` は配下すべて、それ以外はパス完全一致。
+/// ポート無しのループバックはポートを問わない（RFC 8252 §7.3）。
+pub const DEFAULT_REDIRECT_ALLOWLIST: &[&str] = &[
+    "https://chatgpt.com/connector/oauth/*",
+    "https://claude.ai/api/mcp/auth_callback",
+    "https://claude.com/api/mcp/auth_callback",
+    "https://grok.com/",
+    "http://localhost/",
+    "http://127.0.0.1/",
+    "http://[::1]/",
+];
+
+enum PathRule {
+    Exact,
+    OneSegment,
+    Subtree,
+}
+
+struct RedirectRule {
+    base: Url,
+    path: PathRule,
+}
+
+impl RedirectRule {
+    fn matches(&self, url: &Url) -> bool {
+        let base = &self.base;
+        if url.scheme() != base.scheme() || url.host_str() != base.host_str() {
+            return false;
+        }
+        let any_port = base.port().is_none() && is_loopback(base);
+        if !any_port && url.port_or_known_default() != base.port_or_known_default() {
+            return false;
+        }
+        let path = url.path();
+        match self.path {
+            PathRule::Exact => path == base.path(),
+            PathRule::Subtree => path.starts_with(base.path()),
+            PathRule::OneSegment => path
+                .strip_prefix(base.path())
+                .is_some_and(|rest| !rest.is_empty() && !rest.contains('/')),
+        }
+    }
+}
+
+/// 登録・利用できる redirect_uri。認可コードを第三者のサーバへ送らせないために絞る。
+pub struct RedirectAllowlist(Vec<RedirectRule>);
+
+impl RedirectAllowlist {
+    pub fn parse<'a>(entries: impl IntoIterator<Item = &'a str>) -> Result<Self, String> {
+        let mut rules = Vec::new();
+        for raw in entries.into_iter().map(str::trim).filter(|s| !s.is_empty()) {
+            let (prefix, path) = match raw.strip_suffix('*') {
+                Some(p) if p.ends_with('/') => (p, PathRule::OneSegment),
+                Some(_) => return Err(format!("`*` は末尾の `/*` だけ使える: {raw}")),
+                None if raw.ends_with('/') => (raw, PathRule::Subtree),
+                None => (raw, PathRule::Exact),
+            };
+            let base = Url::parse(prefix)
+                .ok()
+                .filter(|u| {
+                    u.host_str().is_some()
+                        && u.username().is_empty()
+                        && u.password().is_none()
+                        && u.query().is_none()
+                        && u.fragment().is_none()
+                })
+                .ok_or_else(|| format!("redirect allowlist の項目が不正: {raw}"))?;
+            rules.push(RedirectRule { base, path });
+        }
+        if rules.is_empty() {
+            return Err("redirect allowlist が空".into());
+        }
+        Ok(Self(rules))
+    }
+
+    pub fn allows(&self, raw: &str) -> bool {
+        let Ok(url) = Url::parse(raw) else {
+            return false;
+        };
+        if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+            return false;
+        }
+        self.0.iter().any(|rule| rule.matches(&url))
+    }
+}
+
+impl Default for RedirectAllowlist {
+    fn default() -> Self {
+        Self::parse(DEFAULT_REDIRECT_ALLOWLIST.iter().copied()).expect("default redirect allowlist")
+    }
+}
+
+fn is_loopback(url: &Url) -> bool {
+    matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
+}
+
 /// `construct_redirect_uri`: 既存のクエリを残して値のある引数だけ足す。
 pub fn construct_redirect_uri(base: &str, params: &[(&str, Option<&str>)]) -> String {
     let Ok(mut url) = Url::parse(base) else {
@@ -532,8 +631,12 @@ impl ClientRecord {
     }
 
     /// 戻り値は正規化済みの redirect_uri。
-    pub fn validate_redirect_uri(&self, requested: Option<&str>) -> Result<String, String> {
-        match requested {
+    pub fn validate_redirect_uri(
+        &self,
+        requested: Option<&str>,
+        allowlist: &RedirectAllowlist,
+    ) -> Result<String, String> {
+        let uri = match requested {
             Some(raw) => {
                 let normalized = normalize_url(raw)
                     .ok_or_else(|| format!("Redirect URI '{raw}' not registered for client"))?;
@@ -542,17 +645,21 @@ impl ClientRecord {
                     .iter()
                     .any(|u| *u == normalized || loopback_matches(u, &normalized))
                 {
-                    Ok(normalized)
+                    normalized
                 } else {
-                    Err(format!("Redirect URI '{raw}' not registered for client"))
+                    return Err(format!("Redirect URI '{raw}' not registered for client"));
                 }
             }
-            None if self.redirect_uris.len() == 1 => Ok(self.redirect_uris[0].clone()),
-            None => Err(
+            None if self.redirect_uris.len() == 1 => self.redirect_uris[0].clone(),
+            None => return Err(
                 "redirect_uri must be specified unless the client has exactly one registered URI"
                     .into(),
             ),
+        };
+        if !allowlist.allows(&uri) {
+            return Err(format!("Redirect URI '{uri}' is not allowed"));
         }
+        Ok(uri)
     }
 }
 
@@ -561,8 +668,7 @@ fn loopback_matches(registered: &str, requested: &str) -> bool {
     let (Ok(reg), Ok(mut req)) = (Url::parse(registered), Url::parse(requested)) else {
         return false;
     };
-    let loopback = matches!(reg.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
-    if reg.scheme() != "http" || !loopback || reg.port().is_some() {
+    if reg.scheme() != "http" || !is_loopback(&reg) || reg.port().is_some() {
         return false;
     }
     if req.set_port(None).is_err() {
@@ -602,7 +708,10 @@ fn normalized_uris(list: Vec<String>, field: &str) -> Result<Vec<String>, String
 }
 
 /// RFC 7591 の登録要求を検証し、登録済みクライアントを作る（SDK の RegistrationHandler 相当）。
-pub fn client_from_registration(body: &Value) -> Result<ClientRecord, String> {
+pub fn client_from_registration(
+    body: &Value,
+    allowlist: &RedirectAllowlist,
+) -> Result<ClientRecord, String> {
     let Some(obj) = body.as_object() else {
         return Err("Input should be an object".into());
     };
@@ -612,6 +721,9 @@ pub fn client_from_registration(body: &Value) -> Result<ClientRecord, String> {
         return Err("redirect_uris: List should have at least 1 item".into());
     }
     let redirect_uris = normalized_uris(redirect_uris, "redirect_uris")?;
+    if let Some(bad) = redirect_uris.iter().find(|u| !allowlist.allows(u)) {
+        return Err(format!("redirect_uris: '{bad}' is not allowed"));
+    }
 
     let method = optional_string(
         obj.get("token_endpoint_auth_method"),
@@ -700,7 +812,11 @@ pub fn client_from_registration(body: &Value) -> Result<ClientRecord, String> {
 }
 
 /// CIMD を公開クライアントとして受ける。
-pub fn client_from_cimd(url: &str, document: &Value) -> Option<ClientRecord> {
+pub fn client_from_cimd(
+    url: &str,
+    document: &Value,
+    allowlist: &RedirectAllowlist,
+) -> Option<ClientRecord> {
     let obj = document.as_object()?;
     if obj.get("client_id").and_then(Value::as_str) != Some(url) {
         return None;
@@ -722,6 +838,10 @@ pub fn client_from_cimd(url: &str, document: &Value) -> Option<ClientRecord> {
         return None;
     }
     let redirect_uris = normalized_uris(redirect_uris, "redirect_uris").ok()?;
+    if let Some(bad) = redirect_uris.iter().find(|u| !allowlist.allows(u)) {
+        tracing::info!("cimd redirect_uri not allowed {url}: {bad}");
+        return None;
+    }
     let grant_types = string_list(obj.get("grant_types"), "grant_types")
         .ok()?
         .filter(|v| !v.is_empty())
@@ -876,6 +996,7 @@ pub struct OAuthServer {
     /// 共有の参照。集合から外すと発行済みの bearer も次の照合で弾かれる。
     pub allowed_ids: Arc<RwLock<HashSet<String>>>,
     pub github: Arc<dyn GitHubLogin>,
+    pub redirect_allowlist: RedirectAllowlist,
     fetcher: Arc<dyn ClientMetadataFetcher>,
     store: Mutex<Store>,
 }
@@ -888,6 +1009,7 @@ impl OAuthServer {
         github: Arc<dyn GitHubLogin>,
         fetcher: Arc<dyn ClientMetadataFetcher>,
         resource_paths: Vec<String>,
+        redirect_allowlist: RedirectAllowlist,
     ) -> Self {
         let issuer = issuer.trim_end_matches('/').to_string();
         assert!(
@@ -921,6 +1043,7 @@ impl OAuthServer {
             resource_paths,
             allowed_ids,
             github,
+            redirect_allowlist,
             fetcher,
             store: Mutex::new(Store::default()),
         }
@@ -1042,7 +1165,7 @@ impl OAuthServer {
                 return None;
             }
         };
-        let Some(client) = client_from_cimd(client_id, &document) else {
+        let Some(client) = client_from_cimd(client_id, &document, &self.redirect_allowlist) else {
             tracing::info!("cimd document rejected {client_id}");
             return None;
         };

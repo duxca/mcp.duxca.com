@@ -2,7 +2,7 @@
 
 use crate::auth::{
     is_cimd_client_id, pkce_s256, token_urlsafe, ClientMetadataFetcher, GitHubLogin,
-    GitHubLoginError, OAuthServer,
+    GitHubLoginError, OAuthServer, RedirectAllowlist,
 };
 use crate::backend::{BackendRegistry, McpBackend};
 use crate::routes::{router, AppState};
@@ -75,6 +75,7 @@ impl McpBackend for FakeBackend {
 struct Harness {
     app: Router,
     allowed: Arc<RwLock<HashSet<String>>>,
+    oauth: Arc<OAuthServer>,
 }
 
 fn harness_with(logins: &[(&str, &str, &str)], configured: bool, cimd: Option<Value>) -> Harness {
@@ -92,14 +93,19 @@ fn harness_with(logins: &[(&str, &str, &str)], configured: bool, cimd: Option<Va
         Arc::new(github),
         Arc::new(FakeFetcher(cimd)),
         vec![TEST_MCP_PATH.to_string()],
+        RedirectAllowlist::default(),
     ));
     let mut backends = BackendRegistry::new();
     backends.insert(TEST_MCP_PATH.to_string(), Arc::new(FakeBackend));
     let app = router(AppState {
         backends: Arc::new(backends),
-        oauth,
+        oauth: oauth.clone(),
     });
-    Harness { app, allowed }
+    Harness {
+        app,
+        allowed,
+        oauth,
+    }
 }
 
 fn harness() -> Harness {
@@ -735,6 +741,7 @@ async fn two_services_require_resource_and_isolate_tokens() {
         Arc::new(github),
         Arc::new(FakeFetcher(None)),
         paths.clone(),
+        RedirectAllowlist::default(),
     ));
     let mut backends = BackendRegistry::new();
     backends.insert("/claude/v1".into(), Arc::new(FakeBackend));
@@ -851,7 +858,8 @@ fn cimd_private_key_jwt_is_accepted_only_when_none_is_also_supported() {
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
     });
-    let client = client_from_cimd(url, &chatgpt).expect("chatgpt cimd accepted");
+    let allowlist = RedirectAllowlist::default();
+    let client = client_from_cimd(url, &chatgpt, &allowlist).expect("chatgpt cimd accepted");
     assert_eq!(client.token_endpoint_auth_method, "none");
     assert!(client.client_secret.is_none());
 
@@ -860,5 +868,222 @@ fn cimd_private_key_jwt_is_accepted_only_when_none_is_also_supported() {
         "redirect_uris": ["https://chatgpt.com/connector/oauth/abc"],
         "token_endpoint_auth_method": "private_key_jwt",
     });
-    assert!(client_from_cimd(url, &jwt_only).is_none());
+    assert!(client_from_cimd(url, &jwt_only, &allowlist).is_none());
+}
+
+#[test]
+fn default_redirect_allowlist() {
+    let allowlist = RedirectAllowlist::default();
+    for ok in [
+        "https://chatgpt.com/connector/oauth/abc123",
+        "https://claude.ai/api/mcp/auth_callback",
+        "https://claude.com/api/mcp/auth_callback",
+        "https://grok.com/",
+        "https://grok.com/oauth/callback",
+        "http://localhost/callback",
+        "http://localhost:53682/callback",
+        "http://127.0.0.1:9/cb",
+        "http://[::1]:8080/",
+    ] {
+        assert!(allowlist.allows(ok), "{ok}");
+    }
+    for bad in [
+        "https://evil.example/cb",
+        "https://chatgpt.com/connector/oauth/",
+        "https://chatgpt.com/connector/oauth/a/b",
+        "https://chatgpt.com/other",
+        "https://claude.ai/api/mcp/auth_callback/x",
+        "https://claude.ai/api/mcp/../../evil",
+        "https://claude.ai:8443/api/mcp/auth_callback",
+        "http://claude.ai/api/mcp/auth_callback",
+        "https://grok.com.evil.example/",
+        "https://sub.grok.com/",
+        "http://grok.com/",
+        "https://localhost/callback",
+        "http://10.0.0.1/callback",
+        // fragment / userinfo
+        "https://claude.ai/api/mcp/auth_callback#x",
+        "https://claude.ai/api/mcp/auth_callback#",
+        "https://user@claude.ai/api/mcp/auth_callback",
+        "https://user:pw@grok.com/",
+        "http://user@localhost/callback",
+        "not a url",
+    ] {
+        assert!(!allowlist.allows(bad), "{bad}");
+    }
+}
+
+async fn register_redirects(app: &Router, redirect_uris: &[&str]) -> Reply {
+    let body = json!({ "redirect_uris": redirect_uris, "token_endpoint_auth_method": "none" });
+    send(
+        app,
+        Request::post("/register")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+    )
+    .await
+}
+
+fn authorize_with_redirect(client_id: &str, challenge: &str, redirect: Option<&str>) -> String {
+    let mut pairs = vec![
+        ("response_type", "code"),
+        ("client_id", client_id),
+        ("code_challenge", challenge),
+        ("code_challenge_method", "S256"),
+        ("state", "st"),
+    ];
+    if let Some(r) = redirect {
+        pairs.push(("redirect_uri", r));
+    }
+    format!("/authorize?{}", encode(&pairs))
+}
+
+fn assert_json_error_without_redirect(reply: &Reply) {
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+    assert!(reply.headers.get(header::LOCATION).is_none());
+    assert_eq!(reply.json()["error"], "invalid_request");
+}
+
+#[tokio::test]
+async fn registration_rejects_redirect_uris_outside_the_allowlist() {
+    let h = harness();
+    for uris in [
+        vec!["https://evil.example/cb"],
+        vec![
+            "https://claude.ai/api/mcp/auth_callback",
+            "https://evil.example/cb",
+        ],
+        vec!["https://claude.ai/api/mcp/auth_callback#frag"],
+        vec!["https://user@claude.ai/api/mcp/auth_callback"],
+        vec!["https://chatgpt.com/connector/oauth/a/b"],
+    ] {
+        let reply = register_redirects(&h.app, &uris).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{uris:?}");
+        assert_eq!(reply.json()["error"], "invalid_client_metadata");
+        assert!(
+            reply.json()["error_description"]
+                .as_str()
+                .unwrap()
+                .contains("not allowed"),
+            "{}",
+            reply.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn registration_accepts_chatgpt_and_authorize_starts_github_login() {
+    let h = harness();
+    let redirect = "https://chatgpt.com/connector/oauth/abc123";
+    let reply = register_redirects(&h.app, &[redirect]).await;
+    assert_eq!(reply.status, StatusCode::CREATED, "{}", reply.body);
+    let client_id = reply.json()["client_id"].as_str().unwrap().to_string();
+    let (_verifier, challenge) = pkce();
+    let started = get(
+        &h.app,
+        &authorize_with_redirect(&client_id, &challenge, Some(redirect)),
+    )
+    .await;
+    assert_eq!(started.status, StatusCode::FOUND, "{}", started.body);
+    assert!(started
+        .location()
+        .as_str()
+        .starts_with("https://github.com/login/oauth/authorize"));
+}
+
+#[tokio::test]
+async fn registration_accepts_loopback_on_any_port() {
+    let h = harness();
+    let reply = register_redirects(
+        &h.app,
+        &["http://localhost/callback", "http://[::1]/callback"],
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::CREATED, "{}", reply.body);
+    let client_id = reply.json()["client_id"].as_str().unwrap().to_string();
+    let (_verifier, challenge) = pkce();
+    for redirect in [
+        "http://localhost:53682/callback",
+        "http://[::1]:8080/callback",
+    ] {
+        let started = get(
+            &h.app,
+            &authorize_with_redirect(&client_id, &challenge, Some(redirect)),
+        )
+        .await;
+        assert_eq!(
+            started.status,
+            StatusCode::FOUND,
+            "{redirect}: {}",
+            started.body
+        );
+        assert!(started
+            .location()
+            .as_str()
+            .starts_with("https://github.com/login/oauth/authorize"));
+    }
+}
+
+#[tokio::test]
+async fn cimd_with_redirect_uris_outside_the_allowlist_is_rejected() {
+    let url = "https://client.example/oauth.json";
+    let (_verifier, challenge) = pkce();
+    for redirect_uris in [
+        json!(["https://evil.example/cb"]),
+        // 1 つでも allowlist 外があれば文書ごと拒否する
+        json!([
+            "https://claude.ai/api/mcp/auth_callback",
+            "https://evil.example/cb"
+        ]),
+    ] {
+        let h = harness_with(
+            &[("ok", "2429307", "legokichi")],
+            true,
+            Some(json!({
+                "client_id": url,
+                "redirect_uris": redirect_uris,
+                "token_endpoint_auth_method": "none",
+            })),
+        );
+        for redirect in [
+            Some("https://evil.example/cb"),
+            Some("https://claude.ai/api/mcp/auth_callback"),
+            None,
+        ] {
+            let reply = get(&h.app, &authorize_with_redirect(url, &challenge, redirect)).await;
+            assert_json_error_without_redirect(&reply);
+        }
+    }
+}
+
+#[tokio::test]
+async fn authorize_rejects_a_stored_redirect_outside_the_allowlist_without_redirecting() {
+    // 登録時の検査をすり抜けたクライアントでも、/authorize は戻し先へ送らない。
+    let h = harness();
+    let permissive = RedirectAllowlist::parse(["https://evil.example/"]).unwrap();
+    let client = crate::auth::client_from_registration(
+        &json!({ "redirect_uris": ["https://evil.example/cb"], "token_endpoint_auth_method": "none" }),
+        &permissive,
+    )
+    .unwrap();
+    let client_id = client.client_id.clone();
+    h.oauth.register_client(client);
+    let (_verifier, challenge) = pkce();
+    for redirect in [Some("https://evil.example/cb"), None] {
+        let reply = get(
+            &h.app,
+            &authorize_with_redirect(&client_id, &challenge, redirect),
+        )
+        .await;
+        assert_json_error_without_redirect(&reply);
+        assert!(
+            reply.json()["error_description"]
+                .as_str()
+                .unwrap()
+                .contains("not allowed"),
+            "{}",
+            reply.body
+        );
+    }
 }

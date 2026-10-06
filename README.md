@@ -125,7 +125,9 @@ curl -si -X POST http://127.0.0.1:8000/default/v1 \
 | 変数 | 意味 |
 |------|------|
 | `PUBLIC_URL` | 公開オリジン（スキーム+ホスト） |
-| `PORT` | 待受（既定 8000） |
+| `BIND_ADDR` | 待受アドレス（既定 `127.0.0.1`。公開は Tunnel 経由なので外向きには開けない） |
+| `PORT` | 待受ポート（既定 8000） |
+| `OAUTH_REDIRECT_ALLOWLIST` | カンマ区切りの redirect_uri 許可リスト。末尾 `/*` は 1 セグメントだけ、末尾 `/` は配下すべて、それ以外はパス完全一致。ポート無しのループバックはポートを問わない。未設定時は `src/auth.rs` の `DEFAULT_REDIRECT_ALLOWLIST`（ChatGPT / Claude / Grok / ループバック） |
 | `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | GitHub OAuth App |
 | `ALLOWED_GITHUB_IDS` | カンマ区切り数値 id |
 | `MCP_SERVICES` | カンマ区切り `name/version`（空なら `default/v1`） |
@@ -151,6 +153,7 @@ curl -si -X POST http://127.0.0.1:8000/default/v1 \
 - 旧パス `/github/callback` と `/mcp/v3` は廃止。
 - CIMD 取得は公開 IP だけに接続する。ローカル DNS が合成アドレスを返すときは Cloudflare DoH にフォールバックする。
 - ループバック redirect（`http://localhost/callback`）は RFC 8252 どおりポート違いを許す。
+- redirect_uri は `OAUTH_REDIRECT_ALLOWLIST` に載るものだけ受ける。`/register` は `invalid_client_metadata`、CIMD は文書ごと拒否、`/authorize` はリダイレクトせず 400 JSON。fragment・userinfo 付きは常に拒否。
 - 起動は `./scripts/run.sh` のみサポート。常時起動前提の運用はしない。
 
 ## duxca VM へのデプロイ（adb/v1 のみ）

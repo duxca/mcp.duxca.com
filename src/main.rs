@@ -61,6 +61,7 @@ async fn main() -> anyhow::Result<()> {
         github,
         Arc::new(HttpClientMetadataFetcher),
         service_paths.clone(),
+        config.redirect_allowlist()?,
     ));
 
     let mut backends = BackendRegistry::new();
@@ -82,8 +83,8 @@ async fn main() -> anyhow::Result<()> {
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http());
 
-    let addr = format!("0.0.0.0:{}", config.port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let addr = config.listen_addr()?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("listening on {addr} (Ctrl+C for graceful shutdown)");
     // StdioMcpBackend uses kill_on_drop(true); dropping AppState on shutdown
     // tears down MCP child processes with the gateway.
