@@ -158,7 +158,7 @@ curl -si -X POST http://127.0.0.1:8000/default/v1 \
 `main` への push で `.github/workflows/deploy.yml` が走り、ビルドしたバイナリと `deploy/` を
 `duxca` VM（`duxca.com:4322`）に送って `deploy/install.sh` を sudo 実行する。
 
-- systemd: `mcp-duxca-com.service`（gateway, 127.0.0.1:18733, `MCP_SERVICES=adb/v1`, `ADB_MCP_ALLOW_SHELL=1`）と
+- systemd: `mcp-duxca-com.service`（gateway, 127.0.0.1:8000, `MCP_SERVICES=adb/v1`, `ADB_MCP_ALLOW_SHELL=1`）と
   `mcp-duxca-com-tunnel.service`（cloudflared）。どちらも専用ユーザー `mcp-duxca` で動く。
 - adbmcp は FlashZ/adb-mcp をコミット固定で `/opt/mcp-duxca-com/adbmcp` の venv に入れる。
 - 秘密は GitHub Secrets: `MCP_GITHUB_CLIENT_ID`, `MCP_GITHUB_CLIENT_SECRET`, `MCP_TUNNEL_TOKEN`,

@@ -40,6 +40,6 @@ systemctl restart mcp-duxca-com.service
 systemctl restart mcp-duxca-com-tunnel.service
 sleep 3
 systemctl is-active mcp-duxca-com.service mcp-duxca-com-tunnel.service
-code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18733/adb/v1)
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8000/adb/v1)
 echo "local POST /adb/v1 -> $code"
 [[ "$code" == 401 ]]

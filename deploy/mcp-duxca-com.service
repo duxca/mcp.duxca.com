@@ -9,7 +9,7 @@ User=mcp-duxca
 Group=mcp-duxca
 WorkingDirectory=/var/lib/mcp-duxca-com
 Environment=HOME=/var/lib/mcp-duxca-com
-Environment=PORT=18733
+Environment=PORT=8000
 Environment=PUBLIC_URL=https://mcp.duxca.com
 Environment=MCP_SERVICES=adb/v1
 Environment=MCP_ADB_V1_COMMAND=/opt/mcp-duxca-com/adbmcp/bin/adbmcp
