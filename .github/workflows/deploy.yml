@@ -1,0 +1,58 @@
+name: Deploy to duxca VM
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-duxca-vm
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  deploy:
+    # bookworm (glibc 2.36) で動くように 22.04 (glibc 2.35) でビルド
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@v6
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: Swatinem/rust-cache@v2
+    - run: cargo test --locked
+    - run: cargo build --release --locked
+    - name: Stage
+      env:
+        GITHUB_CLIENT_ID: ${{ secrets.MCP_GITHUB_CLIENT_ID }}
+        GITHUB_CLIENT_SECRET: ${{ secrets.MCP_GITHUB_CLIENT_SECRET }}
+        TUNNEL_TOKEN: ${{ secrets.MCP_TUNNEL_TOKEN }}
+      run: |
+        umask 077
+        mkdir -p stage
+        cp target/release/mcp-duxca-com deploy/*.service deploy/install.sh stage/
+        if [ -n "$GITHUB_CLIENT_SECRET" ]; then
+          printf 'GITHUB_CLIENT_ID=%s\nGITHUB_CLIENT_SECRET=%s\n' "$GITHUB_CLIENT_ID" "$GITHUB_CLIENT_SECRET" > stage/runtime.env
+        fi
+        if [ -n "$TUNNEL_TOKEN" ]; then printf '%s' "$TUNNEL_TOKEN" > stage/tunnel.token; fi
+    - name: Ship and install
+      env:
+        SSH_KEY: ${{ secrets.DUXCA_SSH_KEY }}
+        KNOWN_HOSTS: ${{ secrets.DUXCA_KNOWN_HOSTS }}
+      run: |
+        install -d -m 700 ~/.ssh
+        printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+        printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+        SSH="ssh -p 4322 -o BatchMode=yes legokichi@duxca.com"
+        D=/tmp/mcp-duxca-deploy-${GITHUB_RUN_ID}
+        $SSH "rm -rf $D && mkdir -m 700 $D"
+        scp -P 4322 -o BatchMode=yes stage/* legokichi@duxca.com:$D/
+        $SSH "sudo bash $D/install.sh $D; rc=\$?; rm -rf $D; exit \$rc"
+    - name: Public check
+      run: |
+        sleep 5
+        test "$(curl -s -o /dev/null -w '%{http_code}' -X POST https://mcp.duxca.com/adb/v1)" = 401
+        test "$(curl -s -o /dev/null -w '%{http_code}' https://mcp.duxca.com/health)" = 404

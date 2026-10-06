@@ -21,7 +21,6 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 
-pub const MCP_PATH: &str = "/mcp/v3";
 /// river.duxca.com と同じ GitHub OAuth コールバックパス。
 pub const REDIRECT_PATH: &str = "/oauth/callback/github";
 /// GitHub OAuth App 未設定時の案内。
@@ -863,7 +862,10 @@ pub enum CallbackOutcome {
 
 pub struct OAuthServer {
     pub issuer: String,
-    pub resource_url: String,
+    /// 許可する保護リソース URL の集合（`{issuer}/{name}/{version}`）。
+    pub resource_urls: HashSet<String>,
+    /// 登録順。単独サービス時のデフォルトや一覧に使う。
+    pub resource_paths: Vec<String>,
     /// 共有の参照。集合から外すと発行済みの bearer も次の照合で弾かれる。
     pub allowed_ids: Arc<RwLock<HashSet<String>>>,
     pub github: Arc<dyn GitHubLogin>,
@@ -872,16 +874,44 @@ pub struct OAuthServer {
 }
 
 impl OAuthServer {
+    /// `resource_paths` は `/claude/v1` のようなパス（先頭スラッシュ付き）。
     pub fn new(
         issuer: &str,
         allowed_ids: Arc<RwLock<HashSet<String>>>,
         github: Arc<dyn GitHubLogin>,
         fetcher: Arc<dyn ClientMetadataFetcher>,
+        resource_paths: Vec<String>,
     ) -> Self {
         let issuer = issuer.trim_end_matches('/').to_string();
+        assert!(
+            !resource_paths.is_empty(),
+            "at least one MCP resource path is required"
+        );
+        let resource_urls: HashSet<String> = resource_paths
+            .iter()
+            .map(|p| {
+                let p = if p.starts_with('/') {
+                    p.clone()
+                } else {
+                    format!("/{p}")
+                };
+                format!("{issuer}{p}")
+            })
+            .collect();
+        let resource_paths: Vec<String> = resource_paths
+            .into_iter()
+            .map(|p| {
+                if p.starts_with('/') {
+                    p
+                } else {
+                    format!("/{p}")
+                }
+            })
+            .collect();
         Self {
-            resource_url: format!("{issuer}{MCP_PATH}"),
             issuer,
+            resource_urls,
+            resource_paths,
             allowed_ids,
             github,
             fetcher,
@@ -889,11 +919,46 @@ impl OAuthServer {
         }
     }
 
-    pub fn resource_metadata_url(&self) -> String {
+    /// 登録順で先頭のリソース URL。
+    pub fn primary_resource_url(&self) -> String {
+        self.all_resource_urls()
+            .into_iter()
+            .next()
+            .expect("at least one resource")
+    }
+
+    pub fn resource_url_for_path(&self, path: &str) -> Option<String> {
+        let path = if path.starts_with('/') {
+            path.to_string()
+        } else {
+            format!("/{path}")
+        };
+        let url = format!("{}{path}", self.issuer);
+        if self.resource_urls.contains(&url) {
+            Some(url)
+        } else {
+            None
+        }
+    }
+
+    pub fn resource_metadata_url_for(&self, path: &str) -> String {
+        let path = if path.starts_with('/') {
+            path.to_string()
+        } else {
+            format!("/{path}")
+        };
         format!(
-            "{}/.well-known/oauth-protected-resource{MCP_PATH}",
+            "{}/.well-known/oauth-protected-resource{path}",
             self.issuer
         )
+    }
+
+    /// ルート well-known 用。全リソースを列挙する。
+    pub fn all_resource_urls(&self) -> Vec<String> {
+        self.resource_paths
+            .iter()
+            .map(|p| format!("{}{p}", self.issuer))
+            .collect()
     }
 
     fn store(&self) -> std::sync::MutexGuard<'_, Store> {
@@ -932,9 +997,19 @@ impl OAuthServer {
         })
     }
 
-    pub fn protected_resource_metadata(&self) -> Value {
+    pub fn protected_resource_metadata_for(&self, path: &str) -> Option<Value> {
+        let resource = self.resource_url_for_path(path)?;
+        Some(serde_json::json!({
+            "resource": resource,
+            "authorization_servers": [self.issuer],
+            "bearer_methods_supported": ["header"],
+        }))
+    }
+
+    /// ルート `/.well-known/oauth-protected-resource` 用の拡張一覧。
+    pub fn protected_resources_index(&self) -> Value {
         serde_json::json!({
-            "resource": self.resource_url,
+            "resources": self.all_resource_urls(),
             "authorization_servers": [self.issuer],
             "bearer_methods_supported": ["header"],
         })
@@ -985,15 +1060,35 @@ impl OAuthServer {
         store.clients.insert(client.client_id.clone(), client);
     }
 
+    fn normalize_resource_key(url: &str) -> String {
+        normalize_url(url)
+            .unwrap_or_else(|| url.to_string())
+            .trim_end_matches('/')
+            .to_ascii_lowercase()
+    }
+
+    fn lookup_resource(&self, requested: &str) -> Option<String> {
+        let key = Self::normalize_resource_key(requested);
+        self.resource_urls
+            .iter()
+            .find(|u| Self::normalize_resource_key(u) == key)
+            .cloned()
+    }
+
+    /// RFC 8707: 要求された resource を許可集合に束ねる。
+    /// サービスが 1 つだけのときは省略可（その URL を既定にする）。
+    /// 複数あるときは `resource` 必須。
     fn bound_resource(&self, requested: Option<&str>) -> Result<String, AuthorizeError> {
         match requested {
-            None => Ok(self.resource_url.clone()),
-            Some(r) if r.trim_end_matches('/') == self.resource_url.trim_end_matches('/') => {
-                Ok(self.resource_url.clone())
-            }
-            Some(_) => Err(AuthorizeError {
+            None if self.resource_urls.len() == 1 => Ok(self.primary_resource_url()),
+            None => Err(AuthorizeError {
                 error: "invalid_target",
-                description: "resource does not match this MCP server".into(),
+                description: "resource is required when multiple MCP services are configured"
+                    .into(),
+            }),
+            Some(r) => self.lookup_resource(r).ok_or_else(|| AuthorizeError {
+                error: "invalid_target",
+                description: "resource does not match a configured MCP service".into(),
             }),
         }
     }
@@ -1174,7 +1269,12 @@ impl OAuthServer {
     }
 
     /// Bearer を照合する。期限・許可 id・resource（RFC 8707）を見る。
-    pub fn load_access_token(&self, token: &str) -> Option<IssuedToken> {
+    /// `expected_resource_url` はこのリクエストの MCP パスに対応する絶対 URL。
+    pub fn load_access_token(
+        &self,
+        token: &str,
+        expected_resource_url: &str,
+    ) -> Option<IssuedToken> {
         let found = {
             let mut store = self.store();
             let found = store.access_tokens.get(token)?.clone();
@@ -1187,12 +1287,14 @@ impl OAuthServer {
         if found.subject.is_empty() || !self.allows(&found.subject) {
             return None;
         }
-        let same_resource = normalize_url(&found.resource)
-            .map(|r| r.trim_end_matches('/').to_ascii_lowercase())
-            == normalize_url(&self.resource_url)
-                .map(|r| r.trim_end_matches('/').to_ascii_lowercase());
+        let same_resource = Self::normalize_resource_key(&found.resource)
+            == Self::normalize_resource_key(expected_resource_url);
         if !same_resource {
-            tracing::warn!("bearer token resource is not this server");
+            tracing::warn!(
+                expected = %expected_resource_url,
+                token_resource = %found.resource,
+                "bearer token resource does not match this MCP path"
+            );
             return None;
         }
         Some(found)

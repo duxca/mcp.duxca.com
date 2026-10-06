@@ -1,0 +1,33 @@
+[Unit]
+Description=mcp.duxca.com gateway (adb/v1 only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mcp-duxca
+Group=mcp-duxca
+WorkingDirectory=/var/lib/mcp-duxca-com
+Environment=HOME=/var/lib/mcp-duxca-com
+Environment=PORT=18733
+Environment=PUBLIC_URL=https://mcp.duxca.com
+Environment=MCP_SERVICES=adb/v1
+Environment=MCP_ADB_V1_COMMAND=/opt/mcp-duxca-com/adbmcp/bin/adbmcp
+Environment=MCP_ADB_V1_CWD=/var/lib/mcp-duxca-com
+# run_shell ツール（端末上の adb shell）を有効化。ホストのシェルではない。
+Environment=ADB_MCP_ALLOW_SHELL=1
+Environment=RUST_LOG=info,mcp_duxca_com=info
+# GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET（CI が GitHub Secrets から書く）
+EnvironmentFile=/etc/mcp-duxca-com/runtime.env
+ExecStart=/opt/mcp-duxca-com/bin/mcp-duxca-com
+Restart=on-failure
+RestartSec=3
+MemoryMax=350M
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/mcp-duxca-com
+
+[Install]
+WantedBy=multi-user.target
