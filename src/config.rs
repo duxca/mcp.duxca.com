@@ -53,6 +53,30 @@ pub struct Config {
 
     #[serde(default)]
     pub claude_cwd: Option<String>,
+
+    /// relay（/relay/v1）の Muse 用 REST キー。GROK と両方そろったときだけ relay を有効にする。
+    #[serde(default)]
+    pub relay_muse_key: String,
+
+    /// relay の Grok 用 MCP キー。
+    #[serde(default)]
+    pub relay_grok_key: String,
+
+    /// webhook 署名（HMAC-SHA256）の共有秘密。
+    #[serde(default)]
+    pub relay_webhook_secret: String,
+
+    /// Muse の新着を POST する先。空なら送らない。
+    #[serde(default)]
+    pub relay_grok_webhook_url: String,
+
+    /// webhook の Authorization ヘッダにそのまま載せる値。
+    #[serde(default)]
+    pub relay_grok_webhook_auth: String,
+
+    /// 添付の総量上限（バイト）。メモリに持つので小さめ。
+    #[serde(default = "default_relay_max_total_storage_bytes")]
+    pub relay_max_total_storage_bytes: u64,
 }
 
 fn default_public_url() -> String {
@@ -73,6 +97,10 @@ fn default_allowed_ids() -> String {
 
 fn default_claude_command() -> String {
     "claude mcp serve".into()
+}
+
+fn default_relay_max_total_storage_bytes() -> u64 {
+    crate::relay::DEFAULT_MAX_TOTAL_STORAGE_BYTES
 }
 
 /// `name` / `version` を環境変数キー用に正規化する。

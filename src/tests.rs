@@ -100,6 +100,7 @@ fn harness_with(logins: &[(&str, &str, &str)], configured: bool, cimd: Option<Va
     let app = router(AppState {
         backends: Arc::new(backends),
         oauth: oauth.clone(),
+        relay: None,
     });
     Harness {
         app,
@@ -749,6 +750,7 @@ async fn two_services_require_resource_and_isolate_tokens() {
     let app = router(AppState {
         backends: Arc::new(backends),
         oauth,
+        relay: None,
     });
 
     // 複数サービス時、resource 無しの authorize は invalid_target
@@ -844,6 +846,79 @@ async fn health_is_an_empty_404() {
     let r = get(&h.app, "/health").await;
     assert_eq!(r.status, StatusCode::NOT_FOUND);
     assert!(r.body.is_empty());
+}
+
+/// 既存のハーネスに relay を足したゲートウェイ。
+fn gateway_with_relay(relay: Option<Arc<crate::relay::Relay>>) -> Router {
+    let h = harness();
+    let mut backends = BackendRegistry::new();
+    backends.insert(TEST_MCP_PATH.to_string(), Arc::new(FakeBackend));
+    router(AppState {
+        backends: Arc::new(backends),
+        oauth: h.oauth.clone(),
+        relay,
+    })
+}
+
+#[tokio::test]
+async fn relay_routes_exist_only_with_keys_and_leave_the_gateway_alone() {
+    let config: crate::config::Config = envy::from_iter(
+        [
+            ("RELAY_MUSE_KEY", "test-muse-key"),
+            ("RELAY_GROK_KEY", "test-grok-key"),
+        ]
+        .map(|(k, v)| (k.to_string(), v.to_string())),
+    )
+    .unwrap();
+    let relay = crate::relay::Relay::from_config(&config, PUBLIC_URL);
+    assert!(relay.is_some());
+    let enabled = gateway_with_relay(relay);
+    let disabled = gateway_with_relay(None);
+
+    let r = get(&disabled, "/relay/v1/health").await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    assert!(r.body.is_empty());
+    let r = get(&enabled, "/relay/v1/health").await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.json(), json!({ "status": "ok" }));
+
+    for app in [&enabled, &disabled] {
+        for path in ["/", "/health"] {
+            let r = get(app, path).await;
+            assert_eq!(r.status, StatusCode::NOT_FOUND, "{path}");
+            assert!(r.body.is_empty(), "{path}");
+        }
+        let r = mcp(app, None, 1).await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+        assert!(r.headers[header::WWW_AUTHENTICATE]
+            .to_str()
+            .unwrap()
+            .contains("resource_metadata="));
+        // relay の静的キーは OAuth の Bearer として通らない
+        let r = mcp(app, Some("test-muse-key"), 1).await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+        let r = send(app, Request::post("/relay/v1").body(Body::empty()).unwrap()).await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            get(app, "/.well-known/oauth-authorization-server")
+                .await
+                .status,
+            StatusCode::OK
+        );
+    }
+
+    // OAuth の Bearer は relay に通らない
+    let h = harness();
+    let (access, _, _) = issue_token(&h.app).await;
+    let r = send(
+        &enabled,
+        Request::get("/relay/v1/messages")
+            .header(header::AUTHORIZATION, format!("Bearer {access}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
 }
 
 #[test]

@@ -1,6 +1,7 @@
 mod auth;
 mod backend;
 mod config;
+mod relay;
 mod routes;
 #[cfg(test)]
 mod tests;
@@ -13,7 +14,7 @@ use std::sync::{Arc, RwLock};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
@@ -74,9 +75,17 @@ async fn main() -> anyhow::Result<()> {
         backends.insert(svc.path.clone(), backend);
     }
 
+    let relay = relay::Relay::from_config(&config, &public_url);
+    match &relay {
+        Some(relay) => tracing::info!(base = %relay.base_url(), "relay enabled"),
+        None => tracing::info!("relay disabled (RELAY_MUSE_KEY / RELAY_GROK_KEY 未設定)"),
+    }
+
+    let relay_on_shutdown = relay.clone();
     let state = AppState {
         backends: Arc::new(backends),
         oauth,
+        relay,
     };
 
     let app = router(state)
@@ -89,7 +98,12 @@ async fn main() -> anyhow::Result<()> {
     // StdioMcpBackend uses kill_on_drop(true); dropping AppState on shutdown
     // tears down MCP child processes with the gateway.
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            if let Some(relay) = relay_on_shutdown {
+                relay.store.close();
+            }
+        })
         .await?;
     tracing::info!("gateway stopped");
     Ok(())

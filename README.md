@@ -74,6 +74,39 @@ cargo run   # Tunnel 無しのゲートウェイ単体でも可（PUBLIC_URL 必
 
 旧パス `/mcp/v3` は廃止（サブドメイン `mcp.` と重複するため）。
 
+relay を有効にすると、上に加えて `/relay/v1/*` が生える（次節）。
+
+## relay（Muse ⇄ Grok Bot、`/relay/v1`）
+
+[AISupplyGuy/muse-relay](https://github.com/AISupplyGuy/muse-relay) の Rust 移植。Muse は REST、Grok Bot は MCP で、
+同じスレッドにメッセージと添付をやりとりする。`src/relay/` にまとまっている。
+
+- `RELAY_MUSE_KEY` と `RELAY_GROK_KEY` の両方が設定されたときだけ有効（どちらか欠けるか同じ値なら無効で、ルートも生えない）
+- 認証は静的キー 2 本だけ。OAuth（GitHub ログイン）の Bearer とは別物で、互いに通らない
+  - Muse キーは REST だけ、Grok キーは MCP だけ。ファイル DL はどちらのキーでも可
+  - `Authorization: Bearer <key>` か `X-API-Key: <key>`
+- ストアはメモリだけ。再起動でスレッド・メッセージ・添付は消える
+  - メッセージ id（= カーソル）は起動時刻の Unix ミリ秒から増えるので、再起動前のカーソルもそのまま使える
+- 添付は 1 メッセージ 5 件・合計 3 MB まで。全体の総量は `RELAY_MAX_TOTAL_STORAGE_BYTES`（既定 32 MB）で、超えると 507
+- long-poll（`ask` / `GET messages?wait=`）は最大 280 秒。Ctrl+C では待機中のものも即座に返して止まる
+
+| Method | Path | 認証 | 説明 |
+|--------|------|------|------|
+| GET | `/relay/v1/health` | なし | `{"status":"ok"}` |
+| GET | `/relay/v1/docs`（`/llms.txt`, `/docs.md`） | なし | Muse 向けの使い方（テキスト） |
+| GET | `/relay/v1/openapi.json` | なし | OpenAPI |
+| POST | `/relay/v1/ask` | Muse | 送って Grok の返信を待つ（既定 240 秒） |
+| GET / POST | `/relay/v1/messages` | Muse | Grok からの受信一覧（`since` / `wait`）／待たずに送信 |
+| POST | `/relay/v1/messages/read` | Muse | 既読化 |
+| GET | `/relay/v1/threads`, `/relay/v1/threads/{id}` | Muse | スレッド一覧・詳細 |
+| GET | `/relay/v1/files/{attachment_id}` | Muse / Grok | 添付の生バイト |
+| POST | `/relay/v1/mcp` | Grok | MCP（stateless streamable HTTP、バッチ可） |
+
+Muse の送信（`ask` / `POST messages`）ごとに `RELAY_GROK_WEBHOOK_URL` へ通知する（Grok 側の送信では通知しない）。
+本文 `{"event":"muse.message.created","message":{...}}` に、`X-Relay-Signature: sha256=<HMAC-SHA256(RELAY_WEBHOOK_SECRET, "<timestamp>.<body>")>`、
+`X-Relay-Timestamp`、`X-Relay-Event`、元実装互換の `X-Relay-Secret`（秘密そのもの）と、`RELAY_GROK_WEBHOOK_AUTH` があれば `Authorization` を付ける。
+単発・5 秒タイムアウトで、リダイレクトは追わない。
+
 ## GitHub OAuth App の設定
 
 1. **新規は作らない**。pascal の `~/Github/mcp-test` が使っている GitHub OAuth App を流用する
@@ -135,6 +168,11 @@ curl -si -X POST http://127.0.0.1:8000/default/v1 \
 | `MCP_<NAME>_<VER>_CWD` | サービスごとの cwd（省略時は下記） |
 | `CLAUDE_MCP_COMMAND` | `MCP_SERVICES` 未設定時のフォールバック（既定 `claude mcp serve`） |
 | `CLAUDE_CWD` | 上記フォールバック / 個別 CWD 未設定時の cwd（省略時 `$HOME`） |
+| `RELAY_MUSE_KEY` / `RELAY_GROK_KEY` | relay の静的キー。両方あるときだけ `/relay/v1` を有効化 |
+| `RELAY_WEBHOOK_SECRET` | relay webhook の HMAC 秘密 |
+| `RELAY_GROK_WEBHOOK_URL` | Muse の新着を POST する先（空なら送らない） |
+| `RELAY_GROK_WEBHOOK_AUTH` | webhook の `Authorization` にそのまま付ける値 |
+| `RELAY_MAX_TOTAL_STORAGE_BYTES` | relay 添付の総量上限（既定 33554432 = 32 MB） |
 | `CLOUDFLARED_TOKEN_FILE` | Tunnel トークンファイル（`scripts/run.sh`） |
 | `MCP_BIN` | ゲートウェイ実行ファイル（`scripts/run.sh`） |
 

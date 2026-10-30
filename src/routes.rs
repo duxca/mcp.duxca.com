@@ -6,6 +6,7 @@ use crate::auth::{
     REGISTRATION_PATH, TOKEN_PATH,
 };
 use crate::backend::BackendRegistry;
+use crate::relay::Relay;
 use axum::body::Bytes;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
@@ -22,10 +23,13 @@ pub struct AppState {
     pub backends: Arc<BackendRegistry>,
     /// 登録順のサービスパス一覧
     pub oauth: Arc<OAuthServer>,
+    /// `/relay/v1`。キー未設定なら None でルートごと出さない。
+    pub relay: Option<Arc<Relay>>,
 }
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let relay = state.relay.clone();
+    let app = Router::new()
         // パスベース MCP: /{service}/{version}
         .route("/{service}/{version}", post(mcp_post))
         .route(
@@ -46,7 +50,11 @@ pub fn router(state: AppState) -> Router {
         .route(REGISTRATION_PATH, post(register))
         .route(REDIRECT_PATH, get(github_callback))
         .route(GITHUB_SETUP_PATH, get(github_setup))
-        .with_state(state)
+        .with_state(state);
+    match relay {
+        Some(relay) => app.merge(crate::relay::router(relay)),
+        None => app,
+    }
 }
 
 fn no_store(mut response: Response) -> Response {
