@@ -18,7 +18,11 @@ install -d -o mcp-duxca -g mcp-duxca -m 750 /var/lib/mcp-duxca-com
 install -d -m 755 /opt/mcp-duxca-com/bin
 install -d -o root -g mcp-duxca -m 750 /etc/mcp-duxca-com
 
-# adbmcp（コミット固定）
+# 変わったものだけ再起動する。
+# トンネルは ssh.duxca.com（= CI の SSH 自身の輸送路）も運ぶので、無駄に再起動すると CI が切断される。
+restart_gw=0 restart_tun=0
+
+# adbmcp（コミット固定）。ゲートウェイの子プロセスとして動くので、作り直したらゲートウェイごと再起動して入れ替える。
 stamp=/opt/mcp-duxca-com/adbmcp/.ref
 if [[ "$(cat "$stamp" 2>/dev/null)" != "$ADBMCP_REF" ]]; then
   rm -rf /opt/mcp-duxca-com/adbmcp
@@ -26,13 +30,11 @@ if [[ "$(cat "$stamp" 2>/dev/null)" != "$ADBMCP_REF" ]]; then
   /opt/mcp-duxca-com/adbmcp/bin/pip install -q --upgrade pip
   /opt/mcp-duxca-com/adbmcp/bin/pip install -q "https://github.com/FlashZ/adb-mcp/archive/${ADBMCP_REF}.tar.gz"
   echo "$ADBMCP_REF" > "$stamp"
+  restart_gw=1
 fi
 
-# 上書き前に変更を検出し、変わったものだけ再起動する。
-# トンネルは ssh.duxca.com（= CI の SSH 自身の輸送路）も運ぶので、無駄に再起動すると CI が切断される。
-# 宛先が無ければ cmp は失敗する = 変更ありとして扱う。
+# 上書き前に変更を検出する。宛先が無ければ cmp は失敗する = 変更ありとして扱う。
 changed() { ! cmp -s "$1" "$2"; }
-restart_gw=0 restart_tun=0
 changed "$SRC/mcp-duxca-com" /opt/mcp-duxca-com/bin/mcp-duxca-com && restart_gw=1
 changed "$SRC/mcp-duxca-com.service" /etc/systemd/system/mcp-duxca-com.service && restart_gw=1
 changed "$SRC/mcp-duxca-com-tunnel.service" /etc/systemd/system/mcp-duxca-com-tunnel.service && restart_tun=1
