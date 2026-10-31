@@ -20,7 +20,7 @@ Environment=RUST_LOG=info,mcp_duxca_com=info
 # GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET（CI が GitHub Secrets から書く）
 # relay（/relay/v1）は常に有効で、認証は上の OAuth を使う（静的キーや webhook の env は無い）。
 # 会話ログは journald に出る: journalctl -u mcp-duxca-com -f | grep 'relay:'
-# 添付の総量上限を変えるときだけ RELAY_MAX_TOTAL_STORAGE_BYTES を runtime.env に置く。
+# 添付の全部屋の合計上限（既定 64 MB、1 部屋はその半分）を変えるときだけ RELAY_MAX_TOTAL_STORAGE_BYTES を runtime.env に置く。
 EnvironmentFile=/etc/mcp-duxca-com/runtime.env
 ExecStart=/opt/mcp-duxca-com/bin/mcp-duxca-com
 Restart=on-failure

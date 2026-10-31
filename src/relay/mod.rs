@@ -3,7 +3,8 @@
 //! - MCP エンドポイントは `POST {PUBLIC_URL}/relay/v1` の 1 本。認証はゲートウェイの OAuth のみ。
 //! - 「部屋」は OAuth の subject（GitHub 数値 id）。同じアカウントのトークンなら同じ部屋を共有する。
 //! - エージェント名と起床用 webhook は呼び出し側の自己申告（`agent` / `to` / `register_agent`）。
-//! - ストアはメモリのみ。会話ログは tracing の info で出す（webhook の値と添付の中身は出さない）。
+//! - ストアはメモリのみ。保存量・同時待機・同時 webhook・バッチには上限がある（`Limits` など）。
+//! - 会話ログは tracing の info で出す（webhook の値と添付の中身は出さない）。
 
 mod docs;
 mod js;
@@ -19,7 +20,7 @@ use std::sync::Arc;
 
 pub use routes::{router, serve};
 use store::MessageView;
-pub use store::{Store, DEFAULT_MAX_TOTAL_STORAGE_BYTES};
+pub use store::{Limits, Store, DEFAULT_MAX_TOTAL_STORAGE_BYTES};
 use webhook::{Webhook, WebhookTarget};
 
 pub const PREFIX: &str = "/relay/v1";
@@ -52,19 +53,22 @@ pub struct Relay {
     webhook: Webhook,
     /// PUBLIC_URL（スキーム+ホスト）
     origin: String,
-    max_total_storage_bytes: u64,
-    /// テスト用。ループバックの http webhook を許す（本番は https のみ）。
-    allow_loopback_http_webhooks: bool,
 }
 
 impl Relay {
+    /// `max_total_storage_bytes` は全部屋の添付の上限。他の上限は `Limits` の既定値。
     pub fn new(public_url: &str, max_total_storage_bytes: u64) -> Self {
+        Self::with_limits(
+            public_url,
+            Limits::with_total_attachment_bytes(max_total_storage_bytes),
+        )
+    }
+
+    pub fn with_limits(public_url: &str, limits: Limits) -> Self {
         Self {
-            store: Store::new(max_total_storage_bytes),
+            store: Store::new(limits),
             webhook: Webhook::new(),
             origin: public_url.trim_end_matches('/').to_string(),
-            max_total_storage_bytes,
-            allow_loopback_http_webhooks: false,
         }
     }
 
@@ -73,14 +77,16 @@ impl Relay {
     }
 
     /// 保存して会話ログを出し、宛先に webhook があれば発火する。戻り値の bool は `notified`。
+    /// 引数は保存したら手放す（大きな未使用の引数を webhook や待機の間まで抱えない）。
     async fn send(
         self: &Arc<Self>,
         room: &str,
         from: &str,
         to: &str,
-        args: &Map<String, Value>,
+        args: Map<String, Value>,
     ) -> Result<(MessageView, bool), RelayError> {
-        let (message, target) = self.store.send_message(room, from, to, args)?;
+        let (message, target) = self.store.send_message(room, from, to, &args)?;
+        drop(args);
         let files: Vec<String> = message
             .attachments
             .iter()
@@ -106,16 +112,25 @@ impl Relay {
     }
 
     /// webhook を送り、結果をメッセージに記録する。クライアントが切れても送信と記録は最後まで行う。
+    /// 同時に送れる数を超えたら送らずに諦め、そのことを記録する。
     async fn notify(
         self: &Arc<Self>,
         room: &str,
         message: &MessageView,
         target: WebhookTarget,
     ) -> bool {
+        let Some(slot) = self.webhook.slot() else {
+            let status = "skipped:too_many_in_flight";
+            self.store
+                .set_webhook_status(room, &message.id, status.into());
+            tracing::warn!(room, to = ?message.to, message_id = %message.id, result = status, "relay: webhook");
+            return false;
+        };
         let relay = self.clone();
         let room = room.to_string();
         let message = message.clone();
         tokio::spawn(async move {
+            let _slot = slot;
             let started = std::time::Instant::now();
             let status = relay.webhook.notify(&target, &message).await;
             relay
@@ -162,23 +177,26 @@ impl Relay {
         let Some(url) = url else {
             return Ok(None);
         };
+        let loopback = self.webhook.allow_loopback_http;
         let parsed = url::Url::parse(&url).ok().filter(|u| {
-            u.host_str().is_some()
-                && (u.scheme() == "https"
-                    || (self.allow_loopback_http_webhooks
-                        && u.scheme() == "http"
-                        && matches!(u.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))))
+            u.host_str().is_some() && (u.scheme() == "https" || (loopback && u.scheme() == "http"))
         });
-        if url.chars().count() > MAX_WEBHOOK_URL || parsed.is_none() {
+        let Some(parsed) = parsed.filter(|_| url.chars().count() <= MAX_WEBHOOK_URL) else {
             return Err(RelayError::bad_request(format!(
                 "\"webhook_url\" must be an https URL of at most {MAX_WEBHOOK_URL} characters"
             )));
+        };
+        if !webhook::host_is_public(&parsed, loopback) {
+            return Err(RelayError::bad_request(
+                "\"webhook_url\" must point to the public internet (localhost, private, link-local and other internal addresses are refused)",
+            ));
         }
-        Ok(Some(WebhookTarget {
-            url,
-            auth,
-            secret: secret.unwrap_or_default(),
-        }))
+        let Some(secret) = secret else {
+            return Err(RelayError::bad_request(
+                "\"webhook_secret\" is required with \"webhook_url\": every delivery is signed with it (X-Relay-Signature)",
+            ));
+        };
+        Ok(Some(WebhookTarget { url, auth, secret }))
     }
 }
 
@@ -186,7 +204,25 @@ impl Relay {
 impl Relay {
     /// テストの受信側（http://127.0.0.1）へ webhook を送れるようにする。
     pub fn allowing_loopback_http_webhooks(mut self) -> Self {
-        self.allow_loopback_http_webhooks = true;
+        self.webhook.allow_loopback_http = true;
         self
+    }
+
+    /// webhook の名前解決を `hosts` の表に差し替える（公開アドレスかどうかの判定はそのまま）。
+    pub fn with_webhook_dns(mut self, hosts: &[(&str, std::net::IpAddr)]) -> Self {
+        let hosts: std::collections::HashMap<String, std::net::IpAddr> =
+            hosts.iter().map(|(h, ip)| (h.to_string(), *ip)).collect();
+        let loopback = self.webhook.allow_loopback_http;
+        self.webhook = Webhook::with_lookup(Arc::new(move |host: String| {
+            let found = hosts.get(&host).copied();
+            Box::pin(async move { Ok(found.into_iter().collect()) })
+        }));
+        self.webhook.allow_loopback_http = loopback;
+        self
+    }
+
+    /// webhook の同時送信枠を全部取る（溢れたときの挙動を見るため）。
+    pub fn take_all_webhook_slots(&self) -> Vec<tokio::sync::OwnedSemaphorePermit> {
+        std::iter::from_fn(|| self.webhook.slot()).collect()
     }
 }

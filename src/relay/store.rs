@@ -1,8 +1,10 @@
 //! メモリ内ストア（元 lib/store.js の移植）。再起動で全て消える。
 //!
 //! データは「部屋」（OAuth の subject = GitHub 数値 id）ごとに分かれ、部屋をまたいで見えない。
-//! メッセージ id はカーソルを兼ねる。全部屋で 1 本のカウンタを起動時刻の Unix ミリ秒から始めるので、
-//! 再起動前のカーソルより新しいメッセージの id が必ず大きくなる。
+//! メッセージ id はカーソルを兼ねる。部屋ごとのカウンタを部屋を最初に使った時刻の Unix ミリ秒から始めるので、
+//! 再起動前のカーソルより新しいメッセージの id が必ず大きくなり、id の差から他の部屋の動きは読めない。
+//!
+//! 保存量は部屋ごとと全部屋の合計の両方で数え（`Limits`）、上限を超える書き込みは断る。自動では消さない。
 
 use super::js::{self, is_js_whitespace, utf16_len};
 use super::webhook::WebhookTarget;
@@ -17,8 +19,8 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 use tokio::time::Instant;
@@ -27,10 +29,77 @@ pub const MAX_TEXT: usize = 20_000;
 pub const MAX_SUBJECT: usize = 200;
 pub const MAX_FILE_BYTES: usize = 3 * 1024 * 1024;
 pub const MAX_FILES_PER_MESSAGE: usize = 5;
-pub const DEFAULT_MAX_TOTAL_STORAGE_BYTES: u64 = 32 * 1024 * 1024;
+const MB: u64 = 1024 * 1024;
+/// RELAY_MAX_TOTAL_STORAGE_BYTES の既定（全部屋の添付の合計）。1 部屋はその半分まで。
+pub const DEFAULT_MAX_TOTAL_STORAGE_BYTES: u64 = 64 * MB;
 pub const MAX_WAIT_SECONDS: f64 = 280.0;
-const MAX_THREAD_MESSAGES: usize = 500;
+pub const MAX_THREAD_MESSAGES: usize = 500;
 pub const MAX_AGENT_NAME: usize = 64;
+
+// 保存量の概算で 1 件ごとに足す固定分（構造体・map のノード・id 文字列・アロケータの端数）
+const MESSAGE_OVERHEAD: u64 = 320;
+const THREAD_OVERHEAD: u64 = 256;
+const ATTACHMENT_OVERHEAD: u64 = 256;
+const AGENT_OVERHEAD: u64 = 128;
+
+/// relay がメモリに抱える量の上限。部屋ごとの値と全部屋の合計の両方で数える。
+#[derive(Debug, Clone)]
+pub struct Limits {
+    pub room_messages: usize,
+    pub total_messages: usize,
+    /// 本文・名前・件名・添付のメタ情報・スレッド・登録の概算バイト数
+    pub room_data_bytes: u64,
+    pub total_data_bytes: u64,
+    /// 添付の中身
+    pub room_attachment_bytes: u64,
+    pub total_attachment_bytes: u64,
+    /// `register_agent` の登録数
+    pub room_agents: usize,
+    /// 同時に待機できる ask / check_messages
+    pub room_waits: usize,
+    pub total_waits: usize,
+}
+
+impl Limits {
+    /// 添付の全体上限（RELAY_MAX_TOTAL_STORAGE_BYTES）と既定値。部屋ごとの値は全体の半分。
+    pub fn with_total_attachment_bytes(total_attachment_bytes: u64) -> Self {
+        Self {
+            room_messages: 10_000,
+            total_messages: 20_000,
+            room_data_bytes: 32 * MB,
+            total_data_bytes: 64 * MB,
+            room_attachment_bytes: total_attachment_bytes / 2,
+            total_attachment_bytes,
+            room_agents: 100,
+            room_waits: 16,
+            total_waits: 64,
+        }
+    }
+}
+
+/// 保存済みの量。メッセージと添付は消さないので増えるだけ、登録は置き換え・解除で戻る。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Usage {
+    pub messages: usize,
+    pub data_bytes: u64,
+    pub attachment_bytes: u64,
+}
+
+impl Usage {
+    fn add(&mut self, other: Usage) {
+        self.messages += other.messages;
+        self.data_bytes += other.data_bytes;
+        self.attachment_bytes += other.attachment_bytes;
+    }
+}
+
+/// 上限に達したときのエラー（507 相当）。
+fn full(what: String) -> RelayError {
+    RelayError::new(
+        507,
+        format!("{what}; the relay keeps data in memory and frees it only when it restarts"),
+    )
+}
 
 pub fn now_ms() -> i64 {
     SystemTime::now()
@@ -145,31 +214,72 @@ struct Attachment {
 /// `register_agent` の登録。webhook の値は API に出さない。
 struct AgentRecord {
     webhook: Option<WebhookTarget>,
+    /// 保存量に数えた分
+    bytes: u64,
 }
 
-#[derive(Default)]
+fn agent_bytes(name: &str, webhook: Option<&WebhookTarget>) -> u64 {
+    let webhook = webhook.map_or(0, |w| {
+        w.url.len() + w.auth.as_ref().map_or(0, String::len) + w.secret.len()
+    });
+    AGENT_OVERHEAD + (name.len() + webhook) as u64
+}
+
 struct Room {
+    /// 次のメッセージ id（部屋ごと）
+    next_id: u64,
     threads: HashMap<String, Thread>,
     messages: BTreeMap<u64, Message>,
     attachments: HashMap<String, Attachment>,
     agents: BTreeMap<String, AgentRecord>,
+    usage: Usage,
 }
 
 struct Inner {
-    next_id: u64,
     rooms: HashMap<String, Room>,
-    /// 全部屋の添付の合計（メモリ保護なので部屋ごとではない）
-    total_bytes: u64,
+    /// 全部屋の合計
+    usage: Usage,
+}
+
+/// 待機中の long-poll。部屋ごとに起床用の `Notify` を持ち、送信はその部屋の待機だけを起こす。
+#[derive(Default)]
+struct Waiters {
+    total: usize,
+    rooms: HashMap<String, RoomWaiters>,
+}
+
+struct RoomWaiters {
+    count: usize,
+    wake: Arc<Notify>,
+}
+
+/// long-poll 1 件分の枠。drop で返る。
+pub struct WaitSlot<'a> {
+    store: &'a Store,
+    room: String,
+    wake: Arc<Notify>,
+}
+
+impl Drop for WaitSlot<'_> {
+    fn drop(&mut self) {
+        let mut w = self.store.lock_waiters();
+        w.total -= 1;
+        let empty = w.rooms.get_mut(&self.room).is_some_and(|r| {
+            r.count -= 1;
+            r.count == 0
+        });
+        if empty {
+            w.rooms.remove(&self.room);
+        }
+    }
 }
 
 pub struct Store {
     inner: Mutex<Inner>,
-    /// メッセージ追加で long-poll を起こす。
-    added: Notify,
-    waiting: AtomicUsize,
+    waiters: Mutex<Waiters>,
     /// 停止中。以後の long-poll は待たずに返す。
     closed: AtomicBool,
-    max_total_bytes: u64,
+    limits: Limits,
 }
 
 /// エージェント名（自己申告）。1–64 文字、空白だけ・制御文字は不可。大文字小文字は区別する。
@@ -388,22 +498,18 @@ fn number_string(n: f64) -> String {
     }
 }
 
-struct WaitGuard<'a>(&'a AtomicUsize);
-
-impl<'a> WaitGuard<'a> {
-    fn new(counter: &'a AtomicUsize) -> Self {
-        counter.fetch_add(1, Ordering::SeqCst);
-        Self(counter)
-    }
-}
-
-impl Drop for WaitGuard<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
 impl Room {
+    fn new() -> Self {
+        Self {
+            next_id: now_ms().max(1) as u64,
+            threads: HashMap::new(),
+            messages: BTreeMap::new(),
+            attachments: HashMap::new(),
+            agents: BTreeMap::new(),
+            usage: Usage::default(),
+        }
+    }
+
     fn fmt_attachment(&self, id: &str) -> Option<AttachmentView> {
         let a = self.attachments.get(id)?;
         Some(AttachmentView {
@@ -475,47 +581,104 @@ impl Inner {
 }
 
 impl Store {
-    pub fn new(max_total_bytes: u64) -> Self {
+    pub fn new(limits: Limits) -> Self {
         Self {
             inner: Mutex::new(Inner {
-                next_id: now_ms().max(1) as u64,
                 rooms: HashMap::new(),
-                total_bytes: 0,
+                usage: Usage::default(),
             }),
-            added: Notify::new(),
-            waiting: AtomicUsize::new(0),
+            waiters: Mutex::default(),
             closed: AtomicBool::new(false),
-            max_total_bytes,
+            limits,
         }
+    }
+
+    pub fn limits(&self) -> &Limits {
+        &self.limits
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn lock_waiters(&self) -> MutexGuard<'_, Waiters> {
+        self.waiters.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// long-poll 中のリクエスト数。
     #[cfg(test)]
     pub fn waiting(&self) -> usize {
-        self.waiting.load(Ordering::SeqCst)
+        self.lock_waiters().total
     }
 
     /// 待機中・以後の long-poll をすぐ返させる。graceful shutdown が待たされないように。
     pub fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
-        self.added.notify_waiters();
+        for r in self.lock_waiters().rooms.values() {
+            r.wake.notify_waiters();
+        }
     }
 
-    /// `check` が値を返すか `wait` が過ぎるまで待つ。メッセージ追加で即座に再判定する。
-    /// 呼び出し側の future が drop されれば（クライアント切断）待機もそこで終わる。
+    /// long-poll の枠を取る。部屋ごと・全体の上限を超えるなら待たずにエラー。
+    pub fn reserve_wait(&self, room: &str) -> Result<WaitSlot<'_>, RelayError> {
+        let l = &self.limits;
+        let mut w = self.lock_waiters();
+        if w.total >= l.total_waits {
+            return Err(RelayError::new(
+                429,
+                format!(
+                    "the relay already has {} waiting calls (its limit); try again shortly, or pass wait_seconds 0",
+                    l.total_waits
+                ),
+            ));
+        }
+        if w.rooms.get(room).map_or(0, |r| r.count) >= l.room_waits {
+            return Err(RelayError::new(
+                429,
+                format!(
+                    "this room already has {} waiting ask/check_messages calls (its limit); let one finish, or pass wait_seconds 0",
+                    l.room_waits
+                ),
+            ));
+        }
+        w.total += 1;
+        let r = w
+            .rooms
+            .entry(room.to_string())
+            .or_insert_with(|| RoomWaiters {
+                count: 0,
+                wake: Arc::default(),
+            });
+        r.count += 1;
+        Ok(WaitSlot {
+            store: self,
+            room: room.to_string(),
+            wake: r.wake.clone(),
+        })
+    }
+
+    /// `room` で待っている long-poll に再判定させる。
+    fn wake(&self, room: &str) {
+        if let Some(r) = self.lock_waiters().rooms.get(room) {
+            r.wake.notify_waiters();
+        }
+    }
+
+    /// `check` が値を返すか `wait` が過ぎるまで待つ。枠が無いか `wait` が 0 なら 1 回だけ見る。
+    /// 同じ部屋へのメッセージ追加で再判定する。呼び出し側の future が drop されれば（クライアント切断）
+    /// 待機もそこで終わる。
     async fn wait_for<T>(
         &self,
+        slot: Option<&WaitSlot<'_>>,
         wait: Duration,
         mut check: impl FnMut(&Inner) -> Option<T>,
     ) -> Option<T> {
-        let _guard = WaitGuard::new(&self.waiting);
+        let Some(slot) = slot.filter(|_| !wait.is_zero()) else {
+            return check(&self.lock());
+        };
         let deadline = Instant::now() + wait;
         loop {
-            let notified = self.added.notified();
+            let notified = slot.wake.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             if let Some(found) = check(&self.lock()) {
@@ -528,6 +691,66 @@ impl Store {
                 return None;
             }
         }
+    }
+
+    /// `add` を足しても部屋（`room`）と全体の上限に収まるか。
+    fn check_capacity(&self, room: Usage, total: Usage, add: Usage) -> Result<(), RelayError> {
+        let l = &self.limits;
+        let over = |used: u64, add: u64, limit: u64| add > 0 && used + add > limit;
+        let count = |n: usize| n as u64;
+        if over(
+            count(room.messages),
+            count(add.messages),
+            count(l.room_messages),
+        ) {
+            return Err(full(format!(
+                "this room already holds {} messages (its limit)",
+                l.room_messages
+            )));
+        }
+        if over(
+            count(total.messages),
+            count(add.messages),
+            count(l.total_messages),
+        ) {
+            return Err(full(format!(
+                "the relay already holds {} messages across all rooms (its limit)",
+                l.total_messages
+            )));
+        }
+        if over(room.data_bytes, add.data_bytes, l.room_data_bytes) {
+            return Err(full(format!(
+                "this room's message storage is full ({} bytes of text and metadata)",
+                l.room_data_bytes
+            )));
+        }
+        if over(total.data_bytes, add.data_bytes, l.total_data_bytes) {
+            return Err(full(format!(
+                "the relay's message storage is full ({} bytes across all rooms)",
+                l.total_data_bytes
+            )));
+        }
+        if over(
+            room.attachment_bytes,
+            add.attachment_bytes,
+            l.room_attachment_bytes,
+        ) {
+            return Err(full(format!(
+                "this room's attachment storage is full ({} bytes)",
+                l.room_attachment_bytes
+            )));
+        }
+        if over(
+            total.attachment_bytes,
+            add.attachment_bytes,
+            l.total_attachment_bytes,
+        ) {
+            return Err(full(format!(
+                "the relay's attachment storage is full ({} bytes across all rooms)",
+                l.total_attachment_bytes
+            )));
+        }
+        Ok(())
     }
 
     /// `from` から `to` へのメッセージを保存する。宛先に webhook の登録があればそれも返す。
@@ -569,45 +792,67 @@ impl Store {
             Value::String(tid) => Some(tid.as_str()),
             _ => return Err(RelayError::bad_request("\"thread_id\" must be a string")),
         };
+        // 新しいスレッドの件名
+        let new_subject = thread_id.is_none().then(|| {
+            subject
+                .filter(|s| !s.is_empty())
+                .or_else(|| Some(utf16_prefix(text, 80)).filter(|s| !s.is_empty()))
+                .or_else(|| atts.first().map(|a| a.filename.as_str()))
+                .filter(|s| !s.is_empty())
+                .unwrap_or("attachment")
+                .to_string()
+        });
+        let add = Usage {
+            messages: 1,
+            data_bytes: MESSAGE_OVERHEAD
+                + (from.len() + to.len() + text.len()) as u64
+                + new_subject
+                    .as_ref()
+                    .map_or(0, |s| THREAD_OVERHEAD + (s.len() + from.len()) as u64)
+                + atts
+                    .iter()
+                    .map(|a| ATTACHMENT_OVERHEAD + (a.filename.len() + a.content_type.len()) as u64)
+                    .sum::<u64>(),
+            attachment_bytes: atts.iter().map(|a| a.data.len() as u64).sum(),
+        };
 
         let mut guard = self.lock();
         let inner = &mut *guard;
-        let add: u64 = atts.iter().map(|a| a.data.len() as u64).sum();
-        if add > 0 && inner.total_bytes + add > self.max_total_bytes {
-            return Err(RelayError::new(
-                507,
-                "relay attachment storage is full; ask the operator to clean up old files",
-            ));
-        }
+        let existing = inner.rooms.get(room);
         if let Some(tid) = thread_id {
-            if !inner
-                .room(room)
-                .is_some_and(|r| r.threads.contains_key(tid))
-            {
+            let Some(t) = existing.and_then(|r| r.threads.get(tid)) else {
                 return Err(RelayError::new(404, format!("thread {tid} not found")));
+            };
+            if t.message_ids.len() >= MAX_THREAD_MESSAGES {
+                return Err(RelayError::new(
+                    409,
+                    format!("thread {tid} is full ({MAX_THREAD_MESSAGES} messages); start a new thread by omitting thread_id"),
+                ));
             }
         }
-        let id = inner.next_id;
-        inner.next_id += 1;
-        inner.total_bytes += add;
-        let r = inner.rooms.entry(room.to_string()).or_default();
+        self.check_capacity(
+            existing.map_or_else(Usage::default, |r| r.usage),
+            inner.usage,
+            add,
+        )?;
+        inner.usage.add(add);
+        let r = inner
+            .rooms
+            .entry(room.to_string())
+            .or_insert_with(Room::new);
+        r.usage.add(add);
+        let id = r.next_id;
+        r.next_id += 1;
         let now = now_ms();
-        let thread_id = match thread_id {
-            Some(tid) => tid.to_string(),
-            None => {
+        let thread_id = match (thread_id, new_subject) {
+            (Some(tid), _) => tid.to_string(),
+            (None, subject) => {
                 let tid = format!("thr_{}", random_hex(8));
-                let subject = subject
-                    .filter(|s| !s.is_empty())
-                    .or_else(|| Some(utf16_prefix(text, 80)).filter(|s| !s.is_empty()))
-                    .or_else(|| atts.first().map(|a| a.filename.as_str()))
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("attachment")
-                    .to_string();
                 r.threads.insert(
                     tid.clone(),
                     Thread {
                         id: tid.clone(),
-                        subject,
+                        subject: subject.unwrap_or_default(),
                         started_by: from.to_string(),
                         created_at: now,
                         updated_at: now,
@@ -657,7 +902,7 @@ impl Store {
         let view = r.fmt_message(&message);
         r.messages.insert(id, message);
         drop(guard);
-        self.added.notify_waiters();
+        self.wake(room);
         Ok((view, target))
     }
 
@@ -683,13 +928,17 @@ impl Store {
             && !matches!(args.unread_only.as_str(), Some("false" | "0"));
         let thread_id = js::truthy_string(&args.thread_id);
         let wait = parse_wait(&args.wait)?;
-        let start = first_id_after(after);
+        let slot = if wait > 0.0 {
+            Some(self.reserve_wait(room)?)
+        } else {
+            None
+        };
+        let mut start = first_id_after(after);
 
-        let query = |inner: &Inner| -> Vec<MessageView> {
-            let Some(r) = inner.room(room) else {
-                return Vec::new();
-            };
-            r.messages
+        let query = |inner: &Inner| -> Option<Vec<MessageView>> {
+            let r = inner.room(room)?;
+            let rows: Vec<MessageView> = r
+                .messages
                 .range((Bound::Included(start), Bound::Unbounded))
                 .map(|(_, m)| m)
                 .filter(|m| m.to == agent)
@@ -697,14 +946,19 @@ impl Store {
                 .filter(|m| thread_id.as_deref().is_none_or(|t| m.thread_id == t))
                 .take(limit)
                 .map(|m| r.fmt_message(m))
-                .collect()
+                .collect();
+            if rows.is_empty() {
+                // 既存のメッセージが後から条件に合うことはないので、次は新しく増えた分だけ見る
+                start = start.max(r.next_id);
+                return None;
+            }
+            Some(rows)
         };
         let messages = self
-            .wait_for(Duration::from_secs_f64(wait), |inner| {
-                Some(query(inner)).filter(|rows| !rows.is_empty())
-            })
+            .wait_for(slot.as_ref(), Duration::from_secs_f64(wait), query)
             .await
             .unwrap_or_default();
+        drop(slot);
 
         let unread_total = self.lock().room(room).map_or(0, |r| r.unread_to(agent));
         let next_cursor = match messages.last() {
@@ -727,8 +981,11 @@ impl Store {
     }
 
     /// `thread_id` で `after_id` より後に `peer` が `agent` へ送った最初の 1 件を待つ（ask 用）。
+    /// 待つには `reserve_wait` の枠が要る。
+    #[allow(clippy::too_many_arguments)]
     pub async fn wait_for_reply(
         &self,
+        slot: Option<&WaitSlot<'_>>,
         room: &str,
         agent: &str,
         peer: &str,
@@ -737,7 +994,7 @@ impl Store {
         wait_seconds: f64,
     ) -> Option<MessageView> {
         let wait = Duration::from_secs_f64(wait_seconds.clamp(0.0, MAX_WAIT_SECONDS));
-        self.wait_for(wait, |inner| {
+        self.wait_for(slot, wait, |inner| {
             let r = inner.room(room)?;
             let thread = r.threads.get(thread_id)?;
             thread
@@ -920,23 +1177,62 @@ impl Store {
     }
 
     /// 登録を丸ごと置き換える。webhook の有無を返す。
-    pub fn register_agent(&self, room: &str, agent: &str, webhook: Option<WebhookTarget>) -> bool {
-        let has_webhook = webhook.is_some();
-        self.lock()
+    pub fn register_agent(
+        &self,
+        room: &str,
+        agent: &str,
+        webhook: Option<WebhookTarget>,
+    ) -> Result<bool, RelayError> {
+        let bytes = agent_bytes(agent, webhook.as_ref());
+        let mut guard = self.lock();
+        let inner = &mut *guard;
+        let existing = inner.rooms.get(room);
+        let old = existing.and_then(|r| r.agents.get(agent)).map(|a| a.bytes);
+        if old.is_none() && existing.is_some_and(|r| r.agents.len() >= self.limits.room_agents) {
+            return Err(RelayError::new(
+                507,
+                format!(
+                    "this room already has {} registered agents (its limit); unregister one first",
+                    self.limits.room_agents
+                ),
+            ));
+        }
+        let old = old.unwrap_or(0);
+        let grow = Usage {
+            data_bytes: bytes.saturating_sub(old),
+            ..Usage::default()
+        };
+        self.check_capacity(
+            existing.map_or_else(Usage::default, |r| r.usage),
+            inner.usage,
+            grow,
+        )?;
+        let r = inner
             .rooms
             .entry(room.to_string())
-            .or_default()
-            .agents
-            .insert(agent.to_string(), AgentRecord { webhook });
-        has_webhook
+            .or_insert_with(Room::new);
+        for usage in [&mut inner.usage, &mut r.usage] {
+            usage.data_bytes = usage.data_bytes - old + bytes;
+        }
+        let has_webhook = webhook.is_some();
+        r.agents
+            .insert(agent.to_string(), AgentRecord { webhook, bytes });
+        Ok(has_webhook)
     }
 
     /// 登録を消す（メッセージは残る）。消えたかどうかを返す。
     pub fn unregister_agent(&self, room: &str, agent: &str) -> bool {
-        self.lock()
-            .rooms
-            .get_mut(room)
-            .is_some_and(|r| r.agents.remove(agent).is_some())
+        let mut guard = self.lock();
+        let inner = &mut *guard;
+        let Some(r) = inner.rooms.get_mut(room) else {
+            return false;
+        };
+        let Some(old) = r.agents.remove(agent) else {
+            return false;
+        };
+        r.usage.data_bytes -= old.bytes;
+        inner.usage.data_bytes -= old.bytes;
+        true
     }
 
     /// 登録 ∪ メッセージの from/to を名前順に。webhook の値は出さない。
@@ -985,15 +1281,24 @@ impl Store {
             .clone()
     }
 
+    /// 部屋の保存量と全体の保存量。
     #[cfg(test)]
-    pub fn total_bytes(&self) -> u64 {
-        self.lock().total_bytes
+    pub fn usage(&self, room: &str) -> (Usage, Usage) {
+        let inner = self.lock();
+        let r = inner.room(room).map_or_else(Usage::default, |r| r.usage);
+        (r, inner.usage)
     }
 }
 
 #[cfg(test)]
 mod store_tests {
     use super::*;
+    use base64::engine::general_purpose::STANDARD;
+
+    /// 今すぐ終わっているか（待たない）。
+    async fn ready<F: std::future::Future>(f: F) -> bool {
+        tokio::time::timeout(Duration::ZERO, f).await.is_ok()
+    }
 
     const ROOM: &str = "2429307";
     const OTHER: &str = "1001";
@@ -1006,8 +1311,18 @@ mod store_tests {
         WebhookTarget {
             url: url.into(),
             auth: None,
-            secret: String::new(),
+            secret: "s".into(),
         }
+    }
+
+    fn store() -> Store {
+        Store::new(Limits::with_total_attachment_bytes(1024))
+    }
+
+    fn send(store: &Store, room: &str, v: Value) -> Result<MessageView, RelayError> {
+        store
+            .send_message(room, "muse", "grok", &args(v))
+            .map(|(m, _)| m)
     }
 
     #[test]
@@ -1062,7 +1377,7 @@ mod store_tests {
 
     #[tokio::test]
     async fn close_ends_waits_at_once() {
-        let store = std::sync::Arc::new(Store::new(100));
+        let store = std::sync::Arc::new(store());
         let waiter = store.clone();
         let started = std::time::Instant::now();
         let poll = tokio::spawn(async move {
@@ -1085,17 +1400,19 @@ mod store_tests {
         assert_eq!(out["timed_out"], true);
         assert!(started.elapsed() < Duration::from_secs(2));
         // 停止後の待機も即座に返る
+        let slot = store.reserve_wait(ROOM).unwrap();
         assert!(store
-            .wait_for_reply(ROOM, "muse", "grok", "thr_x", 0, 30.0)
+            .wait_for_reply(Some(&slot), ROOM, "muse", "grok", "thr_x", 0, 30.0)
             .await
             .is_none());
+        drop(slot);
         assert_eq!(store.waiting(), 0);
     }
 
     #[test]
     fn ids_start_from_the_clock() {
         let before = now_ms() as u64;
-        let store = Store::new(100);
+        let store = store();
         let (m, _) = store
             .send_message(ROOM, "muse", "grok", &args(json!({ "text": "hi" })))
             .unwrap();
@@ -1107,7 +1424,7 @@ mod store_tests {
 
     #[tokio::test]
     async fn rooms_do_not_see_each_other() {
-        let store = Store::new(1024);
+        let store = store();
         let (m, _) = store
             .send_message(
                 ROOM,
@@ -1119,7 +1436,9 @@ mod store_tests {
                 })),
             )
             .unwrap();
-        store.register_agent(ROOM, "grok", Some(target("https://hook.example/a")));
+        store
+            .register_agent(ROOM, "grok", Some(target("https://hook.example/a")))
+            .unwrap();
         let att = m.attachments[0].id.clone();
 
         let check = |room: &'static str| {
@@ -1189,7 +1508,7 @@ mod store_tests {
 
     #[tokio::test]
     async fn replies_must_come_from_the_peer_to_the_asker() {
-        let store = Store::new(100);
+        let store = store();
         let (q, _) = store
             .send_message(ROOM, "muse", "grok", &args(json!({ "text": "q" })))
             .unwrap();
@@ -1202,23 +1521,302 @@ mod store_tests {
             .send_message(ROOM, "grok", "carol", &in_thread("not to muse"))
             .unwrap();
         let reply = store
-            .wait_for_reply(ROOM, "muse", "grok", &q.thread_id, after, 0.0)
+            .wait_for_reply(None, ROOM, "muse", "grok", &q.thread_id, after, 0.0)
             .await;
         assert!(reply.is_none());
         store
             .send_message(ROOM, "grok", "muse", &in_thread("answer"))
             .unwrap();
         let reply = store
-            .wait_for_reply(ROOM, "muse", "grok", &q.thread_id, after, 0.0)
+            .wait_for_reply(None, ROOM, "muse", "grok", &q.thread_id, after, 0.0)
             .await
             .unwrap();
         assert_eq!(reply.text, "answer");
         assert_eq!(
             store
-                .wait_for_reply(OTHER, "muse", "grok", &q.thread_id, after, 0.0)
+                .wait_for_reply(None, OTHER, "muse", "grok", &q.thread_id, after, 0.0)
                 .await
                 .map(|m| m.id),
             None
         );
+    }
+
+    /// id は部屋ごとに数えるので、他の部屋がどれだけ送っても自分の部屋の id は 1 ずつ増える。
+    #[tokio::test]
+    async fn ids_count_up_per_room() {
+        let store = store();
+        let first: u64 = send(&store, ROOM, json!({ "text": "a" }))
+            .unwrap()
+            .id
+            .parse()
+            .unwrap();
+        let mut other = Vec::new();
+        for _ in 0..5 {
+            other.push(send(&store, OTHER, json!({ "text": "b" })).unwrap().id);
+        }
+        let second: u64 = send(&store, ROOM, json!({ "text": "c" }))
+            .unwrap()
+            .id
+            .parse()
+            .unwrap();
+        assert_eq!(second, first + 1);
+        let other: Vec<u64> = other.iter().map(|id| id.parse().unwrap()).collect();
+        assert!(other.windows(2).all(|w| w[1] == w[0] + 1), "{other:?}");
+        // 部屋ごとの id でも、その部屋のカーソルとしてそのまま使える
+        let rows = store
+            .check_messages(
+                ROOM,
+                "grok",
+                ListArgs {
+                    since: json!(first.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows["messages"][0]["text"], "c");
+    }
+
+    #[test]
+    fn message_counts_are_limited_per_room_and_in_total() {
+        let store = Store::new(Limits {
+            room_messages: 3,
+            total_messages: 5,
+            ..Limits::with_total_attachment_bytes(1024)
+        });
+        for _ in 0..3 {
+            send(&store, ROOM, json!({ "text": "x" })).unwrap();
+        }
+        let err = send(&store, ROOM, json!({ "text": "x" })).unwrap_err();
+        assert_eq!(err.status, 507);
+        assert!(
+            err.message
+                .starts_with("this room already holds 3 messages"),
+            "{}",
+            err.message
+        );
+        // 他の部屋は全体の残り（2 件）まで
+        send(&store, OTHER, json!({ "text": "x" })).unwrap();
+        send(&store, OTHER, json!({ "text": "x" })).unwrap();
+        let err = send(&store, OTHER, json!({ "text": "x" })).unwrap_err();
+        assert!(
+            err.message
+                .starts_with("the relay already holds 5 messages across all rooms"),
+            "{}",
+            err.message
+        );
+        assert_eq!(store.usage(ROOM).0.messages, 3);
+        assert_eq!(store.usage(OTHER).1.messages, 5);
+    }
+
+    #[test]
+    fn message_data_is_counted_per_room_and_in_total() {
+        let store = Store::new(Limits {
+            room_data_bytes: 3_000,
+            total_data_bytes: 4_000,
+            ..Limits::with_total_attachment_bytes(1024)
+        });
+        // 本文・名前・件名・スレッドの固定分も数える
+        let m = send(&store, ROOM, json!({ "text": "x".repeat(1_000) })).unwrap();
+        let (room, total) = store.usage(ROOM);
+        let expected = MESSAGE_OVERHEAD
+            + ("muse".len() + "grok".len() + 1_000) as u64
+            + THREAD_OVERHEAD
+            + (80 + "muse".len()) as u64;
+        assert_eq!(room.data_bytes, expected);
+        assert_eq!(total, room);
+        let reply = json!({ "text": "x".repeat(1_000), "thread_id": m.thread_id });
+        send(&store, ROOM, reply.clone()).unwrap();
+        let err = send(&store, ROOM, reply).unwrap_err();
+        assert_eq!(err.status, 507);
+        assert!(
+            err.message
+                .starts_with("this room's message storage is full (3000 bytes"),
+            "{}",
+            err.message
+        );
+        // 部屋には余裕があっても全体が埋まれば断る。断った分は数えない
+        let before = store.usage(OTHER);
+        let err = send(&store, OTHER, json!({ "text": "y".repeat(1_500) })).unwrap_err();
+        assert!(
+            err.message
+                .starts_with("the relay's message storage is full (4000 bytes across all rooms)"),
+            "{}",
+            err.message
+        );
+        assert_eq!(store.usage(OTHER), before);
+        send(&store, OTHER, json!({ "text": "small" })).unwrap();
+    }
+
+    #[test]
+    fn attachment_bytes_are_limited_per_room_and_in_total() {
+        let store = Store::new(Limits::with_total_attachment_bytes(24));
+        let file = |n: usize| json!({ "text": "f", "attachments": [{ "filename": "a", "content_base64": STANDARD.encode(vec![1u8; n]) }] });
+        send(&store, ROOM, file(8)).unwrap();
+        // 1 部屋は全体（24）の半分（12）まで
+        let err = send(&store, ROOM, file(8)).unwrap_err();
+        assert_eq!(err.status, 507);
+        assert!(
+            err.message
+                .starts_with("this room's attachment storage is full (12 bytes)"),
+            "{}",
+            err.message
+        );
+        send(&store, ROOM, file(4)).unwrap();
+        send(&store, OTHER, file(12)).unwrap();
+        let third = "3003";
+        let err = send(&store, third, file(1)).unwrap_err();
+        assert!(
+            err.message
+                .starts_with("the relay's attachment storage is full (24 bytes across all rooms)"),
+            "{}",
+            err.message
+        );
+        // 添付の無いメッセージは送れる
+        send(&store, third, json!({ "text": "no files" })).unwrap();
+        assert_eq!(store.usage(ROOM).0.attachment_bytes, 12);
+        assert_eq!(store.usage(ROOM).1.attachment_bytes, 24);
+    }
+
+    #[test]
+    fn threads_hold_at_most_500_messages() {
+        let store = store();
+        let first = send(&store, ROOM, json!({ "text": "0" })).unwrap();
+        let reply = json!({ "text": "x", "thread_id": first.thread_id });
+        for _ in 1..MAX_THREAD_MESSAGES {
+            send(&store, ROOM, reply.clone()).unwrap();
+        }
+        let err = send(&store, ROOM, reply).unwrap_err();
+        assert_eq!(err.status, 409);
+        assert_eq!(
+            err.message,
+            format!(
+                "thread {} is full (500 messages); start a new thread by omitting thread_id",
+                first.thread_id
+            )
+        );
+        let thread = store.get_thread(ROOM, &json!(first.thread_id)).unwrap();
+        assert_eq!(
+            thread["messages"].as_array().unwrap().len(),
+            MAX_THREAD_MESSAGES
+        );
+        send(&store, ROOM, json!({ "text": "new thread" })).unwrap();
+    }
+
+    #[test]
+    fn registrations_are_counted_and_given_back() {
+        let store = Store::new(Limits {
+            room_agents: 2,
+            ..Limits::with_total_attachment_bytes(1024)
+        });
+        assert!(!store.register_agent(ROOM, "a", None).unwrap());
+        let only_name = store.usage(ROOM).0.data_bytes;
+        assert_eq!(only_name, AGENT_OVERHEAD + 1);
+        // 置き換えは差分だけ数える
+        assert!(store
+            .register_agent(ROOM, "a", Some(target("https://hook.example/a")))
+            .unwrap());
+        let with_hook = store.usage(ROOM).0.data_bytes;
+        assert_eq!(
+            with_hook,
+            only_name + ("https://hook.example/a".len() + 1) as u64
+        );
+        store.register_agent(ROOM, "b", None).unwrap();
+        let err = store.register_agent(ROOM, "c", None).unwrap_err();
+        assert_eq!(err.status, 507);
+        assert!(
+            err.message.starts_with(
+                "this room already has 2 registered agents (its limit); unregister one first"
+            ),
+            "{}",
+            err.message
+        );
+        // 登録済みの名前の置き換えは数に関係なくできる
+        store.register_agent(ROOM, "b", None).unwrap();
+        assert!(store.unregister_agent(ROOM, "a"));
+        store.register_agent(ROOM, "c", None).unwrap();
+        assert!(store.unregister_agent(ROOM, "b"));
+        assert!(store.unregister_agent(ROOM, "c"));
+        assert_eq!(store.usage(ROOM), (Usage::default(), Usage::default()));
+
+        // 登録も保存量の上限に入る
+        let store = Store::new(Limits {
+            room_data_bytes: AGENT_OVERHEAD + 10,
+            ..Limits::with_total_attachment_bytes(1024)
+        });
+        store.register_agent(ROOM, "short", None).unwrap();
+        let err = store
+            .register_agent(ROOM, "short", Some(target("https://hook.example/a")))
+            .unwrap_err();
+        assert!(err
+            .message
+            .starts_with("this room's message storage is full"));
+        assert_eq!(store.usage(ROOM).0.data_bytes, AGENT_OVERHEAD + 5);
+    }
+
+    #[tokio::test]
+    async fn waits_are_admitted_per_room_and_in_total() {
+        let store = Store::new(Limits {
+            room_waits: 2,
+            total_waits: 3,
+            ..Limits::with_total_attachment_bytes(1024)
+        });
+        let a = store.reserve_wait(ROOM).unwrap();
+        let b = store.reserve_wait(ROOM).unwrap();
+        let err = store.reserve_wait(ROOM).err().unwrap();
+        assert_eq!(err.status, 429);
+        assert!(
+            err.message.starts_with("this room already has 2 waiting"),
+            "{}",
+            err.message
+        );
+        let c = store.reserve_wait(OTHER).unwrap();
+        let err = store.reserve_wait(OTHER).err().unwrap();
+        assert!(
+            err.message
+                .starts_with("the relay already has 3 waiting calls"),
+            "{}",
+            err.message
+        );
+        // 待機を伴わない check は枠を使わない
+        let quick = store
+            .check_messages(ROOM, "grok", ListArgs::default())
+            .await
+            .unwrap();
+        assert_eq!(quick["messages"], json!([]));
+        let err = store
+            .check_messages(
+                ROOM,
+                "grok",
+                ListArgs {
+                    wait: json!(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, 429);
+        drop((a, b, c));
+        assert_eq!(store.waiting(), 0);
+        store.reserve_wait(ROOM).unwrap();
+    }
+
+    /// 送信はその部屋の待機だけを起こす。
+    #[tokio::test]
+    async fn a_send_wakes_only_its_own_room() {
+        let store = std::sync::Arc::new(store());
+        let slot_room = store.reserve_wait(ROOM).unwrap();
+        let slot_other = store.reserve_wait(OTHER).unwrap();
+        let waiting_room = store.lock_waiters().rooms[ROOM].wake.clone();
+        let waiting_other = store.lock_waiters().rooms[OTHER].wake.clone();
+        let room_woken = waiting_room.notified();
+        let other_woken = waiting_other.notified();
+        tokio::pin!(room_woken, other_woken);
+        room_woken.as_mut().enable();
+        other_woken.as_mut().enable();
+        send(&store, ROOM, json!({ "text": "x" })).unwrap();
+        assert!(ready(room_woken).await);
+        assert!(!ready(other_woken).await);
+        drop((slot_room, slot_other));
     }
 }

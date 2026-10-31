@@ -88,13 +88,18 @@ cargo run   # Tunnel 無しのゲートウェイ単体でも可（PUBLIC_URL 必
   - `MCP_SERVICES` でサービス名 `relay` は使えない（予約）
 - **部屋 = OAuth の subject（GitHub 数値 id）。** 同じアカウントのトークンなら同じ部屋。部屋をまたいだ参照はできない
 - **名乗りは自己申告。** 各ツールで自分を `agent`、相手を `to` で申告する。サーバは資格情報からロールを決めない（部屋の中は本人のエージェントだけなので名前を信頼する）
-- **起床 webhook も自己申告。** 受け手が `register_agent` で自分の `webhook_url` / `webhook_auth` / `webhook_secret` を登録し、その名前宛てのメッセージが保存されると POST される
-  - 本文 `{"event":"relay.message.created","message":{...}}`、`X-Relay-Signature: sha256=<HMAC-SHA256(webhook_secret, "<timestamp>.<body>")>`、`X-Relay-Timestamp`、`X-Relay-Event`、元実装互換の `X-Relay-Secret`、`webhook_auth` があれば `Authorization`
-  - 単発・5 秒タイムアウト・リダイレクトは追わない。`webhook_url` は https のみ
+- **起床 webhook も自己申告。** 受け手が `register_agent` で自分の `webhook_url` / `webhook_secret`（`webhook_url` を登録するなら必須）/ `webhook_auth` を登録し、その名前宛てのメッセージが保存されると POST される
+  - 本文 `{"event":"relay.message.created","message":{...}}`、`X-Relay-Signature: sha256=<HMAC-SHA256(webhook_secret, "<timestamp>.<body>")>`、`X-Relay-Timestamp`、`X-Relay-Event`、`webhook_auth` があれば `Authorization`。秘密そのもの（旧 `X-Relay-Secret`）は送らない
+  - 受信側は署名だけで認証する（定数時間で比較、タイムスタンプが 5 分より古い配送は捨てる、`message.id` で重複を捨てる）
+  - 単発・5 秒タイムアウト・リダイレクトは追わない。同時に送るのは 16 件まで（溢れた分は送らない）
+  - `webhook_url` は https で、公開アドレスに限る。localhost・プライベート・リンクローカルなどは登録時に断り、送る直前にも名前を引き直して公開アドレスだけに繋ぐ
   - 登録の値はどのツールの応答にもログにも出ない。登録はメモリだけなので、エージェントは起動のたびに登録し直す
 - ストアはメモリだけ。再起動でスレッド・メッセージ・添付・登録は消える
-  - メッセージ id（= カーソル）は起動時刻の Unix ミリ秒から増えるので、再起動前のカーソルもそのまま使える
-- 添付は 1 メッセージ 5 件・合計 3 MB まで。全体の総量は `RELAY_MAX_TOTAL_STORAGE_BYTES`（既定 32 MB）。リクエストボディは 6 MB まで
+  - メッセージ id（= カーソル）は部屋ごとに数え、部屋を最初に使った時刻の Unix ミリ秒から増えるので、再起動前のカーソルもそのまま使える
+- 上限（超えると isError。自動では消さない）
+  - 添付は 1 メッセージ 5 件・合計 3 MB まで。リクエストボディは 6 MB まで。1 スレッド 500 件まで
+  - 部屋ごと: 10000 件、本文などのデータ 32 MB（概算）、添付 32 MB、登録 100 件。全体: 20000 件、データ 64 MB、添付 `RELAY_MAX_TOTAL_STORAGE_BYTES`（既定 64 MB。部屋ごとの添付はその半分）
+  - 同時に待機できる `ask` / `check_messages` は部屋ごと 16 件、全体 64 件。バッチは 32 件まで、応答は合計 16 MB まで
 - 待機は `ask` が最大 240 秒（既定 55 秒）、`check_messages` が最大 55 秒。Ctrl+C では待機中のものも即座に返して止まる
 
 ツール: `send_message` / `ask` / `check_messages` / `get_thread` / `list_threads` / `mark_read` / `get_attachment` /
@@ -184,7 +189,7 @@ curl -si -X POST http://127.0.0.1:8000/default/v1 \
 | `MCP_<NAME>_<VER>_CWD` | サービスごとの cwd（省略時は下記） |
 | `CLAUDE_MCP_COMMAND` | `MCP_SERVICES` 未設定時のフォールバック（既定 `claude mcp serve`） |
 | `CLAUDE_CWD` | 上記フォールバック / 個別 CWD 未設定時の cwd（省略時 `$HOME`） |
-| `RELAY_MAX_TOTAL_STORAGE_BYTES` | relay 添付の総量上限（既定 33554432 = 32 MB）。relay の env はこれだけ |
+| `RELAY_MAX_TOTAL_STORAGE_BYTES` | relay 添付の全部屋の合計上限（既定 67108864 = 64 MB、1 部屋はその半分）。relay の env はこれだけ |
 | `RUST_LOG` | ログの絞り込み（未設定なら `info`） |
 | `CLOUDFLARED_TOKEN_FILE` | Tunnel トークンファイル（`scripts/run.sh`） |
 | `MCP_BIN` | ゲートウェイ実行ファイル（`scripts/run.sh`） |

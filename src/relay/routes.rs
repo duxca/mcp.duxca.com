@@ -53,7 +53,7 @@ async fn health() -> Response {
 async fn docs_text(State(relay): State<Arc<Relay>>) -> Response {
     (
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        docs::docs_text(&relay.origin, relay.max_total_storage_bytes),
+        docs::docs_text(&relay.origin, relay.store.limits()),
     )
         .into_response()
 }
@@ -100,6 +100,8 @@ pub async fn serve(relay: Arc<Relay>, room: String, request: Request) -> Respons
             Err(_) => return parse_error(),
         }
     };
+    // 生のボディは long-poll の間まで抱えない
+    drop(bytes);
     match mcp::handle(relay, room.into(), body).await {
         Some(reply) => json_response(200, &reply),
         None => StatusCode::ACCEPTED.into_response(),

@@ -155,7 +155,7 @@ pub(crate) async fn send(app: &Router, request: Request<Body>) -> Reply {
     let response = app.clone().oneshot(request).await.unwrap();
     let status = response.status();
     let headers = response.headers().clone();
-    let bytes = axum::body::to_bytes(response.into_body(), 16 << 20)
+    let bytes = axum::body::to_bytes(response.into_body(), 64 << 20)
         .await
         .unwrap();
     Reply {
@@ -343,10 +343,23 @@ fn private_addresses_are_not_global() {
         "::1",
         "fd00::1",
         "::ffff:10.0.0.1",
+        "::127.0.0.1",
+        "::a9fe:a9fe",
+        "2002:7f00:1::1",
+        "2002:a00:1::",
+        "64:ff9b::a00:1",
+        "0.0.0.0",
+        "::",
     ] {
         assert!(!is_global_ip(ip.parse().unwrap()), "{ip}");
     }
-    for ip in ["1.1.1.1", "140.82.112.3", "2606:4700::1111"] {
+    for ip in [
+        "1.1.1.1",
+        "140.82.112.3",
+        "2606:4700::1111",
+        "::ffff:1.1.1.1",
+        "2002:101:101::1",
+    ] {
         assert!(is_global_ip(ip.parse().unwrap()), "{ip}");
     }
 }

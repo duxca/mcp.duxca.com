@@ -699,12 +699,12 @@ async fn attachments_round_trip_and_limits() {
         .unwrap()
         .starts_with("request body too large"));
     assert_eq!(
-        h.relay.store.total_bytes(),
+        h.relay.store.usage(ROOM).1.attachment_bytes,
         (png.len() + "こんにちは".len()) as u64
     );
 
-    // 総量の上限（507 相当）
-    let (h, c) = setup_with(Relay::new(PUBLIC_URL, 10)).await;
+    // 部屋の添付の上限（全体 20 の半分）。超えると isError（507 相当）
+    let (h, c) = setup_with(Relay::new(PUBLIC_URL, 20)).await;
     let eight = attachment("a.bin", "", &[1u8; 8]);
     c.ok(
         "send_message",
@@ -717,14 +717,55 @@ async fn attachments_round_trip_and_limits() {
             json!({ "agent": "muse", "to": "grok", "text": "x", "attachments": [eight] })
         )
         .await,
-        "Error: relay attachment storage is full; ask the operator to clean up old files"
+        "Error: this room's attachment storage is full (10 bytes); the relay keeps data in memory and frees it only when it restarts"
     );
     c.ok(
         "send_message",
         json!({ "agent": "muse", "to": "grok", "text": "text only" }),
     )
     .await;
-    assert_eq!(h.relay.store.total_bytes(), 8);
+    assert_eq!(h.relay.store.usage(ROOM).0.attachment_bytes, 8);
+}
+
+#[tokio::test]
+async fn storage_limits_fail_as_tool_errors() {
+    let (h, c) = setup_with(Relay::with_limits(
+        PUBLIC_URL,
+        Limits {
+            room_messages: 2,
+            room_agents: 1,
+            ..Limits::with_total_attachment_bytes(1024)
+        },
+    ))
+    .await;
+    let send = json!({ "agent": "muse", "to": "grok", "text": "x" });
+    c.ok("send_message", send.clone()).await;
+    c.ok("send_message", send.clone()).await;
+    assert_eq!(
+        c.err("send_message", send).await,
+        "Error: this room already holds 2 messages (its limit); the relay keeps data in memory and frees it only when it restarts"
+    );
+    // ask も保存の前に断られ、待たない
+    let started = Instant::now();
+    assert!(c
+        .err(
+            "ask",
+            json!({ "agent": "muse", "to": "grok", "text": "q", "wait_seconds": 30 })
+        )
+        .await
+        .starts_with("Error: this room already holds 2 messages"));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(h.relay.store.waiting(), 0);
+
+    c.ok("register_agent", json!({ "agent": "muse" })).await;
+    assert!(c
+        .err("register_agent", json!({ "agent": "grok" }))
+        .await
+        .starts_with(
+            "Error: this room already has 1 registered agents (its limit); unregister one first"
+        ));
+    c.ok("unregister_agent", json!({ "agent": "muse" })).await;
+    c.ok("register_agent", json!({ "agent": "grok" })).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -989,11 +1030,33 @@ async fn retired_paths_are_gone_and_docs_describe_the_new_design() {
             assert!(docs.contains(&format!("- {name} {{")), "{name}");
         }
         assert!(docs.contains("register again every time you start"));
-        assert!(docs.contains("Total attachment storage on the relay is 32 MB"));
+        for limit in [
+            "Storage per room: 10000 messages, 32 MB of message data",
+            "32 MB of files, 100 registered agents",
+            "Storage on the whole relay: 20000 messages, 64 MB of message data, 64 MB of files.",
+            "At most 16 calls can wait at once per room (64 on the whole relay)",
+            "at most 32 requests per batch, and at most 16 MB of tool responses per batch",
+            "check_messages then marks nothing read",
+            "A thread holds at most 500 messages",
+            "At most 16 deliveries run at once",
+        ] {
+            assert!(docs.contains(limit), "{limit}");
+        }
+        for webhook in [
+            "the secret is required\nwhenever webhook_url is given",
+            "The webhook_secret itself is never sent. Authenticate deliveries by the signature alone",
+            "constant-time comparison",
+            "more than 5 minutes away from your clock",
+            "drop a delivery whose message id you have already handled",
+            "localhost, private,\nlink-local and other internal addresses are refused",
+        ] {
+            assert!(docs.contains(webhook), "{webhook}");
+        }
         for gone in [
             "RELAY_MUSE_KEY",
             "RELAY_GROK",
             "X-API-Key",
+            "X-Relay-Secret",
             "/ask",
             "openapi",
             "download_url",
@@ -1069,6 +1132,7 @@ fn header_of(headers: &HeaderMap, k: &str) -> Option<String> {
 
 const DUMMY_AUTH: &str = "Bearer dummy-webhook-auth-7c1e";
 const DUMMY_SECRET: &str = "dummy-webhook-secret-92ab";
+const DUMMY_SECRET2: &str = "dummy-webhook-secret-second-5d03";
 
 #[tokio::test]
 async fn webhooks_are_registered_by_the_recipient() {
@@ -1114,10 +1178,9 @@ async fn webhooks_are_registered_by_the_recipient() {
         header_of(&headers, "x-relay-signature").unwrap(),
         format!("sha256={}", signature(DUMMY_SECRET, &ts, &raw))
     );
-    assert_eq!(
-        header_of(&headers, "x-relay-secret").as_deref(),
-        Some(DUMMY_SECRET)
-    );
+    // 署名の鍵そのものは送らない
+    assert_eq!(header_of(&headers, "x-relay-secret"), None);
+    assert!(!format!("{headers:?}").contains(DUMMY_SECRET));
     assert_eq!(
         header_of(&headers, "authorization").as_deref(),
         Some(DUMMY_AUTH)
@@ -1173,10 +1236,10 @@ async fn webhooks_are_registered_by_the_recipient() {
     assert_eq!(r["notified"], true);
     assert_eq!(captured.lock().unwrap().len(), 2);
 
-    // 再登録は丸ごと置き換え（auth / secret も消える）
+    // 再登録は丸ごと置き換え（auth も消え、secret は新しいものになる）
     grok.ok(
         "register_agent",
-        json!({ "agent": "grok", "webhook_url": hook2 }),
+        json!({ "agent": "grok", "webhook_url": hook2, "webhook_secret": DUMMY_SECRET2 }),
     )
     .await;
     muse.ok(
@@ -1187,11 +1250,11 @@ async fn webhooks_are_registered_by_the_recipient() {
     let (name, headers, raw) = captured.lock().unwrap()[2].clone();
     assert_eq!(name, "hook2");
     assert_eq!(header_of(&headers, "authorization"), None);
-    assert_eq!(header_of(&headers, "x-relay-secret").as_deref(), Some(""));
+    assert_eq!(header_of(&headers, "x-relay-secret"), None);
     let ts = header_of(&headers, "x-relay-timestamp").unwrap();
     assert_eq!(
         header_of(&headers, "x-relay-signature").unwrap(),
-        format!("sha256={}", signature("", &ts, &raw))
+        format!("sha256={}", signature(DUMMY_SECRET2, &ts, &raw))
     );
 
     // 登録解除後は届かない
@@ -1222,7 +1285,7 @@ async fn webhooks_are_registered_by_the_recipient() {
     // 2xx 以外は notified:false
     grok.ok(
         "register_agent",
-        json!({ "agent": "grok", "webhook_url": format!("{url}/fail") }),
+        json!({ "agent": "grok", "webhook_url": format!("{url}/fail"), "webhook_secret": DUMMY_SECRET }),
     )
     .await;
     let r = muse
@@ -1246,7 +1309,7 @@ async fn webhooks_are_registered_by_the_recipient() {
     drop(closed);
     grok.ok(
         "register_agent",
-        json!({ "agent": "grok", "webhook_url": dead }),
+        json!({ "agent": "grok", "webhook_url": dead, "webhook_secret": DUMMY_SECRET }),
     )
     .await;
     let r = muse
@@ -1273,6 +1336,7 @@ async fn webhooks_are_registered_by_the_recipient() {
         dead.as_str(),
         DUMMY_AUTH,
         DUMMY_SECRET,
+        DUMMY_SECRET2,
     ] {
         assert!(!seen.contains(value), "response leaked {value}");
     }
@@ -1312,17 +1376,61 @@ async fn webhook_registration_is_validated_without_echoing_values() {
             json!({ "webhook_url": "https://hook.example/x", "webhook_secret": "s\ncret" }),
             "\"webhook_secret\" must be usable as an HTTP header value",
         ),
+        // 署名の鍵は必須（空は未指定と同じ）
+        (
+            json!({ "webhook_url": "https://hook.example/x" }),
+            "\"webhook_secret\" is required with \"webhook_url\"",
+        ),
+        (
+            json!({ "webhook_url": "https://hook.example/x", "webhook_secret": "", "webhook_auth": "Bearer a" }),
+            "\"webhook_secret\" is required with \"webhook_url\"",
+        ),
     ];
     for (mut args, expected) in cases {
         args["agent"] = json!("grok");
         let error = c.err("register_agent", args.clone()).await;
         assert!(error.contains(expected), "{error}");
         for k in ["webhook_url", "webhook_auth", "webhook_secret"] {
-            if let Some(v) = args[k].as_str() {
+            if let Some(v) = args[k].as_str().filter(|v| !v.is_empty()) {
                 assert!(!error.contains(v), "{error}");
             }
         }
     }
+    // 内部へ向く宛先は表記を変えても断る
+    for url in [
+        "https://127.0.0.1/hook",
+        "https://2130706433/hook",
+        "https://0x7f000001/hook",
+        "https://0177.0.0.1/hook",
+        "https://127.1/hook",
+        "https://10.0.0.1/hook",
+        "https://192.168.0.10:8443/hook",
+        "https://169.254.169.254/latest",
+        "https://0xa9fea9fe/latest",
+        "https://[::1]/hook",
+        "https://[::ffff:127.0.0.1]/hook",
+        "https://[::ffff:a9fe:a9fe]/hook",
+        "https://[fe80::1]/hook",
+        "https://[fd12:3456::1]/hook",
+        "https://localhost/hook",
+        "https://localhost./hook",
+        "https://grok.localhost/hook",
+    ] {
+        let error = c
+            .err(
+                "register_agent",
+                json!({ "agent": "grok", "webhook_url": url, "webhook_secret": "s" }),
+            )
+            .await;
+        assert!(
+            error.contains("\"webhook_url\" must point to the public internet"),
+            "{url}: {error}"
+        );
+    }
+    assert_eq!(
+        c.ok("list_agents", json!({})).await,
+        json!({ "agents": [] })
+    );
     // 名乗りだけの登録（webhook なし）
     assert_eq!(
         c.ok(
@@ -1485,4 +1593,309 @@ async fn conversation_log_has_the_text_but_no_secrets_or_file_bytes() {
     ] {
         assert!(!out.contains(leaked), "log leaked {leaked}:\n{out}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// 同時実行とバッチの上限
+
+#[tokio::test]
+async fn batches_are_limited_in_length_and_response_size() {
+    let (_h, c) = setup().await;
+    let pings = |n: usize| {
+        json!((0..n)
+            .map(|i| json!({ "jsonrpc": "2.0", "id": i, "method": "ping" }))
+            .collect::<Vec<_>>())
+    };
+    let r = c.rpc(pings(super::mcp::MAX_BATCH)).await;
+    assert_eq!(r.json().as_array().unwrap().len(), 32);
+    let r = c.rpc(pings(super::mcp::MAX_BATCH + 1)).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(
+        r.json(),
+        json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32600,
+            "message": "Invalid Request: a batch may contain at most 32 requests (got 33)" } })
+    );
+
+    // 3 MB の添付は base64 で約 4 MB。16 MB の予算に入るのは 3 件まで
+    let file = vec![5u8; store::MAX_FILE_BYTES];
+    let sent = c
+        .ok(
+            "send_message",
+            json!({ "agent": "muse", "to": "grok", "text": "big", "attachments": [attachment("big.bin", "application/octet-stream", &file)] }),
+        )
+        .await;
+    let att = sent["message"]["attachments"][0]["id"].clone();
+    let fetch = |id: usize| json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": "get_attachment", "arguments": { "attachment_id": att } } });
+    let r = c
+        .rpc(json!([
+            fetch(1),
+            fetch(2),
+            fetch(3),
+            fetch(4),
+            fetch(5),
+            { "jsonrpc": "2.0", "id": 6, "method": "ping" }
+        ]))
+        .await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(r.body.len() <= super::mcp::BATCH_RESPONSE_BYTES + 64 * 1024);
+    let replies = r.json();
+    let replies = replies.as_array().unwrap();
+    assert_eq!(replies.len(), 6);
+    let (fetched, refused): (Vec<&Value>, Vec<&Value>) = replies[..5]
+        .iter()
+        .partition(|v| v["result"].get("isError").is_none());
+    assert_eq!((fetched.len(), refused.len()), (3, 2));
+    for v in refused {
+        assert_eq!(
+            v["result"]["content"][0]["text"],
+            "Error: the responses to this batch would exceed 16777216 bytes; send this call in a request of its own"
+        );
+    }
+    assert_eq!(replies[5]["result"], json!({}));
+
+    // 単発の呼び出しには予算を掛けない
+    let r = c
+        .tool("get_attachment", json!({ "attachment_id": att }))
+        .await;
+    assert!(r.get("isError").is_none());
+    assert_eq!(r["structuredContent"]["size"], store::MAX_FILE_BYTES);
+}
+
+/// 予算で断った check_messages は既読にしない（返していないメッセージを既読にしない）。
+#[tokio::test]
+async fn a_refused_batch_read_marks_nothing_read() {
+    let (h, c) = setup().await;
+    // 60 KB の本文 150 件。応答（text と structuredContent の 2 回分）は 16 MB を超える
+    let text = "あ".repeat(store::MAX_TEXT);
+    for _ in 0..150 {
+        h.relay
+            .store
+            .send_message(
+                ROOM,
+                "muse",
+                "grok",
+                json!({ "text": text }).as_object().unwrap(),
+            )
+            .unwrap();
+    }
+    let check = json!({ "agent": "grok", "limit": 200, "mark_read": true });
+    let r = c
+        .rpc(json!([
+            { "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "check_messages", "arguments": check } },
+            { "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": "send_message", "arguments": { "agent": "grok", "to": "muse", "text": "write" } } },
+        ]))
+        .await
+        .json();
+    assert_eq!(r[0]["result"]["isError"], true);
+    assert!(r[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .starts_with("Error: the responses to this batch would exceed"));
+    assert_eq!(
+        r[1]["result"]["structuredContent"]["message"]["text"],
+        "write"
+    );
+    // 単発なら同じ呼び出しがそのまま通り、そこで初めて既読になる
+    let r = c.ok("check_messages", check).await;
+    assert_eq!(r["messages"].as_array().unwrap().len(), 150);
+    assert_eq!(r["unread_total"], 150);
+    assert_eq!(r["marked_read"], 150);
+}
+
+#[tokio::test]
+async fn long_polls_are_admitted_per_room_and_in_total() {
+    let (h, mine) = setup_with(Relay::with_limits(
+        PUBLIC_URL,
+        Limits {
+            room_waits: 1,
+            total_waits: 2,
+            ..Limits::with_total_attachment_bytes(1024)
+        },
+    ))
+    .await;
+    h.allowed.write().unwrap().insert("1001".into());
+    let theirs = client_for(&h, "other").await;
+    let wait_for = |c: &Client| {
+        let c = c.clone();
+        tokio::spawn(async move {
+            c.ok(
+                "check_messages",
+                json!({ "agent": "carol", "wait_seconds": 30 }),
+            )
+            .await
+        })
+    };
+
+    let mine_waiting = wait_for(&mine);
+    eventually("first long-poll", || h.relay.store.waiting() == 1).await;
+    assert_eq!(
+        mine.err(
+            "check_messages",
+            json!({ "agent": "dave", "wait_seconds": 30 })
+        )
+        .await,
+        "Error: this room already has 1 waiting ask/check_messages calls (its limit); let one finish, or pass wait_seconds 0"
+    );
+    // 待てない ask は送らずに断る
+    assert!(mine
+        .err(
+            "ask",
+            json!({ "agent": "muse", "to": "grok", "text": "not sent", "wait_seconds": 10 })
+        )
+        .await
+        .starts_with("Error: this room already has 1 waiting"));
+    assert_eq!(
+        mine.ok("list_threads", json!({})).await,
+        json!({ "threads": [] })
+    );
+    // 待たない呼び出しは枠に関係なく通る
+    let r = mine
+        .ok(
+            "ask",
+            json!({ "agent": "muse", "to": "grok", "text": "no wait", "wait_seconds": 0 }),
+        )
+        .await;
+    assert_eq!(r["timed_out"], true);
+    mine.ok("check_messages", json!({ "agent": "grok" })).await;
+
+    // 別の部屋は自分の枠で待てるが、全体の上限は共有
+    let theirs_waiting = wait_for(&theirs);
+    eventually("second long-poll", || h.relay.store.waiting() == 2).await;
+    assert_eq!(
+        theirs
+            .err(
+                "check_messages",
+                json!({ "agent": "erin", "wait_seconds": 30 })
+            )
+            .await,
+        "Error: the relay already has 2 waiting calls (its limit); try again shortly, or pass wait_seconds 0"
+    );
+
+    for (c, waiting) in [(&mine, mine_waiting), (&theirs, theirs_waiting)] {
+        c.ok(
+            "send_message",
+            json!({ "agent": "muse", "to": "carol", "text": "done" }),
+        )
+        .await;
+        assert_eq!(texts(&waiting.await.unwrap()), ["done"]);
+    }
+    assert_eq!(h.relay.store.waiting(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// webhook の宛先と同時送信数
+
+/// `listener` に接続が来ていないこと。
+async fn no_connection(listener: &tokio::net::TcpListener) {
+    let accepted = tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
+    assert!(accepted.is_err(), "the relay connected to {listener:?}");
+}
+
+#[tokio::test]
+async fn webhooks_are_sent_only_to_public_addresses() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    let metadata: std::net::IpAddr = "169.254.169.254".parse().unwrap();
+    let (h, c) = setup_with(
+        Relay::new(PUBLIC_URL, 1024)
+            .with_webhook_dns(&[("internal.test", loopback), ("metadata.test", metadata)]),
+    )
+    .await;
+    let status = |r: &Value| {
+        h.relay
+            .store
+            .webhook_status(ROOM, r["message"]["id"].as_str().unwrap())
+            .unwrap()
+    };
+
+    // 名前は登録時には引かないので通るが、送る直前に引いて内部アドレスなら繋がない
+    for host in ["internal.test", "metadata.test", "unknown.test"] {
+        c.ok(
+            "register_agent",
+            json!({ "agent": "grok", "webhook_url": format!("https://{host}:{port}/hook"), "webhook_secret": "s" }),
+        )
+        .await;
+        let r = c
+            .ok(
+                "send_message",
+                json!({ "agent": "muse", "to": "grok", "text": host }),
+            )
+            .await;
+        assert_eq!(r["notified"], false);
+        assert_eq!(status(&r), "blocked:non_public_address", "{host}");
+        no_connection(&listener).await;
+    }
+
+    // 登録の検証を経ずに入った IP リテラルも送る直前に断る
+    for url in [
+        format!("https://127.0.0.1:{port}/hook"),
+        format!("https://[::ffff:127.0.0.1]:{port}/hook"),
+        "https://10.0.0.1/hook".to_string(),
+    ] {
+        h.relay
+            .store
+            .register_agent(
+                ROOM,
+                "grok",
+                Some(super::webhook::WebhookTarget {
+                    url: url.clone(),
+                    auth: None,
+                    secret: "s".into(),
+                }),
+            )
+            .unwrap();
+        let r = c
+            .ok(
+                "send_message",
+                json!({ "agent": "muse", "to": "grok", "text": "literal" }),
+            )
+            .await;
+        assert_eq!(status(&r), "blocked:non_public_address", "{url}");
+        no_connection(&listener).await;
+    }
+}
+
+#[tokio::test]
+async fn webhook_deliveries_are_limited_in_number() {
+    let (url, captured, server) = webhook_receiver().await;
+    let (h, c) = setup_with(Relay::new(PUBLIC_URL, 1024).allowing_loopback_http_webhooks()).await;
+    c.ok(
+        "register_agent",
+        json!({ "agent": "grok", "webhook_url": format!("{url}/hook"), "webhook_secret": DUMMY_SECRET }),
+    )
+    .await;
+    let slots = h.relay.take_all_webhook_slots();
+    assert_eq!(slots.len(), super::webhook::MAX_IN_FLIGHT);
+    let r = c
+        .ok(
+            "send_message",
+            json!({ "agent": "muse", "to": "grok", "text": "busy" }),
+        )
+        .await;
+    assert_eq!(r["notified"], false);
+    assert_eq!(
+        h.relay
+            .store
+            .webhook_status(ROOM, r["message"]["id"].as_str().unwrap())
+            .as_deref(),
+        Some("skipped:too_many_in_flight")
+    );
+    assert!(captured.lock().unwrap().is_empty());
+    // メッセージ自体は届いている
+    assert_eq!(
+        texts(&c.ok("check_messages", json!({ "agent": "grok" })).await),
+        ["busy"]
+    );
+
+    drop(slots);
+    let r = c
+        .ok(
+            "send_message",
+            json!({ "agent": "muse", "to": "grok", "text": "free" }),
+        )
+        .await;
+    assert_eq!(r["notified"], true);
+    assert_eq!(captured.lock().unwrap().len(), 1);
+    server.abort();
 }

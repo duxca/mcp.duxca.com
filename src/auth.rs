@@ -453,13 +453,21 @@ fn is_global_ipv6(ip: Ipv6Addr) -> bool {
         return is_global_ipv4(v4);
     }
     let s = ip.segments();
+    let v4 = |hi: u16, lo: u16| Ipv4Addr::from((u32::from(hi) << 16) | u32::from(lo));
+    // IPv4 互換（::a.b.c.d、廃止済み）と 6to4（2002:a.b.c.d::/48）は埋め込みの IPv4 で判定する
+    if s[..6] == [0; 6] && !ip.is_loopback() && !ip.is_unspecified() {
+        return is_global_ipv4(v4(s[6], s[7]));
+    }
+    if s[0] == 0x2002 && !is_global_ipv4(v4(s[1], s[2])) {
+        return false;
+    }
     !(ip.is_unspecified()
         || ip.is_loopback()
         || ip.is_multicast()
         || (s[0] & 0xfe00) == 0xfc00 // fc00::/7
         || (s[0] & 0xffc0) == 0xfe80 // fe80::/10
         || (s[0] == 0x2001 && s[1] == 0x0db8) // documentation
-        || (s[0] == 0x0064 && s[1] == 0xff9b) // NAT64
+        || (s[0] == 0x0064 && s[1] == 0xff9b) // NAT64（64:ff9b::/32）
         || s[0] == 0x0100) // discard
 }
 
@@ -534,16 +542,21 @@ fn urlencoding_host(host: &str) -> String {
         .collect()
 }
 
-async fn resolve_public_host(host: &str) -> anyhow::Result<Vec<SocketAddr>> {
+/// `host` の公開アドレス（ポートは 443）。無ければ空。relay の webhook も同じ判定で送り先を決める。
+pub(crate) async fn public_host_addrs(host: &str) -> anyhow::Result<Vec<SocketAddr>> {
     let system = public_addrs(tokio::net::lookup_host((host, 443)).await?);
     if !system.is_empty() {
         return Ok(system);
     }
-    let doh = resolve_via_doh(host).await?;
-    if doh.is_empty() {
+    resolve_via_doh(host).await
+}
+
+async fn resolve_public_host(host: &str) -> anyhow::Result<Vec<SocketAddr>> {
+    let addrs = public_host_addrs(host).await?;
+    if addrs.is_empty() {
         anyhow::bail!("cimd host is not public");
     }
-    Ok(doh)
+    Ok(addrs)
 }
 
 #[async_trait]

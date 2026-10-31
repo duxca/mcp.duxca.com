@@ -7,10 +7,14 @@ use super::{Relay, RelayError};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use serde_json::{json, Map, Value};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::task::JoinSet;
 
 const PROTOCOL_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
+/// 1 つのバッチに入れられるリクエスト数。
+pub const MAX_BATCH: usize = 32;
+/// バッチ 1 つ分の tools/call の応答の合計（直列化したバイト数）。単発の呼び出しには掛けない。
+pub const BATCH_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const CHECK_MAX_WAIT_SECONDS: f64 = 55.0;
 const ASK_DEFAULT_WAIT_SECONDS: f64 = 55.0;
 const ASK_MAX_WAIT_SECONDS: f64 = 240.0;
@@ -71,7 +75,7 @@ pub fn tools() -> Value {
             "agent": agent,
             "webhook_url": { "type": "string", "description": "https URL (max 2048 chars) to POST {\"event\":\"relay.message.created\",\"message\":{...}} to." },
             "webhook_auth": { "type": "string", "description": "Sent verbatim as the Authorization header." },
-            "webhook_secret": { "type": "string", "description": "HMAC-SHA256 key for X-Relay-Signature (empty when omitted)." } } },
+            "webhook_secret": { "type": "string", "description": "Required with webhook_url. HMAC-SHA256 key for X-Relay-Signature; it is never sent itself." } } },
           "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true } },
         { "name": "unregister_agent", "description": "Remove your registration (and webhook) from this room. Messages are kept.",
           "inputSchema": { "type": "object", "required": ["agent"], "properties": { "agent": agent } },
@@ -117,11 +121,12 @@ fn check_wait(v: &Value) -> Value {
     }
 }
 
+/// `a` は持ち主ごと受け取り、待機の前に手放す（使わない大きな引数を long-poll の間まで抱えない）。
 async fn call_tool(
     relay: &Arc<Relay>,
     room: &str,
     name: &str,
-    a: &Map<String, Value>,
+    a: Map<String, Value>,
 ) -> Result<Value, ToolError> {
     let store = &relay.store;
     let arg = |k: &str| a.get(k).cloned().unwrap_or(Value::Null);
@@ -145,11 +150,27 @@ async fn call_tool(
                 .into());
             }
             let wait = wait.min(ASK_MAX_WAIT_SECONDS);
+            let mark_reply_read = a.get("mark_reply_read") != Some(&Value::Bool(false));
+            // 枠が無ければ送る前に断る（送ってからエラーにすると、やり直しで二重に送られる）
+            let slot = if wait > 0.0 {
+                Some(store.reserve_wait(room)?)
+            } else {
+                None
+            };
             let (message, notified) = relay.send(room, &agent, &to, a).await?;
             let after: u64 = message.id.parse().unwrap_or(u64::MAX);
             let reply = store
-                .wait_for_reply(room, &agent, &to, &message.thread_id, after, wait)
+                .wait_for_reply(
+                    slot.as_ref(),
+                    room,
+                    &agent,
+                    &to,
+                    &message.thread_id,
+                    after,
+                    wait,
+                )
                 .await;
+            drop(slot);
             tracing::info!(
                 room,
                 from = ?agent,
@@ -163,7 +184,7 @@ async fn call_tool(
             );
             Ok(match reply {
                 Some(mut reply) => {
-                    if a.get("mark_reply_read") != Some(&Value::Bool(false)) {
+                    if mark_reply_read {
                         store.mark_read(room, &agent, &json!({ "message_ids": [reply.id] }))?;
                         reply.read = true;
                         reply.read_at = Some(iso_ms(now_ms()));
@@ -184,32 +205,21 @@ async fn call_tool(
                 Value::Null => Value::Bool(true),
                 v => v,
             };
-            let mut r = store
-                .check_messages(
-                    room,
-                    &agent,
-                    ListArgs {
-                        since: arg("since_cursor"),
-                        unread_only,
-                        limit: arg("limit"),
-                        thread_id: arg("thread_id"),
-                        wait: wait.clone(),
-                    },
-                )
-                .await?;
-            let ids: Vec<Value> = r["messages"]
-                .as_array()
-                .map(|ms| ms.iter().map(|m| m["id"].clone()).collect())
-                .unwrap_or_default();
-            if js::truthy(&arg("mark_read")) && !ids.is_empty() {
-                let marked = store.mark_read(room, &agent, &json!({ "message_ids": ids }))?;
-                r["marked_read"] = marked["marked_read"].clone();
-            }
+            let list = ListArgs {
+                since: arg("since_cursor"),
+                unread_only,
+                limit: arg("limit"),
+                thread_id: arg("thread_id"),
+                wait: wait.clone(),
+            };
+            drop(a);
+            // mark_read は応答を返せると決まってから tools_call が行う
+            let r = store.check_messages(room, &agent, list).await?;
             let timed_out = r.get("timed_out").and_then(Value::as_bool);
             tracing::info!(
                 room,
                 agent = ?agent,
-                delivered = ids.len(),
+                delivered = r["messages"].as_array().map_or(0, Vec::len),
                 wait_seconds = %wait,
                 timed_out,
                 "relay: messages checked"
@@ -240,7 +250,7 @@ async fn call_tool(
         }
         "mark_read" => {
             let agent = name_arg("agent")?;
-            let out = store.mark_read(room, &agent, &Value::Object(a.clone()))?;
+            let out = store.mark_read(room, &agent, &Value::Object(a))?;
             tracing::info!(
                 room,
                 agent = ?agent,
@@ -253,8 +263,8 @@ async fn call_tool(
         "list_agents" => Ok(store.list_agents(room)),
         "register_agent" => {
             let agent = name_arg("agent")?;
-            let target = relay.webhook_target(a)?;
-            let webhook = store.register_agent(room, &agent, target);
+            let target = relay.webhook_target(&a)?;
+            let webhook = store.register_agent(room, &agent, target)?;
             tracing::info!(room, agent = ?agent, webhook, "relay: agent registered");
             Ok(json!({ "agent": agent, "webhook": webhook }))
         }
@@ -268,57 +278,130 @@ async fn call_tool(
     }
 }
 
+/// 直列化したときのバイト数（文字列を作らずに数える）。
+fn json_len(v: &Value) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    let _ = serde_json::to_writer(&mut count, v);
+    count.0
+}
+
+/// tools/call の result（content と structuredContent）。
+fn tool_result(name: &str, out: Value) -> Value {
+    if name != "get_attachment" {
+        return json!({ "content": [{ "type": "text", "text": pretty(&out) }], "structuredContent": out });
+    }
+    // バイト列は応答に 1 回だけ載せる
+    let mut meta = out.clone();
+    let data = meta
+        .as_object_mut()
+        .and_then(|m| m.remove("content_base64"))
+        .unwrap_or_default();
+    let content_type = out["content_type"].as_str().unwrap_or_default();
+    let is_image = matches!(
+        content_type,
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+    );
+    let content = if is_image {
+        json!([
+            { "type": "text", "text": pretty(&meta) },
+            { "type": "image", "data": data, "mimeType": content_type },
+        ])
+    } else {
+        json!([{ "type": "text", "text": out.to_string() }])
+    };
+    json!({ "content": content, "structuredContent": meta })
+}
+
+/// `budget` は同じバッチの応答の残り。読み取りの応答が収まらなければ isError に差し替える。
+/// 書き込みを伴う呼び出しは実行済みなので差し替えず、残りから差し引くだけにする（応答は小さい）。
 async fn tools_call(
     relay: &Arc<Relay>,
     room: &str,
     id: Value,
-    params: &Map<String, Value>,
+    mut params: Map<String, Value>,
+    budget: Option<&Mutex<usize>>,
 ) -> Value {
-    let name = params
-        .get("name")
+    let name = match params.remove("name") {
+        Some(Value::String(name)) => name,
+        _ => "undefined".into(),
+    };
+    let mut args = match params.remove("arguments") {
+        Some(Value::Object(args)) => args,
+        _ => Map::new(),
+    };
+    drop(params);
+    // check_messages の既読化は応答が予算に収まると決まってから行う（返せなかったメッセージを既読にしない）
+    let mark_read =
+        name == "check_messages" && args.remove("mark_read").is_some_and(|v| js::truthy(&v));
+    let reader = args
+        .get("agent")
         .and_then(Value::as_str)
-        .unwrap_or("undefined");
-    let empty = Map::new();
-    let args = params
-        .get("arguments")
-        .and_then(Value::as_object)
-        .unwrap_or(&empty);
-    match call_tool(relay, room, name, args).await {
-        Ok(out) if name == "get_attachment" => {
-            // バイト列は応答に 1 回だけ載せる
-            let mut meta = out.clone();
-            let data = meta
-                .as_object_mut()
-                .and_then(|m| m.remove("content_base64"))
-                .unwrap_or_default();
-            let content_type = out["content_type"].as_str().unwrap_or_default();
-            let is_image = matches!(
-                content_type,
-                "image/png" | "image/jpeg" | "image/gif" | "image/webp"
-            );
-            let content = if is_image {
-                json!([
-                    { "type": "text", "text": pretty(&meta) },
-                    { "type": "image", "data": data, "mimeType": content_type },
-                ])
-            } else {
-                json!([{ "type": "text", "text": out.to_string() }])
-            };
-            rpc_result(id, json!({ "content": content, "structuredContent": meta }))
-        }
-        Ok(out) => rpc_result(
-            id,
-            json!({ "content": [{ "type": "text", "text": pretty(&out) }], "structuredContent": out }),
-        ),
-        Err(ToolError::Unknown(message)) => rpc_error(id, -32602, message),
-        Err(ToolError::Failed(e)) => rpc_result(
-            id,
-            json!({ "isError": true, "content": [{ "type": "text", "text": format!("Error: {}", e.message) }] }),
-        ),
+        .map(str::to_string);
+    let mut out = match call_tool(relay, room, &name, args).await {
+        Ok(out) => out,
+        Err(ToolError::Unknown(message)) => return rpc_error(id, -32602, message),
+        Err(ToolError::Failed(e)) => return rpc_result(id, tool_error(&e.message)),
+    };
+    let ids: Vec<Value> = match out["messages"].as_array() {
+        Some(ms) if mark_read => ms.iter().map(|m| m["id"].clone()).collect(),
+        _ => Vec::new(),
+    };
+    if !ids.is_empty() {
+        // 件数は 3 桁までなので、大きめの値で応答の大きさを見積もる
+        out["marked_read"] = json!(999);
     }
+    if let Some(budget) = budget {
+        let size = json_len(&tool_result(&name, out.clone()));
+        let read_only = matches!(
+            name.as_str(),
+            "check_messages" | "get_thread" | "list_threads" | "get_attachment" | "list_agents"
+        );
+        let mut left = budget.lock().unwrap_or_else(|e| e.into_inner());
+        match left.checked_sub(size) {
+            Some(rest) => *left = rest,
+            None if !read_only => *left = 0,
+            None => {
+                return rpc_result(
+                    id,
+                    tool_error(&format!(
+                        "the responses to this batch would exceed {BATCH_RESPONSE_BYTES} bytes; send this call in a request of its own"
+                    )),
+                )
+            }
+        }
+    }
+    if let Some(agent) = reader.filter(|_| !ids.is_empty()) {
+        match relay
+            .store
+            .mark_read(room, &agent, &json!({ "message_ids": ids }))
+        {
+            Ok(marked) => out["marked_read"] = marked["marked_read"].clone(),
+            Err(e) => return rpc_result(id, tool_error(&e.message)),
+        }
+    }
+    rpc_result(id, tool_result(&name, out))
 }
 
-async fn handle_one(relay: &Arc<Relay>, room: &str, msg: Value) -> Option<Value> {
+fn tool_error(message: &str) -> Value {
+    json!({ "isError": true, "content": [{ "type": "text", "text": format!("Error: {message}") }] })
+}
+
+async fn handle_one(
+    relay: &Arc<Relay>,
+    room: &str,
+    mut msg: Value,
+    budget: Option<&Mutex<usize>>,
+) -> Option<Value> {
     let valid = msg.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
         && msg.get("method").is_some_and(Value::is_string);
     let id = msg.get("id").cloned().unwrap_or(Value::Null);
@@ -328,13 +411,13 @@ async fn handle_one(relay: &Arc<Relay>, room: &str, msg: Value) -> Option<Value>
     if id.is_null() {
         return None;
     }
-    let method = msg["method"].as_str().unwrap_or_default();
-    let empty = Map::new();
-    let params = msg
-        .get("params")
-        .and_then(Value::as_object)
-        .unwrap_or(&empty);
-    Some(match method {
+    let method = msg["method"].as_str().unwrap_or_default().to_string();
+    let params = match msg.get_mut("params").map(Value::take) {
+        Some(Value::Object(params)) => params,
+        _ => Map::new(),
+    };
+    drop(msg);
+    Some(match method.as_str() {
         "initialize" => {
             let requested = params.get("protocolVersion").and_then(Value::as_str);
             let version = PROTOCOL_VERSIONS
@@ -353,7 +436,7 @@ async fn handle_one(relay: &Arc<Relay>, room: &str, msg: Value) -> Option<Value>
         }
         "ping" => rpc_result(id, json!({})),
         "tools/list" => rpc_result(id, json!({ "tools": tools() })),
-        "tools/call" => tools_call(relay, room, id, params).await,
+        "tools/call" => tools_call(relay, room, id, params, budget).await,
         "resources/list" => rpc_result(id, json!({ "resources": [] })),
         "prompts/list" => rpc_result(id, json!({ "prompts": [] })),
         _ => rpc_error(id, -32601, format!("Method not found: {method}")),
@@ -363,14 +446,26 @@ async fn handle_one(relay: &Arc<Relay>, room: &str, msg: Value) -> Option<Value>
 /// 単一オブジェクトかバッチ配列を `room` の中で処理する。返す応答が無ければ None（HTTP 202）。
 pub async fn handle(relay: Arc<Relay>, room: Arc<str>, body: Value) -> Option<Value> {
     let Value::Array(items) = body else {
-        return handle_one(&relay, &room, body).await;
+        return handle_one(&relay, &room, body, None).await;
     };
+    if items.len() > MAX_BATCH {
+        return Some(rpc_error(
+            Value::Null,
+            -32600,
+            format!(
+                "Invalid Request: a batch may contain at most {MAX_BATCH} requests (got {})",
+                items.len()
+            ),
+        ));
+    }
+    let budget = Arc::new(Mutex::new(BATCH_RESPONSE_BYTES));
     // 元実装の Promise.all と同じく並行に処理する（long-poll が他を塞がない）
     let mut set = JoinSet::new();
     for (i, item) in items.into_iter().enumerate() {
         let relay = relay.clone();
         let room = room.clone();
-        set.spawn(async move { (i, handle_one(&relay, &room, item).await) });
+        let budget = budget.clone();
+        set.spawn(async move { (i, handle_one(&relay, &room, item, Some(&budget)).await) });
     }
     let mut out = Vec::new();
     while let Some(joined) = set.join_next().await {
