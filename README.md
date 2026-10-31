@@ -74,38 +74,54 @@ cargo run   # Tunnel 無しのゲートウェイ単体でも可（PUBLIC_URL 必
 
 旧パス `/mcp/v3` は廃止（サブドメイン `mcp.` と重複するため）。
 
-relay を有効にすると、上に加えて `/relay/v1/*` が生える（次節）。
+加えて、組み込みの relay が常に `/relay/v1`（MCP）と `/relay/v1/{health,docs,llms.txt,docs.md}` に生える（次節）。
 
-## relay（Muse ⇄ Grok Bot、`/relay/v1`）
+## relay（エージェント間メッセージ、`/relay/v1`）
 
-[AISupplyGuy/muse-relay](https://github.com/AISupplyGuy/muse-relay) の Rust 移植。Muse は REST、Grok Bot は MCP で、
-同じスレッドにメッセージと添付をやりとりする。`src/relay/` にまとまっている。
+[AISupplyGuy/muse-relay](https://github.com/AISupplyGuy/muse-relay) の移植を対称化したもの。Muse も Grok Bot も
+同じ MCP エンドポイント `POST /relay/v1` に繋ぎ、名乗った名前どうしでメッセージと添付をやりとりする。`src/relay/` にまとまっている。
 
-- `RELAY_MUSE_KEY` と `RELAY_GROK_KEY` の両方が設定されたときだけ有効（どちらか欠けるか同じ値なら無効で、ルートも生えない）
-- 認証は静的キー 2 本だけ。OAuth（GitHub ログイン）の Bearer とは別物で、互いに通らない
-  - Muse キーは REST だけ、Grok キーは MCP だけ。ファイル DL はどちらのキーでも可
-  - `Authorization: Bearer <key>` か `X-API-Key: <key>`
-- ストアはメモリだけ。再起動でスレッド・メッセージ・添付は消える
+- **エンドポイントは 1 本、認証は OAuth のみ。** 静的キーは無い。`/relay/v1` は `MCP_SERVICES` とは別に OAuth の保護リソースとして組み込みで登録される
+  - コネクタ登録時の `resource` は `{PUBLIC_URL}/relay/v1`。メタデータは `/.well-known/oauth-protected-resource/relay/v1`
+  - 他サービス向けのトークンは relay で 401、relay 向けのトークンは他サービスで 401（`WWW-Authenticate` の形は既存 MCP と同じ）
+  - `resource` 省略時の既定は従来どおり「stdio サービスが 1 本ならそれ」。relay は数に入れないので、relay へ繋ぐクライアントは `resource` を送る必要がある
+  - `MCP_SERVICES` でサービス名 `relay` は使えない（予約）
+- **部屋 = OAuth の subject（GitHub 数値 id）。** 同じアカウントのトークンなら同じ部屋。部屋をまたいだ参照はできない
+- **名乗りは自己申告。** 各ツールで自分を `agent`、相手を `to` で申告する。サーバは資格情報からロールを決めない（部屋の中は本人のエージェントだけなので名前を信頼する）
+- **起床 webhook も自己申告。** 受け手が `register_agent` で自分の `webhook_url` / `webhook_auth` / `webhook_secret` を登録し、その名前宛てのメッセージが保存されると POST される
+  - 本文 `{"event":"relay.message.created","message":{...}}`、`X-Relay-Signature: sha256=<HMAC-SHA256(webhook_secret, "<timestamp>.<body>")>`、`X-Relay-Timestamp`、`X-Relay-Event`、元実装互換の `X-Relay-Secret`、`webhook_auth` があれば `Authorization`
+  - 単発・5 秒タイムアウト・リダイレクトは追わない。`webhook_url` は https のみ
+  - 登録の値はどのツールの応答にもログにも出ない。登録はメモリだけなので、エージェントは起動のたびに登録し直す
+- ストアはメモリだけ。再起動でスレッド・メッセージ・添付・登録は消える
   - メッセージ id（= カーソル）は起動時刻の Unix ミリ秒から増えるので、再起動前のカーソルもそのまま使える
-- 添付は 1 メッセージ 5 件・合計 3 MB まで。全体の総量は `RELAY_MAX_TOTAL_STORAGE_BYTES`（既定 32 MB）で、超えると 507
-- long-poll（`ask` / `GET messages?wait=`）は最大 280 秒。Ctrl+C では待機中のものも即座に返して止まる
+- 添付は 1 メッセージ 5 件・合計 3 MB まで。全体の総量は `RELAY_MAX_TOTAL_STORAGE_BYTES`（既定 32 MB）。リクエストボディは 6 MB まで
+- 待機は `ask` が最大 240 秒（既定 55 秒）、`check_messages` が最大 55 秒。Ctrl+C では待機中のものも即座に返して止まる
+
+ツール: `send_message` / `ask` / `check_messages` / `get_thread` / `list_threads` / `mark_read` / `get_attachment` /
+`list_agents` / `register_agent` / `unregister_agent`。引数と返り値は `GET /relay/v1/docs` が正。
 
 | Method | Path | 認証 | 説明 |
 |--------|------|------|------|
+| POST | `/relay/v1` | OAuth Bearer（resource = relay） | MCP JSON-RPC（stateless streamable HTTP、バッチ可）。GET は 405、DELETE は 200 |
 | GET | `/relay/v1/health` | なし | `{"status":"ok"}` |
-| GET | `/relay/v1/docs`（`/llms.txt`, `/docs.md`） | なし | Muse 向けの使い方（テキスト） |
-| GET | `/relay/v1/openapi.json` | なし | OpenAPI |
-| POST | `/relay/v1/ask` | Muse | 送って Grok の返信を待つ（既定 240 秒） |
-| GET / POST | `/relay/v1/messages` | Muse | Grok からの受信一覧（`since` / `wait`）／待たずに送信 |
-| POST | `/relay/v1/messages/read` | Muse | 既読化 |
-| GET | `/relay/v1/threads`, `/relay/v1/threads/{id}` | Muse | スレッド一覧・詳細 |
-| GET | `/relay/v1/files/{attachment_id}` | Muse / Grok | 添付の生バイト |
-| POST | `/relay/v1/mcp` | Grok | MCP（stateless streamable HTTP、バッチ可） |
+| GET | `/relay/v1/docs`（`/llms.txt`, `/docs.md`） | なし | エージェント向けの使い方（テキスト） |
 
-Muse の送信（`ask` / `POST messages`）ごとに `RELAY_GROK_WEBHOOK_URL` へ通知する（Grok 側の送信では通知しない）。
-本文 `{"event":"muse.message.created","message":{...}}` に、`X-Relay-Signature: sha256=<HMAC-SHA256(RELAY_WEBHOOK_SECRET, "<timestamp>.<body>")>`、
-`X-Relay-Timestamp`、`X-Relay-Event`、元実装互換の `X-Relay-Secret`（秘密そのもの）と、`RELAY_GROK_WEBHOOK_AUTH` があれば `Authorization` を付ける。
-単発・5 秒タイムアウトで、リダイレクトは追わない。
+### 会話ログ
+
+relay の処理は tracing の info で会話ログを出す。本番は systemd 常駐なので journald に入る。
+
+- メッセージ保存（部屋・id・スレッド・from・to・本文全文・添付のファイル名/MIME/サイズ）、ask の結果、check_messages の配達件数、
+  mark_read、register/unregister（webhook の有無だけ）、webhook の結果と所要 ms、get_attachment
+- 添付の中身（base64）と webhook の URL・auth・secret は出さない。名前と本文は改行をエスケープして 1 行に収める
+
+```sh
+journalctl -u mcp-duxca-com -f                       # 全部
+journalctl -u mcp-duxca-com -f | grep 'relay:'       # relay だけ
+journalctl -u mcp-duxca-com -f | grep 'relay: message stored'
+```
+
+`RUST_LOG` が未設定なら `info` が既定。relay だけ見たいときは `RUST_LOG=warn,mcp_duxca_com::relay=info`
+（`mcp_duxca_com::relay` 配下が relay のターゲット）。
 
 ## GitHub OAuth App の設定
 
@@ -168,11 +184,8 @@ curl -si -X POST http://127.0.0.1:8000/default/v1 \
 | `MCP_<NAME>_<VER>_CWD` | サービスごとの cwd（省略時は下記） |
 | `CLAUDE_MCP_COMMAND` | `MCP_SERVICES` 未設定時のフォールバック（既定 `claude mcp serve`） |
 | `CLAUDE_CWD` | 上記フォールバック / 個別 CWD 未設定時の cwd（省略時 `$HOME`） |
-| `RELAY_MUSE_KEY` / `RELAY_GROK_KEY` | relay の静的キー。両方あるときだけ `/relay/v1` を有効化 |
-| `RELAY_WEBHOOK_SECRET` | relay webhook の HMAC 秘密 |
-| `RELAY_GROK_WEBHOOK_URL` | Muse の新着を POST する先（空なら送らない） |
-| `RELAY_GROK_WEBHOOK_AUTH` | webhook の `Authorization` にそのまま付ける値 |
-| `RELAY_MAX_TOTAL_STORAGE_BYTES` | relay 添付の総量上限（既定 33554432 = 32 MB） |
+| `RELAY_MAX_TOTAL_STORAGE_BYTES` | relay 添付の総量上限（既定 33554432 = 32 MB）。relay の env はこれだけ |
+| `RUST_LOG` | ログの絞り込み（未設定なら `info`） |
 | `CLOUDFLARED_TOKEN_FILE` | Tunnel トークンファイル（`scripts/run.sh`） |
 | `MCP_BIN` | ゲートウェイ実行ファイル（`scripts/run.sh`） |
 

@@ -5,6 +5,7 @@ use crate::auth::{
     GitHubLoginError, OAuthServer, RedirectAllowlist,
 };
 use crate::backend::{BackendRegistry, McpBackend};
+use crate::relay::Relay;
 use crate::routes::{router, AppState};
 use async_trait::async_trait;
 use axum::body::Body;
@@ -16,12 +17,12 @@ use std::sync::{Arc, RwLock};
 use tower::ServiceExt;
 use url::Url;
 
-const PUBLIC_URL: &str = "https://demo.trycloudflare.com";
+pub(crate) const PUBLIC_URL: &str = "https://demo.trycloudflare.com";
 const REDIRECT_URI: &str = "http://127.0.0.1:9/cb";
 /// テスト用の単一サービスパス（設定駆動の例）。
 const TEST_MCP_PATH: &str = "/default/v1";
 
-fn resource() -> String {
+pub(crate) fn resource() -> String {
     format!("{PUBLIC_URL}{TEST_MCP_PATH}")
 }
 
@@ -72,13 +73,29 @@ impl McpBackend for FakeBackend {
     }
 }
 
-struct Harness {
-    app: Router,
-    allowed: Arc<RwLock<HashSet<String>>>,
+pub(crate) struct Harness {
+    pub(crate) app: Router,
+    pub(crate) allowed: Arc<RwLock<HashSet<String>>>,
     oauth: Arc<OAuthServer>,
+    pub(crate) relay: Arc<Relay>,
 }
 
 fn harness_with(logins: &[(&str, &str, &str)], configured: bool, cimd: Option<Value>) -> Harness {
+    gateway(
+        logins,
+        configured,
+        cimd,
+        Relay::new(PUBLIC_URL, crate::relay::DEFAULT_MAX_TOTAL_STORAGE_BYTES),
+    )
+}
+
+/// OAuth（フェイクの GitHub ログイン）+ default/v1 + relay のゲートウェイ全体。
+pub(crate) fn gateway(
+    logins: &[(&str, &str, &str)],
+    configured: bool,
+    cimd: Option<Value>,
+    relay: Relay,
+) -> Harness {
     let allowed = Arc::new(RwLock::new(HashSet::from(["2429307".to_string()])));
     let github = FakeGitHub {
         logins: logins
@@ -95,17 +112,19 @@ fn harness_with(logins: &[(&str, &str, &str)], configured: bool, cimd: Option<Va
         vec![TEST_MCP_PATH.to_string()],
         RedirectAllowlist::default(),
     ));
+    let relay = Arc::new(relay);
     let mut backends = BackendRegistry::new();
     backends.insert(TEST_MCP_PATH.to_string(), Arc::new(FakeBackend));
     let app = router(AppState {
         backends: Arc::new(backends),
         oauth: oauth.clone(),
-        relay: None,
+        relay: relay.clone(),
     });
     Harness {
         app,
         allowed,
         oauth,
+        relay,
     }
 }
 
@@ -113,14 +132,14 @@ fn harness() -> Harness {
     harness_with(&[("ok", "2429307", "legokichi")], true, None)
 }
 
-struct Reply {
-    status: StatusCode,
-    headers: axum::http::HeaderMap,
-    body: String,
+pub(crate) struct Reply {
+    pub(crate) status: StatusCode,
+    pub(crate) headers: axum::http::HeaderMap,
+    pub(crate) body: String,
 }
 
 impl Reply {
-    fn json(&self) -> Value {
+    pub(crate) fn json(&self) -> Value {
         serde_json::from_str(&self.body).unwrap_or(Value::Null)
     }
     fn location(&self) -> Url {
@@ -132,11 +151,11 @@ fn query(url: &Url) -> HashMap<String, String> {
     url.query_pairs().into_owned().collect()
 }
 
-async fn send(app: &Router, request: Request<Body>) -> Reply {
+pub(crate) async fn send(app: &Router, request: Request<Body>) -> Reply {
     let response = app.clone().oneshot(request).await.unwrap();
     let status = response.status();
     let headers = response.headers().clone();
-    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+    let bytes = axum::body::to_bytes(response.into_body(), 16 << 20)
         .await
         .unwrap();
     Reply {
@@ -146,7 +165,7 @@ async fn send(app: &Router, request: Request<Body>) -> Reply {
     }
 }
 
-async fn get(app: &Router, path: &str) -> Reply {
+pub(crate) async fn get(app: &Router, path: &str) -> Reply {
     send(app, Request::get(path).body(Body::empty()).unwrap()).await
 }
 
@@ -224,12 +243,8 @@ fn authorize_path(client_id: &str, challenge: &str, resource: Option<&str>) -> S
     format!("/authorize?{}", encode(&pairs))
 }
 
-async fn github_state(app: &Router, client_id: &str, challenge: &str) -> String {
-    let started = get(
-        app,
-        &authorize_path(client_id, challenge, Some(&resource())),
-    )
-    .await;
+async fn github_state(app: &Router, client_id: &str, challenge: &str, resource: &str) -> String {
+    let started = get(app, &authorize_path(client_id, challenge, Some(resource))).await;
     assert_eq!(started.status, StatusCode::FOUND, "{}", started.body);
     let location = started.location();
     assert!(location
@@ -239,12 +254,23 @@ async fn github_state(app: &Router, client_id: &str, challenge: &str) -> String 
 }
 
 async fn authorization_code(app: &Router, client_id: &str, challenge: &str) -> String {
-    let state = github_state(app, client_id, challenge).await;
+    authorization_code_for(app, client_id, challenge, "ok", &resource()).await
+}
+
+/// `login` はフェイク GitHub のコード（= どのアカウントでログインするか）。
+async fn authorization_code_for(
+    app: &Router,
+    client_id: &str,
+    challenge: &str,
+    login: &str,
+    resource: &str,
+) -> String {
+    let state = github_state(app, client_id, challenge, resource).await;
     let finished = get(
         app,
         &format!(
             "/oauth/callback/github?{}",
-            encode(&[("code", "ok"), ("state", &state)])
+            encode(&[("code", login), ("state", &state)])
         ),
     )
     .await;
@@ -257,9 +283,18 @@ async fn authorization_code(app: &Router, client_id: &str, challenge: &str) -> S
 }
 
 async fn issue_token(app: &Router) -> (String, String, String) {
+    issue_token_for(app, "ok", &resource()).await
+}
+
+/// フェイク GitHub の `login` で `resource` 向けのトークンを取る（クライアント登録から）。
+pub(crate) async fn issue_token_for(
+    app: &Router,
+    login: &str,
+    resource: &str,
+) -> (String, String, String) {
     let client_id = register_client(app).await;
     let (verifier, challenge) = pkce();
-    let code = authorization_code(app, &client_id, &challenge).await;
+    let code = authorization_code_for(app, &client_id, &challenge, login, resource).await;
     let token = post_form(
         app,
         "/token",
@@ -269,7 +304,7 @@ async fn issue_token(app: &Router) -> (String, String, String) {
             ("redirect_uri", REDIRECT_URI),
             ("client_id", &client_id),
             ("code_verifier", &verifier),
-            ("resource", &resource()),
+            ("resource", resource),
         ],
     )
     .await;
@@ -418,7 +453,7 @@ async fn other_github_login_gets_no_code() {
     let h = harness_with(&[("ok", "1", "someoneelse")], true, None);
     let client_id = register_client(&h.app).await;
     let (_verifier, challenge) = pkce();
-    let state = github_state(&h.app, &client_id, &challenge).await;
+    let state = github_state(&h.app, &client_id, &challenge, &resource()).await;
     let path = format!(
         "/oauth/callback/github?{}",
         encode(&[("code", "ok"), ("state", &state)])
@@ -440,7 +475,7 @@ async fn reused_login_with_another_id_gets_no_code() {
     let h = harness_with(&[("ok", "99999999", "legokichi")], true, None);
     let client_id = register_client(&h.app).await;
     let (_verifier, challenge) = pkce();
-    let state = github_state(&h.app, &client_id, &challenge).await;
+    let state = github_state(&h.app, &client_id, &challenge, &resource()).await;
     let denied = get(
         &h.app,
         &format!(
@@ -750,7 +785,10 @@ async fn two_services_require_resource_and_isolate_tokens() {
     let app = router(AppState {
         backends: Arc::new(backends),
         oauth,
-        relay: None,
+        relay: Arc::new(Relay::new(
+            PUBLIC_URL,
+            crate::relay::DEFAULT_MAX_TOTAL_STORAGE_BYTES,
+        )),
     });
 
     // 複数サービス時、resource 無しの authorize は invalid_target
@@ -848,77 +886,92 @@ async fn health_is_an_empty_404() {
     assert!(r.body.is_empty());
 }
 
-/// 既存のハーネスに relay を足したゲートウェイ。
-fn gateway_with_relay(relay: Option<Arc<crate::relay::Relay>>) -> Router {
-    let h = harness();
-    let mut backends = BackendRegistry::new();
-    backends.insert(TEST_MCP_PATH.to_string(), Arc::new(FakeBackend));
-    router(AppState {
-        backends: Arc::new(backends),
-        oauth: h.oauth.clone(),
-        relay,
-    })
-}
-
 #[tokio::test]
-async fn relay_routes_exist_only_with_keys_and_leave_the_gateway_alone() {
-    let config: crate::config::Config = envy::from_iter(
-        [
-            ("RELAY_MUSE_KEY", "test-muse-key"),
-            ("RELAY_GROK_KEY", "test-grok-key"),
-        ]
-        .map(|(k, v)| (k.to_string(), v.to_string())),
-    )
-    .unwrap();
-    let relay = crate::relay::Relay::from_config(&config, PUBLIC_URL);
-    assert!(relay.is_some());
-    let enabled = gateway_with_relay(relay);
-    let disabled = gateway_with_relay(None);
+async fn relay_is_a_built_in_resource_and_leaves_the_gateway_alone() {
+    let h = harness();
+    let relay_resource = format!("{PUBLIC_URL}/relay/v1");
 
-    let r = get(&disabled, "/relay/v1/health").await;
-    assert_eq!(r.status, StatusCode::NOT_FOUND);
-    assert!(r.body.is_empty());
-    let r = get(&enabled, "/relay/v1/health").await;
-    assert_eq!(r.status, StatusCode::OK);
-    assert_eq!(r.json(), json!({ "status": "ok" }));
-
-    for app in [&enabled, &disabled] {
-        for path in ["/", "/health"] {
-            let r = get(app, path).await;
-            assert_eq!(r.status, StatusCode::NOT_FOUND, "{path}");
-            assert!(r.body.is_empty(), "{path}");
-        }
-        let r = mcp(app, None, 1).await;
-        assert_eq!(r.status, StatusCode::UNAUTHORIZED);
-        assert!(r.headers[header::WWW_AUTHENTICATE]
-            .to_str()
-            .unwrap()
-            .contains("resource_metadata="));
-        // relay の静的キーは OAuth の Bearer として通らない
-        let r = mcp(app, Some("test-muse-key"), 1).await;
-        assert_eq!(r.status, StatusCode::UNAUTHORIZED);
-        let r = send(app, Request::post("/relay/v1").body(Body::empty()).unwrap()).await;
-        assert_eq!(r.status, StatusCode::NOT_FOUND);
-        assert_eq!(
-            get(app, "/.well-known/oauth-authorization-server")
-                .await
-                .status,
-            StatusCode::OK
-        );
+    let r = get(&h.app, "/relay/v1/health").await;
+    assert_eq!(
+        (r.status, r.json()),
+        (StatusCode::OK, json!({ "status": "ok" }))
+    );
+    for path in ["/", "/health"] {
+        let r = get(&h.app, path).await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND, "{path}");
+        assert!(r.body.is_empty(), "{path}");
     }
 
-    // OAuth の Bearer は relay に通らない
-    let h = harness();
-    let (access, _, _) = issue_token(&h.app).await;
+    // relay も既存 MCP と同じ形の 401 を返す（resource_metadata だけが relay を指す）
+    let r = mcp(&h.app, None, 1).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
     let r = send(
-        &enabled,
-        Request::get("/relay/v1/messages")
-            .header(header::AUTHORIZATION, format!("Bearer {access}"))
-            .body(Body::empty())
+        &h.app,
+        Request::post("/relay/v1")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#))
             .unwrap(),
     )
     .await;
     assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        r.json(),
+        json!({ "error": "invalid_token", "error_description": "Authentication required" })
+    );
+    assert_eq!(
+        r.headers[header::WWW_AUTHENTICATE],
+        format!(
+            "Bearer error=\"invalid_token\", error_description=\"Authentication required\", resource_metadata=\"{PUBLIC_URL}/.well-known/oauth-protected-resource/relay/v1\""
+        )
+    );
+
+    let prm = get(&h.app, "/.well-known/oauth-protected-resource/relay/v1").await;
+    assert_eq!(prm.status, StatusCode::OK);
+    assert_eq!(prm.json()["resource"], relay_resource);
+    let index = get(&h.app, "/.well-known/oauth-protected-resource")
+        .await
+        .json();
+    assert_eq!(
+        index["resources"],
+        json!([resource(), relay_resource.clone()])
+    );
+
+    // stdio サービスが 1 本なら resource 省略はこれまでどおりそのサービスに束ねる
+    let client_id = register_client(&h.app).await;
+    let (verifier, challenge) = pkce();
+    let started = get(&h.app, &authorize_path(&client_id, &challenge, None)).await;
+    assert_eq!(started.status, StatusCode::FOUND, "{}", started.body);
+    let state = query(&started.location())["state"].clone();
+    let finished = get(
+        &h.app,
+        &format!(
+            "/oauth/callback/github?{}",
+            encode(&[("code", "ok"), ("state", &state)])
+        ),
+    )
+    .await;
+    let code = query(&finished.location())["code"].clone();
+    let token = post_form(
+        &h.app,
+        "/token",
+        &[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("redirect_uri", REDIRECT_URI),
+            ("client_id", &client_id),
+            ("code_verifier", &verifier),
+        ],
+    )
+    .await;
+    let access = token.json()["access_token"].as_str().unwrap().to_string();
+    assert_eq!(mcp(&h.app, Some(&access), 1).await.status, StatusCode::OK);
+
+    // relay 向けのトークンは default/v1 に通らない
+    let (relay_access, _, _) = issue_token_for(&h.app, "ok", &relay_resource).await;
+    assert_eq!(
+        mcp(&h.app, Some(&relay_access), 1).await.status,
+        StatusCode::UNAUTHORIZED
+    );
 }
 
 #[test]

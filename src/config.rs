@@ -54,26 +54,6 @@ pub struct Config {
     #[serde(default)]
     pub claude_cwd: Option<String>,
 
-    /// relay（/relay/v1）の Muse 用 REST キー。GROK と両方そろったときだけ relay を有効にする。
-    #[serde(default)]
-    pub relay_muse_key: String,
-
-    /// relay の Grok 用 MCP キー。
-    #[serde(default)]
-    pub relay_grok_key: String,
-
-    /// webhook 署名（HMAC-SHA256）の共有秘密。
-    #[serde(default)]
-    pub relay_webhook_secret: String,
-
-    /// Muse の新着を POST する先。空なら送らない。
-    #[serde(default)]
-    pub relay_grok_webhook_url: String,
-
-    /// webhook の Authorization ヘッダにそのまま載せる値。
-    #[serde(default)]
-    pub relay_grok_webhook_auth: String,
-
     /// 添付の総量上限（バイト）。メモリに持つので小さめ。
     #[serde(default = "default_relay_max_total_storage_bytes")]
     pub relay_max_total_storage_bytes: u64,
@@ -102,6 +82,9 @@ fn default_claude_command() -> String {
 fn default_relay_max_total_storage_bytes() -> u64 {
     crate::relay::DEFAULT_MAX_TOTAL_STORAGE_BYTES
 }
+
+/// `/relay/v1` と衝突しないよう MCP_SERVICES では使わせない。
+const RESERVED_SERVICE_NAME: &str = "relay";
 
 /// `name` / `version` を環境変数キー用に正規化する。
 /// 例: `claude/v1` → `CLAUDE_V1`（接頭辞は呼び出し側で付ける）。
@@ -255,6 +238,9 @@ impl Config {
             if !valid_service_name(name) {
                 anyhow::bail!("サービス名が不正: {name}");
             }
+            if name == RESERVED_SERVICE_NAME {
+                anyhow::bail!("サービス名 {name} は組み込みの /relay/v1 用に予約済み");
+            }
             if !valid_version(version) {
                 anyhow::bail!("バージョンが不正（v + 数字）: {version}");
             }
@@ -322,6 +308,14 @@ mod service_config_tests {
 
     fn config_from(vars: &[(&str, &str)]) -> Config {
         envy::from_iter(vars.iter().map(|(k, v)| (k.to_string(), v.to_string()))).unwrap()
+    }
+
+    #[test]
+    fn relay_is_reserved_in_mcp_services() {
+        let err = config_from(&[("MCP_SERVICES", "relay/v1")])
+            .services()
+            .unwrap_err();
+        assert!(err.to_string().contains("予約"), "{err}");
     }
 
     #[test]

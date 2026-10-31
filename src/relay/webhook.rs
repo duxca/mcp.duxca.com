@@ -1,20 +1,29 @@
-//! Muse の新着を Grok 側へ通知する webhook（元 lib/webhook.js の移植）。
+//! 宛先エージェントが `register_agent` で登録した起床用 webhook（元 lib/webhook.js の移植）。
 
 use super::store::MessageView;
 use hmac::{Hmac, Mac};
 use serde_json::json;
 use sha2::Sha256;
+use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub const EVENT: &str = "muse.message.created";
+pub const EVENT: &str = "relay.message.created";
 const TIMEOUT: Duration = Duration::from_secs(5);
 
-pub struct Webhook {
-    url: Option<String>,
+/// 登録された送り先。値はログにも応答にも出さないので Debug も伏せる。
+#[derive(Clone)]
+pub struct WebhookTarget {
+    pub url: String,
     /// `Authorization` にそのまま載せる値
-    auth: Option<String>,
-    secret: String,
-    client: reqwest::Client,
+    pub auth: Option<String>,
+    /// 署名用の秘密（未設定なら空文字列）
+    pub secret: String,
+}
+
+impl fmt::Debug for WebhookTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("WebhookTarget { .. }")
+    }
 }
 
 /// `HMAC-SHA256(secret, "{timestamp}.{body}")` の hex。
@@ -31,50 +40,42 @@ pub fn signature(secret: &str, timestamp: &str, body: &str) -> String {
         .collect()
 }
 
-fn non_empty(s: &str) -> Option<String> {
-    Some(s.trim().to_string()).filter(|s| !s.is_empty())
+pub struct Webhook {
+    client: reqwest::Client,
 }
 
 impl Webhook {
-    pub fn new(url: &str, auth: &str, secret: &str) -> Self {
+    pub fn new() -> Self {
         let client = reqwest::Client::builder()
             .timeout(TIMEOUT)
             // 秘密ヘッダを転送先へ持ち出さない
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_default();
-        Self {
-            url: non_empty(url),
-            auth: non_empty(auth),
-            secret: secret.to_string(),
-            client,
-        }
+        Self { client }
     }
 
-    /// 単発・リトライなし。戻り値は `http_<status>` / `error:<種別>` / `skipped:no_url`。
-    pub async fn notify(&self, message: &MessageView) -> String {
-        let Some(url) = &self.url else {
-            return "skipped:no_url".into();
-        };
+    /// 単発・リトライなし。戻り値は `http_<status>` / `error:<種別>`。
+    pub async fn notify(&self, target: &WebhookTarget, message: &MessageView) -> String {
         let body = json!({ "event": EVENT, "message": message }).to_string();
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0)
             .to_string();
-        let sig = signature(&self.secret, &ts, &body);
+        let sig = signature(&target.secret, &ts, &body);
         let mut request = self
             .client
-            .post(url)
+            .post(&target.url)
             .header("content-type", "application/json")
             .header("user-agent", "muse-relay/1.0")
             .header("x-relay-timestamp", &ts)
             .header("x-relay-signature", format!("sha256={sig}"))
             // 静的比較しかできない受信側のため、元実装どおり生の秘密も送る
-            .header("x-relay-secret", &self.secret)
+            .header("x-relay-secret", &target.secret)
             .header("x-relay-event", EVENT)
             .body(body);
-        if let Some(auth) = &self.auth {
+        if let Some(auth) = &target.auth {
             request = request.header("authorization", auth);
         }
         match request.send().await {
@@ -102,7 +103,17 @@ mod webhook_tests {
             ),
             "a7dc5ece5d258bc49eaa15e39a9d647e63f331ad44539e7ec7e125f2ee36dcf6"
         );
-        // 空の秘密でも署名はできる（元実装は WEBHOOK_SECRET 未設定で空文字）
+        // 秘密を登録しなかった宛先は空文字列で署名する
         assert_eq!(signature("", "1", "{}").len(), 64);
+    }
+
+    #[test]
+    fn debug_hides_the_target() {
+        let t = WebhookTarget {
+            url: "https://hook.example/secret-path".into(),
+            auth: Some("Bearer dummy-auth".into()),
+            secret: "dummy-secret".into(),
+        };
+        assert_eq!(format!("{t:?}"), "WebhookTarget { .. }");
     }
 }

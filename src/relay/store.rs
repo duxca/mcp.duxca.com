@@ -1,9 +1,11 @@
 //! メモリ内ストア（元 lib/store.js の移植）。再起動で全て消える。
 //!
-//! メッセージ id はカーソルを兼ねる。起動時刻の Unix ミリ秒から始めるので、
+//! データは「部屋」（OAuth の subject = GitHub 数値 id）ごとに分かれ、部屋をまたいで見えない。
+//! メッセージ id はカーソルを兼ねる。全部屋で 1 本のカウンタを起動時刻の Unix ミリ秒から始めるので、
 //! 再起動前のカーソルより新しいメッセージの id が必ず大きくなる。
 
 use super::js::{self, is_js_whitespace, utf16_len};
+use super::webhook::WebhookTarget;
 use super::RelayError;
 use axum::body::Bytes;
 use base64::alphabet;
@@ -28,27 +30,7 @@ pub const MAX_FILES_PER_MESSAGE: usize = 5;
 pub const DEFAULT_MAX_TOTAL_STORAGE_BYTES: u64 = 32 * 1024 * 1024;
 pub const MAX_WAIT_SECONDS: f64 = 280.0;
 const MAX_THREAD_MESSAGES: usize = 500;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Side {
-    Muse,
-    Grok,
-}
-
-impl Side {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Side::Muse => "muse",
-            Side::Grok => "grok",
-        }
-    }
-    pub fn other(self) -> Side {
-        match self {
-            Side::Muse => Side::Grok,
-            Side::Grok => Side::Muse,
-        }
-    }
-}
+pub const MAX_AGENT_NAME: usize = 64;
 
 pub fn now_ms() -> i64 {
     SystemTime::now()
@@ -93,7 +75,6 @@ pub struct AttachmentView {
     pub content_type: String,
     pub size: usize,
     pub sha256: String,
-    pub download_url: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -101,7 +82,8 @@ pub struct MessageView {
     pub id: String,
     pub cursor: String,
     pub thread_id: String,
-    pub sender: &'static str,
+    pub from: String,
+    pub to: String,
     pub text: String,
     pub created_at: String,
     pub read: bool,
@@ -113,7 +95,7 @@ pub struct MessageView {
 pub struct ThreadView {
     pub id: String,
     pub subject: String,
-    pub started_by: &'static str,
+    pub started_by: String,
     pub created_at: String,
     pub updated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -122,7 +104,7 @@ pub struct ThreadView {
     pub unread_count: Option<usize>,
 }
 
-/// `get_attachment` / ファイル DL 用。
+/// `get_attachment` 用。
 pub struct AttachmentContent {
     pub meta: AttachmentView,
     pub message_id: u64,
@@ -132,7 +114,7 @@ pub struct AttachmentContent {
 struct Thread {
     id: String,
     subject: String,
-    started_by: Side,
+    started_by: String,
     created_at: i64,
     updated_at: i64,
     message_ids: Vec<u64>,
@@ -141,7 +123,8 @@ struct Thread {
 struct Message {
     id: u64,
     thread_id: String,
-    sender: Side,
+    from: String,
+    to: String,
     text: String,
     created_at: i64,
     read_at: Option<i64>,
@@ -159,11 +142,23 @@ struct Attachment {
     data: Bytes,
 }
 
-struct Inner {
-    next_id: u64,
+/// `register_agent` の登録。webhook の値は API に出さない。
+struct AgentRecord {
+    webhook: Option<WebhookTarget>,
+}
+
+#[derive(Default)]
+struct Room {
     threads: HashMap<String, Thread>,
     messages: BTreeMap<u64, Message>,
     attachments: HashMap<String, Attachment>,
+    agents: BTreeMap<String, AgentRecord>,
+}
+
+struct Inner {
+    next_id: u64,
+    rooms: HashMap<String, Room>,
+    /// 全部屋の添付の合計（メモリ保護なので部屋ごとではない）
     total_bytes: u64,
 }
 
@@ -175,8 +170,23 @@ pub struct Store {
     /// 停止中。以後の long-poll は待たずに返す。
     closed: AtomicBool,
     max_total_bytes: u64,
-    /// `{PUBLIC_URL}/relay/v1`（download_url 用）
-    base: String,
+}
+
+/// エージェント名（自己申告）。1–64 文字、空白だけ・制御文字は不可。大文字小文字は区別する。
+pub fn agent_name(v: &Value, field: &str) -> Result<String, RelayError> {
+    match v {
+        Value::String(s)
+            if (1..=MAX_AGENT_NAME).contains(&s.chars().count())
+                && !js::trim(s).is_empty()
+                && !s.chars().any(char::is_control) =>
+        {
+            Ok(s.clone())
+        }
+        Value::Null => Err(RelayError::bad_request(format!("\"{field}\" is required"))),
+        _ => Err(RelayError::bad_request(format!(
+            "\"{field}\" must be an agent name: 1-{MAX_AGENT_NAME} characters, not only whitespace, no control characters"
+        ))),
+    }
 }
 
 struct NewAttachment {
@@ -393,8 +403,8 @@ impl Drop for WaitGuard<'_> {
     }
 }
 
-impl Inner {
-    fn fmt_attachment(&self, base: &str, id: &str) -> Option<AttachmentView> {
+impl Room {
+    fn fmt_attachment(&self, id: &str) -> Option<AttachmentView> {
         let a = self.attachments.get(id)?;
         Some(AttachmentView {
             id: a.id.clone(),
@@ -402,16 +412,16 @@ impl Inner {
             content_type: a.content_type.clone(),
             size: a.data.len(),
             sha256: a.sha256.clone(),
-            download_url: format!("{base}/files/{}", a.id),
         })
     }
 
-    fn fmt_message(&self, base: &str, m: &Message) -> MessageView {
+    fn fmt_message(&self, m: &Message) -> MessageView {
         MessageView {
             id: m.id.to_string(),
             cursor: m.id.to_string(),
             thread_id: m.thread_id.clone(),
-            sender: m.sender.as_str(),
+            from: m.from.clone(),
+            to: m.to.clone(),
             text: m.text.clone(),
             created_at: iso_ms(m.created_at),
             read: m.read_at.is_some(),
@@ -419,29 +429,30 @@ impl Inner {
             attachments: m
                 .attachment_ids
                 .iter()
-                .filter_map(|id| self.fmt_attachment(base, id))
+                .filter_map(|id| self.fmt_attachment(id))
                 .collect(),
         }
     }
 
-    fn fmt_thread(&self, t: &Thread, counts_for: Option<Side>) -> ThreadView {
-        let (message_count, unread_count) = match counts_for {
+    /// `counts` が Some なら message_count を付け、さらに Some(agent) ならその宛先の未読数も付ける。
+    fn fmt_thread(&self, t: &Thread, counts: Option<Option<&str>>) -> ThreadView {
+        let (message_count, unread_count) = match counts {
             None => (None, None),
             Some(reader) => {
-                let from = reader.other();
-                let unread = t
-                    .message_ids
-                    .iter()
-                    .filter_map(|id| self.messages.get(id))
-                    .filter(|m| m.sender == from && m.read_at.is_none())
-                    .count();
-                (Some(t.message_ids.len()), Some(unread))
+                let unread = reader.map(|agent| {
+                    t.message_ids
+                        .iter()
+                        .filter_map(|id| self.messages.get(id))
+                        .filter(|m| m.to == agent && m.read_at.is_none())
+                        .count()
+                });
+                (Some(t.message_ids.len()), unread)
             }
         };
         ThreadView {
             id: t.id.clone(),
             subject: t.subject.clone(),
-            started_by: t.started_by.as_str(),
+            started_by: t.started_by.clone(),
             created_at: iso_ms(t.created_at),
             updated_at: iso_ms(t.updated_at),
             message_count,
@@ -449,29 +460,32 @@ impl Inner {
         }
     }
 
-    fn unread_from(&self, from: Side) -> usize {
+    fn unread_to(&self, agent: &str) -> usize {
         self.messages
             .values()
-            .filter(|m| m.sender == from && m.read_at.is_none())
+            .filter(|m| m.to == agent && m.read_at.is_none())
             .count()
     }
 }
 
+impl Inner {
+    fn room(&self, room: &str) -> Option<&Room> {
+        self.rooms.get(room)
+    }
+}
+
 impl Store {
-    pub fn new(base: impl Into<String>, max_total_bytes: u64) -> Self {
+    pub fn new(max_total_bytes: u64) -> Self {
         Self {
             inner: Mutex::new(Inner {
                 next_id: now_ms().max(1) as u64,
-                threads: HashMap::new(),
-                messages: BTreeMap::new(),
-                attachments: HashMap::new(),
+                rooms: HashMap::new(),
                 total_bytes: 0,
             }),
             added: Notify::new(),
             waiting: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
             max_total_bytes,
-            base: base.into(),
         }
     }
 
@@ -485,7 +499,7 @@ impl Store {
         self.waiting.load(Ordering::SeqCst)
     }
 
-    /// 待機中・以後の long-poll をすぐ返させる。graceful shutdown が最大 280 秒待たされないように。
+    /// 待機中・以後の long-poll をすぐ返させる。graceful shutdown が待たされないように。
     pub fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
         self.added.notify_waiters();
@@ -516,9 +530,14 @@ impl Store {
         }
     }
 
-    pub fn send_message(&self, sender: Side, body: &Value) -> Result<MessageView, RelayError> {
-        let empty = Map::new();
-        let b = body.as_object().unwrap_or(&empty);
+    /// `from` から `to` へのメッセージを保存する。宛先に webhook の登録があればそれも返す。
+    pub fn send_message(
+        &self,
+        room: &str,
+        from: &str,
+        to: &str,
+        b: &Map<String, Value>,
+    ) -> Result<(MessageView, Option<WebhookTarget>), RelayError> {
         let field = |k: &str| b.get(k).unwrap_or(&Value::Null);
 
         let atts = validate_attachments(field("attachments"))?;
@@ -545,21 +564,38 @@ impl Store {
                 ))
             }
         };
+        let thread_id = match field("thread_id") {
+            Value::Null => None,
+            Value::String(tid) => Some(tid.as_str()),
+            _ => return Err(RelayError::bad_request("\"thread_id\" must be a string")),
+        };
 
-        let mut inner = self.lock();
-        if !atts.is_empty() {
-            let add: u64 = atts.iter().map(|a| a.data.len() as u64).sum();
-            if inner.total_bytes + add > self.max_total_bytes {
-                return Err(RelayError::new(
-                    507,
-                    "relay attachment storage is full; ask the operator to clean up old files",
-                ));
+        let mut guard = self.lock();
+        let inner = &mut *guard;
+        let add: u64 = atts.iter().map(|a| a.data.len() as u64).sum();
+        if add > 0 && inner.total_bytes + add > self.max_total_bytes {
+            return Err(RelayError::new(
+                507,
+                "relay attachment storage is full; ask the operator to clean up old files",
+            ));
+        }
+        if let Some(tid) = thread_id {
+            if !inner
+                .room(room)
+                .is_some_and(|r| r.threads.contains_key(tid))
+            {
+                return Err(RelayError::new(404, format!("thread {tid} not found")));
             }
         }
+        let id = inner.next_id;
+        inner.next_id += 1;
+        inner.total_bytes += add;
+        let r = inner.rooms.entry(room.to_string()).or_default();
         let now = now_ms();
-        let thread_id = match field("thread_id") {
-            Value::Null => {
-                let id = format!("thr_{}", random_hex(8));
+        let thread_id = match thread_id {
+            Some(tid) => tid.to_string(),
+            None => {
+                let tid = format!("thr_{}", random_hex(8));
                 let subject = subject
                     .filter(|s| !s.is_empty())
                     .or_else(|| Some(utf16_prefix(text, 80)).filter(|s| !s.is_empty()))
@@ -567,31 +603,25 @@ impl Store {
                     .filter(|s| !s.is_empty())
                     .unwrap_or("attachment")
                     .to_string();
-                inner.threads.insert(
-                    id.clone(),
+                r.threads.insert(
+                    tid.clone(),
                     Thread {
-                        id: id.clone(),
+                        id: tid.clone(),
                         subject,
-                        started_by: sender,
+                        started_by: from.to_string(),
                         created_at: now,
                         updated_at: now,
                         message_ids: Vec::new(),
                     },
                 );
-                id
+                tid
             }
-            Value::String(tid) => match inner.threads.get_mut(tid) {
-                Some(t) => {
-                    t.updated_at = now;
-                    tid.clone()
-                }
-                None => return Err(RelayError::new(404, format!("thread {tid} not found"))),
-            },
-            _ => return Err(RelayError::bad_request("\"thread_id\" must be a string")),
         };
+        if let Some(t) = r.threads.get_mut(&thread_id) {
+            t.updated_at = now;
+            t.message_ids.push(id);
+        }
 
-        let id = inner.next_id;
-        inner.next_id += 1;
         let mut attachment_ids = Vec::with_capacity(atts.len());
         for a in atts {
             let att_id = format!("att_{}", random_hex(10));
@@ -599,8 +629,7 @@ impl Store {
                 .iter()
                 .map(|b| format!("{b:02x}"))
                 .collect();
-            inner.total_bytes += a.data.len() as u64;
-            inner.attachments.insert(
+            r.attachments.insert(
                 att_id.clone(),
                 Attachment {
                     id: att_id.clone(),
@@ -613,29 +642,32 @@ impl Store {
             );
             attachment_ids.push(att_id);
         }
-        if let Some(t) = inner.threads.get_mut(&thread_id) {
-            t.message_ids.push(id);
-        }
+        let target = r.agents.get(to).and_then(|a| a.webhook.clone());
         let message = Message {
             id,
             thread_id,
-            sender,
+            from: from.to_string(),
+            to: to.to_string(),
             text: text.to_string(),
             created_at: now,
             read_at: None,
             attachment_ids,
-            webhook_status: None,
+            webhook_status: target.is_none().then(|| "skipped:no_webhook".to_string()),
         };
-        let view = inner.fmt_message(&self.base, &message);
-        inner.messages.insert(id, message);
-        drop(inner);
+        let view = r.fmt_message(&message);
+        r.messages.insert(id, message);
+        drop(guard);
         self.added.notify_waiters();
-        Ok(view)
+        Ok((view, target))
     }
 
-    /// `reader` 宛て（相手が送った）メッセージ。`wait > 0` なら 1 件以上になるまで待つ。
-    pub async fn list_incoming(&self, reader: Side, args: ListArgs) -> Result<Value, RelayError> {
-        let from = reader.other();
+    /// 部屋内で `agent` 宛てのメッセージ。`wait > 0` なら 1 件以上になるまで待つ。
+    pub async fn check_messages(
+        &self,
+        room: &str,
+        agent: &str,
+        args: ListArgs,
+    ) -> Result<Value, RelayError> {
         let after = if args.since.is_null() || args.since.as_str() == Some("") {
             0.0
         } else {
@@ -643,7 +675,7 @@ impl Store {
         };
         if !after.is_finite() || after < 0.0 {
             return Err(RelayError::bad_request(
-                "\"since\" must be a cursor value returned by this API",
+                "\"since_cursor\" must be a cursor value returned by this API",
             ));
         }
         let limit = clamp_limit(&args.limit, 50.0, 200.0);
@@ -654,15 +686,17 @@ impl Store {
         let start = first_id_after(after);
 
         let query = |inner: &Inner| -> Vec<MessageView> {
-            inner
-                .messages
+            let Some(r) = inner.room(room) else {
+                return Vec::new();
+            };
+            r.messages
                 .range((Bound::Included(start), Bound::Unbounded))
                 .map(|(_, m)| m)
-                .filter(|m| m.sender == from)
+                .filter(|m| m.to == agent)
                 .filter(|m| !unread_only || m.read_at.is_none())
                 .filter(|m| thread_id.as_deref().is_none_or(|t| m.thread_id == t))
                 .take(limit)
-                .map(|m| inner.fmt_message(&self.base, m))
+                .map(|m| r.fmt_message(m))
                 .collect()
         };
         let messages = self
@@ -672,7 +706,7 @@ impl Store {
             .await
             .unwrap_or_default();
 
-        let unread_total = self.lock().unread_from(from);
+        let unread_total = self.lock().room(room).map_or(0, |r| r.unread_to(agent));
         let next_cursor = match messages.last() {
             Some(m) => Value::String(m.cursor.clone()),
             None if after != 0.0 => Value::String(number_string(after)),
@@ -692,49 +726,51 @@ impl Store {
         Ok(out)
     }
 
-    /// `thread_id` で `after_id` より後に相手が送った最初の 1 件を待つ（ask 用）。
+    /// `thread_id` で `after_id` より後に `peer` が `agent` へ送った最初の 1 件を待つ（ask 用）。
     pub async fn wait_for_reply(
         &self,
-        reader: Side,
+        room: &str,
+        agent: &str,
+        peer: &str,
         thread_id: &str,
         after_id: u64,
         wait_seconds: f64,
     ) -> Option<MessageView> {
-        let from = reader.other();
         let wait = Duration::from_secs_f64(wait_seconds.clamp(0.0, MAX_WAIT_SECONDS));
         self.wait_for(wait, |inner| {
-            let thread = inner.threads.get(thread_id)?;
+            let r = inner.room(room)?;
+            let thread = r.threads.get(thread_id)?;
             thread
                 .message_ids
                 .iter()
                 .filter(|id| **id > after_id)
-                .filter_map(|id| inner.messages.get(id))
-                .find(|m| m.sender == from)
-                .map(|m| inner.fmt_message(&self.base, m))
+                .filter_map(|id| r.messages.get(id))
+                .find(|m| m.from == peer && m.to == agent)
+                .map(|m| r.fmt_message(m))
         })
         .await
     }
 
-    pub fn get_thread(&self, id: &Value) -> Result<Value, RelayError> {
+    pub fn get_thread(&self, room: &str, id: &Value) -> Result<Value, RelayError> {
         let id = match id.as_str() {
             Some(s) if !s.is_empty() => s,
             _ => return Err(RelayError::bad_request("\"thread_id\" is required")),
         };
         let inner = self.lock();
-        let Some(t) = inner.threads.get(id) else {
+        let Some((r, t)) = inner.room(room).and_then(|r| Some((r, r.threads.get(id)?))) else {
             return Err(RelayError::new(404, format!("thread {id} not found")));
         };
         let messages: Vec<MessageView> = t
             .message_ids
             .iter()
             .take(MAX_THREAD_MESSAGES)
-            .filter_map(|id| inner.messages.get(id))
-            .map(|m| inner.fmt_message(&self.base, m))
+            .filter_map(|id| r.messages.get(id))
+            .map(|m| r.fmt_message(m))
             .collect();
-        Ok(json!({ "thread": inner.fmt_thread(t, None), "messages": messages }))
+        Ok(json!({ "thread": r.fmt_thread(t, None), "messages": messages }))
     }
 
-    pub fn get_attachment(&self, id: &Value) -> Result<AttachmentContent, RelayError> {
+    pub fn get_attachment(&self, room: &str, id: &Value) -> Result<AttachmentContent, RelayError> {
         let id = match id.as_str() {
             Some(s)
                 if s.len() > 4
@@ -752,10 +788,10 @@ impl Store {
             }
         };
         let inner = self.lock();
-        let (Some(a), Some(meta)) = (
-            inner.attachments.get(id),
-            inner.fmt_attachment(&self.base, id),
-        ) else {
+        let found = inner
+            .room(room)
+            .and_then(|r| Some((r.attachments.get(id)?, r.fmt_attachment(id)?)));
+        let Some((a, meta)) = found else {
             return Err(RelayError::new(404, format!("attachment {id} not found")));
         };
         Ok(AttachmentContent {
@@ -765,27 +801,30 @@ impl Store {
         })
     }
 
-    pub fn list_threads(&self, reader: Side, limit: &Value) -> Value {
+    /// 部屋内のスレッドを新しい順に。`agent` があればその宛先の未読数を付ける。
+    pub fn list_threads(&self, room: &str, agent: Option<&str>, limit: &Value) -> Value {
         let limit = clamp_limit(limit, 20.0, 100.0);
         let inner = self.lock();
-        let mut threads: Vec<&Thread> = inner.threads.values().collect();
+        let Some(r) = inner.room(room) else {
+            return json!({ "threads": [] });
+        };
+        let mut threads: Vec<&Thread> = r.threads.values().collect();
         threads.sort_by(|a, b| {
             (b.updated_at, b.message_ids.last()).cmp(&(a.updated_at, a.message_ids.last()))
         });
         let threads: Vec<ThreadView> = threads
             .into_iter()
             .take(limit)
-            .map(|t| inner.fmt_thread(t, Some(reader)))
+            .map(|t| r.fmt_thread(t, Some(agent)))
             .collect();
         json!({ "threads": threads })
     }
 
-    /// `reader` 宛てのメッセージを既読にする。`message_ids` > `thread_id` > `up_to_cursor`。
-    pub fn mark_read(&self, reader: Side, body: &Value) -> Result<Value, RelayError> {
+    /// `agent` 宛てのメッセージを既読にする。`message_ids` > `thread_id` > `up_to_cursor`。
+    pub fn mark_read(&self, room: &str, agent: &str, body: &Value) -> Result<Value, RelayError> {
         let empty = Map::new();
         let b = body.as_object().unwrap_or(&empty);
         let field = |k: &str| b.get(k).unwrap_or(&Value::Null);
-        let from = reader.other();
 
         enum Target {
             Ids(Vec<u64>),
@@ -834,43 +873,45 @@ impl Store {
         let now = now_ms();
         let mut inner = self.lock();
         let mut marked = Vec::new();
-        let mut mark = |m: &mut Message| {
-            if m.sender == from && m.read_at.is_none() {
-                m.read_at = Some(now);
-                marked.push(m.id);
-            }
-        };
-        match target {
-            Target::Ids(ids) => {
-                for id in ids {
-                    if let Some(m) = inner.messages.get_mut(&id) {
+        if let Some(r) = inner.rooms.get_mut(room) {
+            let mut mark = |m: &mut Message| {
+                if m.to == agent && m.read_at.is_none() {
+                    m.read_at = Some(now);
+                    marked.push(m.id);
+                }
+            };
+            match target {
+                Target::Ids(ids) => {
+                    for id in ids {
+                        if let Some(m) = r.messages.get_mut(&id) {
+                            mark(m);
+                        }
+                    }
+                }
+                Target::Thread(tid) => {
+                    let ids = r
+                        .threads
+                        .get(&tid)
+                        .map(|t| t.message_ids.clone())
+                        .unwrap_or_default();
+                    for id in ids {
+                        if let Some(m) = r.messages.get_mut(&id) {
+                            mark(m);
+                        }
+                    }
+                }
+                Target::UpTo(c) if c >= 0.0 => {
+                    let upper = if c >= u64::MAX as f64 {
+                        u64::MAX
+                    } else {
+                        c.floor() as u64
+                    };
+                    for (_, m) in r.messages.range_mut(..=upper) {
                         mark(m);
                     }
                 }
+                Target::UpTo(_) => {}
             }
-            Target::Thread(tid) => {
-                let ids = inner
-                    .threads
-                    .get(&tid)
-                    .map(|t| t.message_ids.clone())
-                    .unwrap_or_default();
-                for id in ids {
-                    if let Some(m) = inner.messages.get_mut(&id) {
-                        mark(m);
-                    }
-                }
-            }
-            Target::UpTo(c) if c >= 0.0 => {
-                let upper = if c >= u64::MAX as f64 {
-                    u64::MAX
-                } else {
-                    c.floor() as u64
-                };
-                for (_, m) in inner.messages.range_mut(..=upper) {
-                    mark(m);
-                }
-            }
-            Target::UpTo(_) => {}
         }
         marked.sort_unstable();
         marked.dedup();
@@ -878,17 +919,70 @@ impl Store {
         Ok(json!({ "marked_read": ids.len(), "message_ids": ids }))
     }
 
-    pub fn set_webhook_status(&self, id: &str, status: String) {
+    /// 登録を丸ごと置き換える。webhook の有無を返す。
+    pub fn register_agent(&self, room: &str, agent: &str, webhook: Option<WebhookTarget>) -> bool {
+        let has_webhook = webhook.is_some();
+        self.lock()
+            .rooms
+            .entry(room.to_string())
+            .or_default()
+            .agents
+            .insert(agent.to_string(), AgentRecord { webhook });
+        has_webhook
+    }
+
+    /// 登録を消す（メッセージは残る）。消えたかどうかを返す。
+    pub fn unregister_agent(&self, room: &str, agent: &str) -> bool {
+        self.lock()
+            .rooms
+            .get_mut(room)
+            .is_some_and(|r| r.agents.remove(agent).is_some())
+    }
+
+    /// 登録 ∪ メッセージの from/to を名前順に。webhook の値は出さない。
+    pub fn list_agents(&self, room: &str) -> Value {
+        let inner = self.lock();
+        let Some(r) = inner.room(room) else {
+            return json!({ "agents": [] });
+        };
+        let mut names: BTreeMap<&str, bool> = r
+            .agents
+            .iter()
+            .map(|(name, a)| (name.as_str(), a.webhook.is_some()))
+            .collect();
+        for m in r.messages.values() {
+            names.entry(&m.from).or_insert(false);
+            names.entry(&m.to).or_insert(false);
+        }
+        let agents: Vec<Value> = names
+            .into_iter()
+            .map(|(name, webhook)| json!({ "name": name, "webhook": webhook }))
+            .collect();
+        json!({ "agents": agents })
+    }
+
+    pub fn set_webhook_status(&self, room: &str, id: &str, status: String) {
         let Ok(id) = id.parse::<u64>() else { return };
-        if let Some(m) = self.lock().messages.get_mut(&id) {
+        if let Some(m) = self
+            .lock()
+            .rooms
+            .get_mut(room)
+            .and_then(|r| r.messages.get_mut(&id))
+        {
             m.webhook_status = Some(status);
         }
     }
 
     #[cfg(test)]
-    pub fn webhook_status(&self, id: &str) -> Option<String> {
+    pub fn webhook_status(&self, room: &str, id: &str) -> Option<String> {
         let id = id.parse::<u64>().ok()?;
-        self.lock().messages.get(&id)?.webhook_status.clone()
+        self.lock()
+            .rooms
+            .get(room)?
+            .messages
+            .get(&id)?
+            .webhook_status
+            .clone()
     }
 
     #[cfg(test)]
@@ -900,6 +994,21 @@ impl Store {
 #[cfg(test)]
 mod store_tests {
     use super::*;
+
+    const ROOM: &str = "2429307";
+    const OTHER: &str = "1001";
+
+    fn args(v: Value) -> Map<String, Value> {
+        v.as_object().cloned().unwrap()
+    }
+
+    fn target(url: &str) -> WebhookTarget {
+        WebhookTarget {
+            url: url.into(),
+            auth: None,
+            secret: String::new(),
+        }
+    }
 
     #[test]
     fn iso_matches_js_to_iso_string() {
@@ -930,15 +1039,37 @@ mod store_tests {
         assert_eq!(utf16_prefix("abc", 80), "abc");
     }
 
+    #[test]
+    fn agent_names_are_validated() {
+        for ok in ["grok", "Grok", "muse bot", "ミューズ", &"x".repeat(64)] {
+            assert_eq!(agent_name(&json!(ok), "agent").unwrap(), ok);
+        }
+        assert_eq!(
+            agent_name(&Value::Null, "to").unwrap_err().message,
+            "\"to\" is required"
+        );
+        for bad in [
+            json!(""),
+            json!("   "),
+            json!("a\nb"),
+            json!("a\u{7}"),
+            json!(1),
+            json!("x".repeat(65)),
+        ] {
+            assert!(agent_name(&bad, "agent").is_err(), "{bad}");
+        }
+    }
+
     #[tokio::test]
     async fn close_ends_waits_at_once() {
-        let store = std::sync::Arc::new(Store::new("https://x/relay/v1", 100));
+        let store = std::sync::Arc::new(Store::new(100));
         let waiter = store.clone();
         let started = std::time::Instant::now();
         let poll = tokio::spawn(async move {
             waiter
-                .list_incoming(
-                    Side::Muse,
+                .check_messages(
+                    ROOM,
+                    "muse",
                     ListArgs {
                         wait: json!(30),
                         ..Default::default()
@@ -955,7 +1086,7 @@ mod store_tests {
         assert!(started.elapsed() < Duration::from_secs(2));
         // 停止後の待機も即座に返る
         assert!(store
-            .wait_for_reply(Side::Muse, "thr_x", 0, 30.0)
+            .wait_for_reply(ROOM, "muse", "grok", "thr_x", 0, 30.0)
             .await
             .is_none());
         assert_eq!(store.waiting(), 0);
@@ -964,12 +1095,130 @@ mod store_tests {
     #[test]
     fn ids_start_from_the_clock() {
         let before = now_ms() as u64;
-        let store = Store::new("https://x/relay/v1", 100);
-        let m = store
-            .send_message(Side::Muse, &json!({ "text": "hi" }))
+        let store = Store::new(100);
+        let (m, _) = store
+            .send_message(ROOM, "muse", "grok", &args(json!({ "text": "hi" })))
             .unwrap();
         let id: u64 = m.id.parse().unwrap();
         assert!(id >= before && id <= now_ms() as u64, "{id}");
         assert_eq!(m.id, m.cursor);
+        assert_eq!((m.from.as_str(), m.to.as_str()), ("muse", "grok"));
+    }
+
+    #[tokio::test]
+    async fn rooms_do_not_see_each_other() {
+        let store = Store::new(1024);
+        let (m, _) = store
+            .send_message(
+                ROOM,
+                "muse",
+                "grok",
+                &args(json!({
+                    "text": "secret plan",
+                    "attachments": [{ "filename": "a.txt", "content_base64": "aGk=" }],
+                })),
+            )
+            .unwrap();
+        store.register_agent(ROOM, "grok", Some(target("https://hook.example/a")));
+        let att = m.attachments[0].id.clone();
+
+        let check = |room: &'static str| {
+            store.check_messages(
+                room,
+                "grok",
+                ListArgs {
+                    unread_only: json!(false),
+                    ..Default::default()
+                },
+            )
+        };
+        assert_eq!(check(ROOM).await.unwrap()["messages"][0]["id"], m.id);
+        assert_eq!(check(OTHER).await.unwrap()["messages"], json!([]));
+        assert_eq!(check(OTHER).await.unwrap()["unread_total"], 0);
+
+        let thread = json!(m.thread_id);
+        assert!(store.get_thread(ROOM, &thread).is_ok());
+        assert_eq!(store.get_thread(OTHER, &thread).unwrap_err().status, 404);
+        assert!(store.get_attachment(ROOM, &json!(att)).is_ok());
+        assert_eq!(
+            store
+                .get_attachment(OTHER, &json!(att))
+                .err()
+                .unwrap()
+                .status,
+            404
+        );
+        assert_eq!(
+            store.list_threads(OTHER, Some("grok"), &Value::Null),
+            json!({ "threads": [] })
+        );
+        assert_eq!(store.list_agents(OTHER), json!({ "agents": [] }));
+        assert_eq!(
+            store
+                .mark_read(OTHER, "grok", &json!({ "message_ids": [m.id] }))
+                .unwrap()["marked_read"],
+            0
+        );
+        // 別の部屋から既存スレッドへは書けない
+        let err = store
+            .send_message(
+                OTHER,
+                "muse",
+                "grok",
+                &args(json!({ "text": "x", "thread_id": m.thread_id })),
+            )
+            .unwrap_err();
+        assert_eq!(err.status, 404);
+
+        // 登録も部屋ごと。別の部屋の grok 宛てでは webhook の対象にならない
+        let (_, hook) = store
+            .send_message(OTHER, "muse", "grok", &args(json!({ "text": "x" })))
+            .unwrap();
+        assert!(hook.is_none());
+        let (_, hook) = store
+            .send_message(ROOM, "muse", "grok", &args(json!({ "text": "x" })))
+            .unwrap();
+        assert_eq!(hook.unwrap().url, "https://hook.example/a");
+        assert!(!store.unregister_agent(OTHER, "grok"));
+        assert!(store.unregister_agent(ROOM, "grok"));
+        let (_, hook) = store
+            .send_message(ROOM, "muse", "grok", &args(json!({ "text": "x" })))
+            .unwrap();
+        assert!(hook.is_none());
+    }
+
+    #[tokio::test]
+    async fn replies_must_come_from_the_peer_to_the_asker() {
+        let store = Store::new(100);
+        let (q, _) = store
+            .send_message(ROOM, "muse", "grok", &args(json!({ "text": "q" })))
+            .unwrap();
+        let after: u64 = q.id.parse().unwrap();
+        let in_thread = |text: &str| args(json!({ "text": text, "thread_id": q.thread_id }));
+        store
+            .send_message(ROOM, "carol", "muse", &in_thread("not grok"))
+            .unwrap();
+        store
+            .send_message(ROOM, "grok", "carol", &in_thread("not to muse"))
+            .unwrap();
+        let reply = store
+            .wait_for_reply(ROOM, "muse", "grok", &q.thread_id, after, 0.0)
+            .await;
+        assert!(reply.is_none());
+        store
+            .send_message(ROOM, "grok", "muse", &in_thread("answer"))
+            .unwrap();
+        let reply = store
+            .wait_for_reply(ROOM, "muse", "grok", &q.thread_id, after, 0.0)
+            .await
+            .unwrap();
+        assert_eq!(reply.text, "answer");
+        assert_eq!(
+            store
+                .wait_for_reply(OTHER, "muse", "grok", &q.thread_id, after, 0.0)
+                .await
+                .map(|m| m.id),
+            None
+        );
     }
 }

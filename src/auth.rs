@@ -67,7 +67,7 @@ pub fn pkce_s256(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
 
-pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -991,8 +991,10 @@ pub struct OAuthServer {
     pub issuer: String,
     /// 許可する保護リソース URL の集合（`{issuer}/{name}/{version}`）。
     pub resource_urls: HashSet<String>,
-    /// 登録順。単独サービス時のデフォルトや一覧に使う。
+    /// 登録順。一覧に使う。末尾に組み込みの relay（`/relay/v1`）が入る。
     pub resource_paths: Vec<String>,
+    /// `resource` 省略時の束ね先。stdio サービスが 1 本だけのときその URL（relay は数えない）。
+    default_resource_url: Option<String>,
     /// 共有の参照。集合から外すと発行済みの bearer も次の照合で弾かれる。
     pub allowed_ids: Arc<RwLock<HashSet<String>>>,
     pub github: Arc<dyn GitHubLogin>,
@@ -1003,6 +1005,7 @@ pub struct OAuthServer {
 
 impl OAuthServer {
     /// `resource_paths` は `/claude/v1` のようなパス（先頭スラッシュ付き）。
+    /// relay の `/relay/v1` は組み込みで足す。
     pub fn new(
         issuer: &str,
         allowed_ids: Arc<RwLock<HashSet<String>>>,
@@ -1016,18 +1019,7 @@ impl OAuthServer {
             !resource_paths.is_empty(),
             "at least one MCP resource path is required"
         );
-        let resource_urls: HashSet<String> = resource_paths
-            .iter()
-            .map(|p| {
-                let p = if p.starts_with('/') {
-                    p.clone()
-                } else {
-                    format!("/{p}")
-                };
-                format!("{issuer}{p}")
-            })
-            .collect();
-        let resource_paths: Vec<String> = resource_paths
+        let mut resource_paths: Vec<String> = resource_paths
             .into_iter()
             .map(|p| {
                 if p.starts_with('/') {
@@ -1037,24 +1029,28 @@ impl OAuthServer {
                 }
             })
             .collect();
+        let default_resource_url = match resource_paths.as_slice() {
+            [only] => Some(format!("{issuer}{only}")),
+            _ => None,
+        };
+        if !resource_paths.iter().any(|p| p == crate::relay::PREFIX) {
+            resource_paths.push(crate::relay::PREFIX.to_string());
+        }
+        let resource_urls: HashSet<String> = resource_paths
+            .iter()
+            .map(|p| format!("{issuer}{p}"))
+            .collect();
         Self {
             issuer,
             resource_urls,
             resource_paths,
+            default_resource_url,
             allowed_ids,
             github,
             redirect_allowlist,
             fetcher,
             store: Mutex::new(Store::default()),
         }
-    }
-
-    /// 登録順で先頭のリソース URL。
-    pub fn primary_resource_url(&self) -> String {
-        self.all_resource_urls()
-            .into_iter()
-            .next()
-            .expect("at least one resource")
     }
 
     pub fn resource_url_for_path(&self, path: &str) -> Option<String> {
@@ -1203,16 +1199,18 @@ impl OAuthServer {
     }
 
     /// RFC 8707: 要求された resource を許可集合に束ねる。
-    /// サービスが 1 つだけのときは省略可（その URL を既定にする）。
-    /// 複数あるときは `resource` 必須。
+    /// stdio サービスが 1 つだけのときは省略可（その URL を既定にする）。
+    /// 複数あるときと relay に繋ぐときは `resource` 必須。
     fn bound_resource(&self, requested: Option<&str>) -> Result<String, AuthorizeError> {
         match requested {
-            None if self.resource_urls.len() == 1 => Ok(self.primary_resource_url()),
-            None => Err(AuthorizeError {
-                error: "invalid_target",
-                description: "resource is required when multiple MCP services are configured"
-                    .into(),
-            }),
+            None => self
+                .default_resource_url
+                .clone()
+                .ok_or_else(|| AuthorizeError {
+                    error: "invalid_target",
+                    description: "resource is required when multiple MCP services are configured"
+                        .into(),
+                }),
             Some(r) => self.lookup_resource(r).ok_or_else(|| AuthorizeError {
                 error: "invalid_target",
                 description: "resource does not match a configured MCP service".into(),

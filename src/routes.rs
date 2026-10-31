@@ -2,16 +2,16 @@
 
 use crate::auth::{
     construct_redirect_uri, normalize_url, pkce_s256, AuthorizationParams, CallbackOutcome,
-    ClientRecord, OAuthServer, TokenError, AUTHORIZATION_PATH, GITHUB_SETUP_PATH, REDIRECT_PATH,
-    REGISTRATION_PATH, TOKEN_PATH,
+    ClientRecord, IssuedToken, OAuthServer, TokenError, AUTHORIZATION_PATH, GITHUB_SETUP_PATH,
+    REDIRECT_PATH, REGISTRATION_PATH, TOKEN_PATH,
 };
 use crate::backend::BackendRegistry;
 use crate::relay::Relay;
 use axum::body::Bytes;
-use axum::extract::{Path, RawQuery, State};
+use axum::extract::{DefaultBodyLimit, Path, RawQuery, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -23,8 +23,8 @@ pub struct AppState {
     pub backends: Arc<BackendRegistry>,
     /// 登録順のサービスパス一覧
     pub oauth: Arc<OAuthServer>,
-    /// `/relay/v1`。キー未設定なら None でルートごと出さない。
-    pub relay: Option<Arc<Relay>>,
+    /// `/relay/v1`（常時有効。OAuth の subject ごとに部屋を分ける）
+    pub relay: Arc<Relay>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -32,6 +32,11 @@ pub fn router(state: AppState) -> Router {
     let app = Router::new()
         // パスベース MCP: /{service}/{version}
         .route("/{service}/{version}", post(mcp_post))
+        // 組み込みの relay（静的パスなので上の汎用パスより優先される）
+        .route(
+            crate::relay::PREFIX,
+            any(relay_mcp).layer(DefaultBodyLimit::max(crate::relay::MAX_BODY_BYTES)),
+        )
         .route(
             "/.well-known/oauth-authorization-server",
             get(oauth_metadata),
@@ -51,10 +56,7 @@ pub fn router(state: AppState) -> Router {
         .route(REDIRECT_PATH, get(github_callback))
         .route(GITHUB_SETUP_PATH, get(github_setup))
         .with_state(state);
-    match relay {
-        Some(relay) => app.merge(crate::relay::router(relay)),
-        None => app,
-    }
+    app.merge(crate::relay::router(relay))
 }
 
 fn no_store(mut response: Response) -> Response {
@@ -504,6 +506,34 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
     }
 }
 
+fn no_service(path: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "error": "not_found",
+            "error_description": format!("no MCP service at {path}"),
+        })),
+    )
+        .into_response()
+}
+
+/// Bearer を `path` のリソースに束ねられたトークンとして照合する。
+fn authenticate(
+    oauth: &OAuthServer,
+    path: &str,
+    headers: &HeaderMap,
+) -> Result<IssuedToken, Box<Response>> {
+    let Some(resource_url) = oauth.resource_url_for_path(path) else {
+        return Err(Box::new(no_service(path)));
+    };
+    let Some(token) = bearer(headers) else {
+        return Err(Box::new(unauthorized(oauth, path)));
+    };
+    oauth
+        .load_access_token(token, &resource_url)
+        .ok_or_else(|| Box::new(unauthorized(oauth, path)))
+}
+
 async fn mcp_post(
     State(state): State<AppState>,
     Path((service, version)): Path<(String, String)>,
@@ -512,31 +542,11 @@ async fn mcp_post(
 ) -> Response {
     let path = service_path(&service, &version);
     let Some(backend) = state.backends.get(&path).cloned() else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({
-                "error": "not_found",
-                "error_description": format!("no MCP service at {path}"),
-            })),
-        )
-            .into_response();
+        return no_service(&path);
     };
-    let Some(resource_url) = state.oauth.resource_url_for_path(&path) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({
-                "error": "not_found",
-                "error_description": format!("no MCP service at {path}"),
-            })),
-        )
-            .into_response();
-    };
-
-    let Some(token) = bearer(&headers) else {
-        return unauthorized(&state.oauth, &path);
-    };
-    let Some(principal) = state.oauth.load_access_token(token, &resource_url) else {
-        return unauthorized(&state.oauth, &path);
+    let principal = match authenticate(&state.oauth, &path, &headers) {
+        Ok(principal) => principal,
+        Err(response) => return *response,
     };
     let payload: Value = match serde_json::from_slice(&body) {
         Ok(v @ Value::Object(_)) => v,
@@ -552,4 +562,22 @@ async fn mcp_post(
         Some(reply) => Json(reply).into_response(),
         None => StatusCode::ACCEPTED.into_response(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// /relay/v1（POST JSON-RPC、GET 405、DELETE 200）
+
+async fn relay_mcp(State(state): State<AppState>, request: Request) -> Response {
+    let path = crate::relay::PREFIX;
+    let principal = match authenticate(&state.oauth, path, request.headers()) {
+        Ok(principal) => principal,
+        Err(response) => return *response,
+    };
+    tracing::info!(
+        path,
+        subject = %principal.subject,
+        http_method = %request.method(),
+        "mcp"
+    );
+    crate::relay::serve(state.relay.clone(), principal.subject, request).await
 }

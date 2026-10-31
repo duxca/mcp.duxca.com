@@ -18,7 +18,11 @@ use tower_http::trace::TraceLayer;
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            // RUST_LOG 未設定でも relay の会話ログ（info）が journald に出るように
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .with_target(true)
         .init();
 
@@ -75,11 +79,11 @@ async fn main() -> anyhow::Result<()> {
         backends.insert(svc.path.clone(), backend);
     }
 
-    let relay = relay::Relay::from_config(&config, &public_url);
-    match &relay {
-        Some(relay) => tracing::info!(base = %relay.base_url(), "relay enabled"),
-        None => tracing::info!("relay disabled (RELAY_MUSE_KEY / RELAY_GROK_KEY 未設定)"),
-    }
+    let relay = Arc::new(relay::Relay::new(
+        &public_url,
+        config.relay_max_total_storage_bytes,
+    ));
+    tracing::info!(endpoint = %relay.base_url(), "relay ready (OAuth, rooms per GitHub id)");
 
     let relay_on_shutdown = relay.clone();
     let state = AppState {
@@ -100,9 +104,7 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
-            if let Some(relay) = relay_on_shutdown {
-                relay.store.close();
-            }
+            relay_on_shutdown.store.close();
         })
         .await?;
     tracing::info!("gateway stopped");
