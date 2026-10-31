@@ -38,21 +38,30 @@ jobs:
           printf 'GITHUB_CLIENT_ID=%s\nGITHUB_CLIENT_SECRET=%s\n' "$GITHUB_CLIENT_ID" "$GITHUB_CLIENT_SECRET" > stage/runtime.env
         fi
         if [ -n "$TUNNEL_TOKEN" ]; then printf '%s' "$TUNNEL_TOKEN" > stage/tunnel.token; fi
+    - name: Install cloudflared
+      run: |
+        curl -fsSL -o /tmp/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+        sudo install -m 755 /tmp/cloudflared /usr/local/bin/cloudflared
+        cloudflared --version
     - name: Ship and install
       env:
         SSH_KEY: ${{ secrets.DUXCA_SSH_KEY }}
-        KNOWN_HOSTS: ${{ secrets.DUXCA_KNOWN_HOSTS }}
+        CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+        CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
       run: |
         install -d -m 700 ~/.ssh
         printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
-        printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
-        SSH="ssh -p 4322 -o BatchMode=yes legokichi@duxca.com"
+        printf 'Host ssh.duxca.com\n  ProxyCommand cloudflared access ssh --hostname %%h\n  BatchMode yes\n  StrictHostKeyChecking accept-new\n' > ~/.ssh/config
+        SSH="ssh legokichi@ssh.duxca.com"
         D=/tmp/mcp-duxca-deploy-${GITHUB_RUN_ID}
         $SSH "rm -rf $D && mkdir -m 700 $D"
-        scp -P 4322 -o BatchMode=yes stage/* legokichi@duxca.com:$D/
+        scp stage/* legokichi@ssh.duxca.com:$D/
         $SSH "sudo bash $D/install.sh $D; rc=\$?; rm -rf $D; exit \$rc"
+        echo "accepted host key for ssh.duxca.com:"
+        ssh-keygen -F ssh.duxca.com -f ~/.ssh/known_hosts | grep -v '^#'
     - name: Public check
       run: |
         sleep 5
         test "$(curl -s -o /dev/null -w '%{http_code}' -X POST https://mcp.duxca.com/adb/v1)" = 401
         test "$(curl -s -o /dev/null -w '%{http_code}' https://mcp.duxca.com/health)" = 404
+        test "$(curl -s -o /dev/null -w '%{http_code}' https://mcp.duxca.com/relay/v1/health)" = 200
