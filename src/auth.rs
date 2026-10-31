@@ -119,6 +119,7 @@ pub const DEFAULT_REDIRECT_ALLOWLIST: &[&str] = &[
     "https://claude.ai/api/mcp/auth_callback",
     "https://claude.com/api/mcp/auth_callback",
     "https://agent.meta.ai/api/hatch/oauth/callback",
+    "https://www.cursor.com/agents/mcp/oauth/callback",
     "https://grok.com/",
     "http://localhost/",
     "http://127.0.0.1/",
