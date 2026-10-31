@@ -60,8 +60,15 @@ jobs:
         echo "accepted host key for ssh.duxca.com:"
         ssh-keygen -F ssh.duxca.com -f ~/.ssh/known_hosts | grep -v '^#'
     - name: Public check
+      # install.sh がトンネルを遅延再起動することがあるので、再接続を待てるよう最大約60秒リトライする
       run: |
-        sleep 5
-        test "$(curl -s -o /dev/null -w '%{http_code}' -X POST https://mcp.duxca.com/adb/v1)" = 401
-        test "$(curl -s -o /dev/null -w '%{http_code}' https://mcp.duxca.com/health)" = 404
-        test "$(curl -s -o /dev/null -w '%{http_code}' https://mcp.duxca.com/relay/v1/health)" = 200
+        code() { curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$@" || true; }
+        for i in $(seq 12); do
+          sleep 5
+          adb=$(code -X POST https://mcp.duxca.com/adb/v1)
+          health=$(code https://mcp.duxca.com/health)
+          relay=$(code https://mcp.duxca.com/relay/v1/health)
+          echo "try $i: POST /adb/v1=$adb GET /health=$health GET /relay/v1/health=$relay"
+          if [ "$adb" = 401 ] && [ "$health" = 404 ] && [ "$relay" = 200 ]; then exit 0; fi
+        done
+        exit 1

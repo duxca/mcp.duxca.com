@@ -28,6 +28,17 @@ if [[ "$(cat "$stamp" 2>/dev/null)" != "$ADBMCP_REF" ]]; then
   echo "$ADBMCP_REF" > "$stamp"
 fi
 
+# 上書き前に変更を検出し、変わったものだけ再起動する。
+# トンネルは ssh.duxca.com（= CI の SSH 自身の輸送路）も運ぶので、無駄に再起動すると CI が切断される。
+# 宛先が無ければ cmp は失敗する = 変更ありとして扱う。
+changed() { ! cmp -s "$1" "$2"; }
+restart_gw=0 restart_tun=0
+changed "$SRC/mcp-duxca-com" /opt/mcp-duxca-com/bin/mcp-duxca-com && restart_gw=1
+changed "$SRC/mcp-duxca-com.service" /etc/systemd/system/mcp-duxca-com.service && restart_gw=1
+changed "$SRC/mcp-duxca-com-tunnel.service" /etc/systemd/system/mcp-duxca-com-tunnel.service && restart_tun=1
+[[ -s "$SRC/runtime.env" ]] && changed "$SRC/runtime.env" /etc/mcp-duxca-com/runtime.env && restart_gw=1
+[[ -s "$SRC/tunnel.token" ]] && changed "$SRC/tunnel.token" /etc/mcp-duxca-com/tunnel.token && restart_tun=1
+
 install -m 755 "$SRC/mcp-duxca-com" /opt/mcp-duxca-com/bin/mcp-duxca-com
 for f in runtime.env tunnel.token; do
   if [[ -s "$SRC/$f" ]]; then install -o root -g mcp-duxca -m 640 "$SRC/$f" "/etc/mcp-duxca-com/$f"; fi
@@ -36,9 +47,29 @@ done
 install -m 644 "$SRC/mcp-duxca-com.service" "$SRC/mcp-duxca-com-tunnel.service" /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable -q mcp-duxca-com.service mcp-duxca-com-tunnel.service
-systemctl restart mcp-duxca-com.service
-systemctl restart mcp-duxca-com-tunnel.service
+
+if ((restart_gw)); then
+  systemctl restart mcp-duxca-com.service
+elif systemctl is-active -q mcp-duxca-com.service; then
+  echo "mcp-duxca-com.service: 変更なし。再起動をスキップ"
+else
+  systemctl start mcp-duxca-com.service
+fi
+
+if ! systemctl is-active -q mcp-duxca-com-tunnel.service; then
+  # 動いていないトンネルはこの SSH を運んでいないので、その場で起動してよい（新しい設定で上がる）。
+  systemctl start mcp-duxca-com-tunnel.service
+elif ((restart_tun)); then
+  # インラインで restart すると、cloudflared の graceful shutdown がこの SSH ストリームの終了を待ち、
+  # 約30秒後に SSH ごと切れる。install が返って SSH が閉じた後に再起動されるよう遅延予約する。
+  systemd-run --on-active=10s --collect /usr/bin/systemctl restart mcp-duxca-com-tunnel.service
+  echo "mcp-duxca-com-tunnel.service: 変更あり。10秒後の再起動を予約"
+else
+  echo "mcp-duxca-com-tunnel.service: 変更なし。再起動をスキップ"
+fi
+
 sleep 3
+# 以下のローカル確認はトンネルを経由しないので、遅延再起動の影響を受けない。
 systemctl is-active mcp-duxca-com.service mcp-duxca-com-tunnel.service
 code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8000/adb/v1)
 echo "local POST /adb/v1 -> $code"
