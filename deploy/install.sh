@@ -5,9 +5,10 @@
 # 任意で runtime.env / tunnel.token（秘密。あれば置き換える）がある。
 set -euo pipefail
 SRC="${1:?staging dir}"
+DATA=/var/lib/mcp-duxca-com
 
 id mcp-duxca >/dev/null 2>&1 || useradd --system --home-dir /var/lib/mcp-duxca-com --shell /usr/sbin/nologin mcp-duxca
-install -d -o mcp-duxca -g mcp-duxca -m 750 /var/lib/mcp-duxca-com
+install -d -o mcp-duxca -g mcp-duxca -m 750 "$DATA"
 install -d -m 755 /opt/mcp-duxca-com/bin
 install -d -o root -g mcp-duxca -m 750 /etc/mcp-duxca-com
 
@@ -32,8 +33,25 @@ install -m 644 "$SRC/mcp-duxca-com.service" "$SRC/mcp-duxca-com-tunnel.service" 
 systemctl daemon-reload
 systemctl enable -q mcp-duxca-com.service mcp-duxca-com-tunnel.service
 
+# 止めたあとの DB（mcp.db と、あれば -wal / -shm）を backup/<時刻>/ に写し、新しい 3 世代だけ残す。
+# スキーマは前進だけなので、バイナリを戻すときはここから DB も戻す。
+backup_db() {
+  local dir f
+  dir="$DATA/backup/$(date -u +%Y%m%dT%H%M%SZ)"
+  for f in mcp.db mcp.db-wal mcp.db-shm; do
+    [[ -f "$DATA/$f" ]] || continue
+    install -d -m 700 "$DATA/backup" "$dir"
+    cp -p "$DATA/$f" "$dir/"
+  done
+  [[ -d "$dir" ]] || return 0
+  echo "mcp-duxca-com.service: DB を $dir に退避"
+  find "$DATA/backup" -mindepth 1 -maxdepth 1 -type d | sort | head -n -3 | xargs -r rm -rf --
+}
+
 if ((restart_gw)); then
-  systemctl restart mcp-duxca-com.service
+  systemctl stop mcp-duxca-com.service
+  backup_db
+  systemctl start mcp-duxca-com.service
 elif systemctl is-active -q mcp-duxca-com.service; then
   echo "mcp-duxca-com.service: 変更なし。再起動をスキップ"
 else

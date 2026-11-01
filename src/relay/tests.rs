@@ -2,6 +2,7 @@
 
 use super::webhook::signature;
 use super::*;
+use crate::db::Db;
 use crate::tests::{gateway, get, issue_token_for, send, Harness, Reply, PUBLIC_URL};
 use axum::body::Body;
 use axum::http::{header, HeaderMap, Request, StatusCode};
@@ -96,7 +97,12 @@ async fn setup_with(relay: Relay) -> (Harness, Client) {
 }
 
 async fn setup() -> (Harness, Client) {
-    setup_with(Relay::new(PUBLIC_URL, DEFAULT_MAX_TOTAL_STORAGE_BYTES)).await
+    setup_with(Relay::new(
+        PUBLIC_URL,
+        DEFAULT_MAX_TOTAL_STORAGE_BYTES,
+        Db::open_in_memory(),
+    ))
+    .await
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -132,7 +138,12 @@ fn texts(out: &Value) -> Vec<&str> {
 
 #[tokio::test]
 async fn relay_needs_a_token_bound_to_relay() {
-    let h = gateway(LOGINS, true, None, Relay::new(PUBLIC_URL, 1024));
+    let h = gateway(
+        LOGINS,
+        true,
+        None,
+        Relay::new(PUBLIC_URL, 1024, Db::open_in_memory()),
+    );
     let ping = json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }).to_string();
     let post = |path: &str, token: Option<&str>| {
         let mut builder = Request::post(path).header(header::CONTENT_TYPE, "application/json");
@@ -693,7 +704,7 @@ async fn attachments_round_trip_and_limits() {
     );
 
     // 部屋の添付の上限（全体 20 の半分）。超えると isError（507 相当）
-    let (h, c) = setup_with(Relay::new(PUBLIC_URL, 20)).await;
+    let (h, c) = setup_with(Relay::new(PUBLIC_URL, 20, Db::open_in_memory())).await;
     let eight = attachment("a.bin", "", &[1u8; 8]);
     c.ok(
         "send_message",
@@ -706,7 +717,7 @@ async fn attachments_round_trip_and_limits() {
             json!({ "agent": "muse", "to": "grok", "text": "x", "attachments": [eight] })
         )
         .await,
-        "Error: this room's attachment storage is full (10 bytes); the relay keeps data in memory and frees it only when it restarts"
+        "Error: this room's attachment storage is full (10 bytes); messages and their files are deleted 7 days after they are sent, which frees space"
     );
     c.ok(
         "send_message",
@@ -725,6 +736,7 @@ async fn storage_limits_fail_as_tool_errors() {
             room_agents: 1,
             ..Limits::with_total_attachment_bytes(1024)
         },
+        Db::open_in_memory(),
     ))
     .await;
     let send = json!({ "agent": "muse", "to": "grok", "text": "x" });
@@ -732,7 +744,7 @@ async fn storage_limits_fail_as_tool_errors() {
     c.ok("send_message", send.clone()).await;
     assert_eq!(
         c.err("send_message", send).await,
-        "Error: this room already holds 2 messages (its limit); the relay keeps data in memory and frees it only when it restarts"
+        "Error: this room already holds 2 messages (its limit); messages and their files are deleted 7 days after they are sent, which frees space"
     );
     // ask も保存の前に断られ、待たない
     let started = Instant::now();
@@ -1018,7 +1030,10 @@ async fn retired_paths_are_gone_and_docs_describe_the_new_design() {
             let name = tool["name"].as_str().unwrap();
             assert!(docs.contains(&format!("- {name} {{")), "{name}");
         }
-        assert!(docs.contains("register again every time you start"));
+        assert!(
+            docs.contains("survives relay\nrestarts until you replace it or call unregister_agent")
+        );
+        assert!(docs.contains("A message and its files are deleted 7 days after it was sent"));
         for limit in [
             "Storage per room: 10000 messages, 32 MB of message data",
             "32 MB of files, 100 registered agents",
@@ -1126,8 +1141,10 @@ const DUMMY_SECRET2: &str = "dummy-webhook-secret-second-5d03";
 #[tokio::test]
 async fn webhooks_are_registered_by_the_recipient() {
     let (url, captured, server) = webhook_receiver().await;
-    let (h, muse) =
-        setup_with(Relay::new(PUBLIC_URL, 1024).allowing_loopback_http_webhooks()).await;
+    let (h, muse) = setup_with(
+        Relay::new(PUBLIC_URL, 1024, Db::open_in_memory()).allowing_loopback_http_webhooks(),
+    )
+    .await;
     let grok = Client {
         token: client_for(&h, "ok").await.token,
         ..muse.clone()
@@ -1494,8 +1511,10 @@ async fn conversation_log_has_the_text_but_no_secrets_or_file_bytes() {
     let logs = capture_logs();
 
     let (url, captured, server) = webhook_receiver().await;
-    let (h, c) =
-        setup_with(Relay::new(PUBLIC_URL, 1024 * 1024).allowing_loopback_http_webhooks()).await;
+    let (h, c) = setup_with(
+        Relay::new(PUBLIC_URL, 1024 * 1024, Db::open_in_memory()).allowing_loopback_http_webhooks(),
+    )
+    .await;
     let hook = format!("{url}/hook");
     c.ok(
         "register_agent",
@@ -1700,6 +1719,7 @@ async fn long_polls_are_admitted_per_room_and_in_total() {
             total_waits: 2,
             ..Limits::with_total_attachment_bytes(1024)
         },
+        Db::open_in_memory(),
     ))
     .await;
     h.allowed.write().unwrap().insert("1001".into());
@@ -1787,7 +1807,7 @@ async fn webhooks_are_sent_only_to_public_addresses() {
     let loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
     let metadata: std::net::IpAddr = "169.254.169.254".parse().unwrap();
     let (h, c) = setup_with(
-        Relay::new(PUBLIC_URL, 1024)
+        Relay::new(PUBLIC_URL, 1024, Db::open_in_memory())
             .with_webhook_dns(&[("internal.test", loopback), ("metadata.test", metadata)]),
     )
     .await;
@@ -1848,7 +1868,10 @@ async fn webhooks_are_sent_only_to_public_addresses() {
 #[tokio::test]
 async fn webhook_deliveries_are_limited_in_number() {
     let (url, captured, server) = webhook_receiver().await;
-    let (h, c) = setup_with(Relay::new(PUBLIC_URL, 1024).allowing_loopback_http_webhooks()).await;
+    let (h, c) = setup_with(
+        Relay::new(PUBLIC_URL, 1024, Db::open_in_memory()).allowing_loopback_http_webhooks(),
+    )
+    .await;
     c.ok(
         "register_agent",
         json!({ "agent": "grok", "webhook_url": format!("{url}/hook"), "webhook_secret": DUMMY_SECRET }),

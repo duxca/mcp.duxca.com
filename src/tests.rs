@@ -4,6 +4,7 @@ use crate::auth::{
     is_cimd_client_id, pkce_s256, token_urlsafe, ClientMetadataFetcher, GitHubLogin,
     GitHubLoginError, OAuthServer, RedirectAllowlist,
 };
+use crate::db::Db;
 use crate::relay::Relay;
 use crate::routes::{router, AppState};
 use async_trait::async_trait;
@@ -71,7 +72,11 @@ fn harness_with(logins: &[(&str, &str, &str)], configured: bool, cimd: Option<Va
         logins,
         configured,
         cimd,
-        Relay::new(PUBLIC_URL, crate::relay::DEFAULT_MAX_TOTAL_STORAGE_BYTES),
+        Relay::new(
+            PUBLIC_URL,
+            crate::relay::DEFAULT_MAX_TOTAL_STORAGE_BYTES,
+            Db::open_in_memory(),
+        ),
     )
 }
 
@@ -90,12 +95,14 @@ pub(crate) fn gateway(
             .collect(),
         configured,
     };
+    // 本番と同じく OAuth と relay で 1 つの DB を共有する
     let oauth = Arc::new(OAuthServer::new(
         PUBLIC_URL,
         allowed.clone(),
         Arc::new(github),
         Arc::new(FakeFetcher(cimd)),
         RedirectAllowlist::default(),
+        relay.store.db().clone(),
     ));
     let relay = Arc::new(relay);
     let app = router(AppState {
@@ -1115,7 +1122,7 @@ async fn authorize_rejects_a_stored_redirect_outside_the_allowlist_without_redir
     )
     .unwrap();
     let client_id = client.client_id.clone();
-    h.oauth.register_client(client);
+    h.oauth.register_client(client).unwrap();
     let (_verifier, challenge) = pkce();
     for redirect in [Some("https://evil.example/cb"), None] {
         let reply = get(
@@ -1133,4 +1140,320 @@ async fn authorize_rejects_a_stored_redirect_outside_the_allowlist_without_redir
             reply.body
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// 永続化（SQLite）
+
+fn sha256_hex(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(value.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn file_harness(path: &crate::db::TempPath) -> Harness {
+    let db = Db::open(&path.0, None).unwrap();
+    gateway(
+        &[("ok", "2429307", "legokichi")],
+        true,
+        None,
+        Relay::new(
+            PUBLIC_URL,
+            crate::relay::DEFAULT_MAX_TOTAL_STORAGE_BYTES,
+            db,
+        ),
+    )
+}
+
+/// relay のツールを呼び、structuredContent を返す。
+async fn tool(app: &Router, token: &str, name: &str, arguments: Value) -> Value {
+    let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": name, "arguments": arguments } });
+    let reply = send(
+        app,
+        Request::post(TEST_MCP_PATH)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let result = reply.json()["result"].clone();
+    assert!(result.get("isError").is_none(), "{result}");
+    result["structuredContent"].clone()
+}
+
+async fn refresh_with(app: &Router, refresh: &str, client_id: &str) -> Reply {
+    post_form(
+        app,
+        "/token",
+        &[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh),
+            ("client_id", client_id),
+        ],
+    )
+    .await
+}
+
+#[tokio::test]
+async fn state_survives_a_restart_and_secrets_are_stored_hashed() {
+    use base64::Engine;
+    let path = crate::db::TempPath::new("restart");
+    let data = b"\x89PNG not really, but bytes that must come back";
+    let file = json!({ "filename": "a.png", "content_type": "image/png",
+        "content_base64": base64::engine::general_purpose::STANDARD.encode(data) });
+    let webhook_secret = "whsec-plaintext-on-purpose-U4";
+
+    let h = file_harness(&path);
+    let (access, refresh, client_id) = issue_token(&h.app).await;
+    let sent = tool(
+        &h.app,
+        &access,
+        "send_message",
+        json!({ "agent": "muse", "to": "grok", "text": "survive", "attachments": [file] }),
+    )
+    .await;
+    let first_id: u64 = sent["message"]["id"].as_str().unwrap().parse().unwrap();
+    let attachment_id = sent["message"]["attachments"][0]["id"].clone();
+    // 既読も残る
+    tool(
+        &h.app,
+        &access,
+        "send_message",
+        json!({ "agent": "grok", "to": "muse", "text": "read me" }),
+    )
+    .await;
+    tool(
+        &h.app,
+        &access,
+        "check_messages",
+        json!({ "agent": "muse", "mark_read": true }),
+    )
+    .await;
+    tool(
+        &h.app,
+        &access,
+        "register_agent",
+        json!({ "agent": "grok",
+        "webhook_url": "https://hook.example/wake", "webhook_secret": webhook_secret }),
+    )
+    .await;
+    // 平文が残ってはいけない値: client_secret、使っていない認可コード、GitHub へ渡した state
+    let confidential = register(&h.app, "client_secret_post").await;
+    let client_secret = confidential["client_secret"].as_str().unwrap().to_string();
+    let (_, challenge) = pkce();
+    let code = authorization_code(&h.app, &client_id, &challenge).await;
+    let state = github_state(&h.app, &client_id, &challenge, &resource()).await;
+    drop(h);
+
+    let h = file_harness(&path);
+    // 再認可なしで同じトークンが通り、メッセージ・添付・既読・登録が残っている
+    let inbox = tool(
+        &h.app,
+        &access,
+        "check_messages",
+        json!({ "agent": "grok", "unread_only": false }),
+    )
+    .await;
+    assert_eq!(inbox["messages"][0]["text"], "survive");
+    assert_eq!(inbox["messages"][0]["id"], first_id.to_string());
+    let att = tool(
+        &h.app,
+        &access,
+        "get_attachment",
+        json!({ "attachment_id": attachment_id }),
+    )
+    .await;
+    assert_eq!(att["sha256"], sha256_hex_bytes(data));
+    let muse = tool(
+        &h.app,
+        &access,
+        "check_messages",
+        json!({ "agent": "muse", "unread_only": false }),
+    )
+    .await;
+    assert_eq!(muse["messages"][0]["read"], true);
+    assert_eq!(
+        tool(&h.app, &access, "list_agents", json!({})).await["agents"],
+        json!([{ "name": "grok", "webhook": true }, { "name": "muse", "webhook": false }])
+    );
+    // id は戻らない
+    let next = tool(
+        &h.app,
+        &access,
+        "send_message",
+        json!({ "agent": "muse", "to": "carol", "text": "after" }),
+    )
+    .await;
+    let next_id: u64 = next["message"]["id"].as_str().unwrap().parse().unwrap();
+    assert!(next_id > first_id + 1, "{next_id} <= {first_id} + 1");
+    // refresh も使え、古い refresh は二度と使えない
+    let refreshed = refresh_with(&h.app, &refresh, &client_id).await;
+    assert_eq!(refreshed.status, StatusCode::OK, "{}", refreshed.body);
+    let replay = refresh_with(&h.app, &refresh, &client_id).await;
+    assert_eq!(replay.json()["error"], "invalid_grant");
+    assert_eq!(
+        mcp(&h.app, Some(&access), 9).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    let new_refresh = refreshed.json()["refresh_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    drop(h);
+
+    let bytes = path.bytes();
+    let contains = |needle: &str| bytes.windows(needle.len()).any(|w| w == needle.as_bytes());
+    for secret in [
+        &access,
+        &refresh,
+        &new_refresh,
+        &client_secret,
+        &code,
+        &state,
+    ] {
+        assert!(!contains(secret), "plaintext {secret} found in the DB");
+    }
+    for stored in [&new_refresh, &client_secret, &code, &state] {
+        assert!(
+            contains(&sha256_hex(stored)),
+            "hash of {stored} not found in the DB"
+        );
+    }
+    // U4: webhook の秘密は送るときに要るので平文で置く
+    assert!(contains(webhook_secret));
+}
+
+fn sha256_hex_bytes(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(data)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+#[tokio::test]
+async fn refresh_rotation_is_one_transaction() {
+    let h = harness();
+    let (access, refresh, client_id) = issue_token(&h.app).await;
+    let db = h.relay.store.db().clone();
+    // 新しい組を入れるところで失敗させる。古い refresh を消したことも巻き戻る
+    db.read(|c| {
+        c.execute_batch(
+            "CREATE TEMP TRIGGER fail_issue BEFORE INSERT ON oauth_tokens \
+             BEGIN SELECT RAISE(ABORT, 'injected'); END",
+        )
+    })
+    .unwrap();
+    let failed = refresh_with(&h.app, &refresh, &client_id).await;
+    assert_eq!(
+        failed.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        failed.body
+    );
+    assert_eq!(failed.json()["error"], "temporarily_unavailable");
+    assert_eq!(mcp(&h.app, Some(&access), 1).await.status, StatusCode::OK);
+    db.read(|c| c.execute_batch("DROP TRIGGER fail_issue"))
+        .unwrap();
+
+    let rotated = refresh_with(&h.app, &refresh, &client_id).await;
+    assert_eq!(rotated.status, StatusCode::OK, "{}", rotated.body);
+    let new_access = rotated.json()["access_token"].as_str().unwrap().to_string();
+    let new_refresh = rotated.json()["refresh_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        mcp(&h.app, Some(&access), 2).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        mcp(&h.app, Some(&new_access), 3).await.status,
+        StatusCode::OK
+    );
+    let replay = refresh_with(&h.app, &refresh, &client_id).await;
+    assert_eq!(
+        (replay.status, replay.json()["error"].clone()),
+        (StatusCode::BAD_REQUEST, json!("invalid_grant"))
+    );
+    assert_eq!(
+        refresh_with(&h.app, &new_refresh, &client_id).await.status,
+        StatusCode::OK
+    );
+}
+
+/// DB の失敗を 401 や invalid_grant にすると、クライアントは再認可へ進んでしまう。
+#[tokio::test]
+async fn storage_failures_are_503_not_401_or_invalid_grant() {
+    let h = harness();
+    let (access, refresh, client_id) = issue_token(&h.app).await;
+    let db = h.relay.store.db().clone();
+    db.read(|c| c.execute_batch("ALTER TABLE relay_messages RENAME TO relay_messages_gone"))
+        .unwrap();
+    let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "check_messages", "arguments": { "agent": "muse" } } });
+    let reply = send(
+        &h.app,
+        Request::post(TEST_MCP_PATH)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {access}"))
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        reply.json()["result"]["content"][0]["text"],
+        "Error: the relay's storage failed; try again later"
+    );
+
+    db.read(|c| c.execute_batch("ALTER TABLE oauth_tokens RENAME TO oauth_tokens_gone"))
+        .unwrap();
+    let bearer = mcp(&h.app, Some(&access), 2).await;
+    assert_eq!(
+        bearer.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        bearer.body
+    );
+    assert!(bearer.headers.get(header::WWW_AUTHENTICATE).is_none());
+    let token = refresh_with(&h.app, &refresh, &client_id).await;
+    assert_eq!(
+        token.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        token.body
+    );
+    assert_eq!(token.json()["error"], "temporarily_unavailable");
+}
+
+#[tokio::test]
+async fn client_registrations_are_capped_by_evicting_the_oldest() {
+    let h = harness();
+    let none = json!({ "redirect_uris": [REDIRECT_URI], "token_endpoint_auth_method": "none" });
+    let mut ids = Vec::new();
+    for _ in 0..=crate::auth::MAX_CLIENTS {
+        let client =
+            crate::auth::client_from_registration(&none, &RedirectAllowlist::default()).unwrap();
+        ids.push(client.client_id.clone());
+        h.oauth.register_client(client).unwrap();
+    }
+    assert!(h.oauth.get_client(&ids[0]).await.unwrap().is_none());
+    assert!(h.oauth.get_client(&ids[1]).await.unwrap().is_some());
+    assert!(h
+        .oauth
+        .get_client(ids.last().unwrap())
+        .await
+        .unwrap()
+        .is_some());
+    let count: i64 = h
+        .relay
+        .store
+        .db()
+        .read(|c| c.query_row("SELECT COUNT(*) FROM oauth_clients", [], |r| r.get(0)))
+        .unwrap();
+    assert_eq!(count as usize, crate::auth::MAX_CLIENTS);
 }

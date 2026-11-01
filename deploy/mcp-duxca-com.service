@@ -12,6 +12,8 @@ Environment=HOME=/var/lib/mcp-duxca-com
 Environment=PORT=8000
 Environment=PUBLIC_URL=https://mcp.duxca.com
 Environment=RUST_LOG=info,mcp_duxca_com=info
+# OAuth と relay の保存先。install.sh は再起動のたびに止めてから backup/ へ写す（3 世代）。
+Environment=DATABASE_PATH=/var/lib/mcp-duxca-com/mcp.db
 # GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET（CI が GitHub Secrets から書く）
 # relay（/relay/v1）は常に有効で、認証は上の OAuth を使う（静的キーや webhook の env は無い）。
 # 会話ログは journald に出る: journalctl -u mcp-duxca-com -f | grep 'relay:'

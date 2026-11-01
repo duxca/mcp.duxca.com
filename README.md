@@ -45,11 +45,12 @@ cargo run   # Tunnel 無しのゲートウェイ単体でも可（PUBLIC_URL 必
                               ├─ OAuth 認可サーバ（動的登録 / CIMD / PKCE）※オリジン共通 1 本
                               ├─ GitHub OAuth で本人確認（数値 id allowlist）
                               ├─ 自前 Bearer で POST /relay/v1 を保護
-                              └─ relay（エージェント間メッセージ。メモリ内ストア）
+                              ├─ relay（エージェント間メッセージ）
+                              └─ SQLite 1 ファイル（DATABASE_PATH）: OAuth と relay の保存先
 ```
 
 - 許可アカウントは GitHub **数値 id**（login は改名で再利用されうる）。既定: `2429307`（legokichi）。
-- トークンはメモリだけ。再起動で消える（mcp-test と同じ）。
+- OAuth のクライアント・認可の途中・認可コード・トークンは SQLite に置き、再起動しても残る。トークン・認可コード・state・client_secret は SHA-256 だけを保存する。
 - MCP は JSON-RPC（`POST /relay/v1`）。OAuth の保護リソースは relay だけ。
 - OAuth（`/authorize` `/token` `/register` GitHub コールバック）はホスト共通のまま。GitHub Client Secret は増やさない。
 
@@ -86,10 +87,13 @@ stdio の MCP バックエンド（`POST /{service}/{version}`、`/adb/v1` な�
   - 受信側は署名だけで認証する（定数時間で比較、タイムスタンプが 5 分より古い配送は捨てる、`message.id` で重複を捨てる）
   - 単発・5 秒タイムアウト・リダイレクトは追わない。同時に送るのは 16 件まで（溢れた分は送らない）
   - `webhook_url` は https で、公開アドレスに限る。localhost・プライベート・リンクローカルなどは登録時に断り、送る直前にも名前を引き直して公開アドレスだけに繋ぐ
-  - 登録の値はどのツールの応答にもログにも出ない。登録はメモリだけなので、エージェントは起動のたびに登録し直す
-- ストアはメモリだけ。再起動でスレッド・メッセージ・添付・登録は消える
-  - メッセージ id（= カーソル）は部屋ごとに数え、部屋を最初に使った時刻の Unix ミリ秒から増えるので、再起動前のカーソルもそのまま使える
-- 上限（超えると isError。自動では消さない）
+  - 登録の値はどのツールの応答にもログにも出ない。登録は DB に残るので、relay の再起動のあとに登録し直す必要は無い
+  - `webhook_auth` / `webhook_secret` は送るときに要るので、DB に平文で置く
+- ストアは SQLite。スレッド・メッセージ・添付・既読・登録は再起動しても残る
+  - メッセージ（と添付）は送ってから 7 日で消え、最後のメッセージが消えたスレッドも消える。登録は消えない
+  - 消すのは `send_message` / `register_agent` の書き込みのついで（常駐タスクは無い）
+  - メッセージ id（= カーソル）は部屋ごとに数え、部屋を最初に使った時刻の Unix ミリ秒から増える。カウンタも DB に残るので id は戻らない
+- 上限（超えると isError。7 日を過ぎたメッセージが消えると空く）
   - 添付は 1 メッセージ 5 件・合計 3 MB まで。リクエストボディは 6 MB まで。1 スレッド 500 件まで
   - 部屋ごと: 10000 件、本文などのデータ 32 MB（概算）、添付 32 MB、登録 100 件。全体: 20000 件、データ 64 MB、添付 `RELAY_MAX_TOTAL_STORAGE_BYTES`（既定 64 MB。部屋ごとの添付はその半分）
   - 同時に待機できる `ask` / `check_messages` は部屋ごと 16 件、全体 64 件。バッチは 32 件まで、応答は合計 16 MB まで
@@ -159,6 +163,8 @@ curl -si -X POST http://127.0.0.1:8000/relay/v1 \
 | `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | GitHub OAuth App |
 | `ALLOWED_GITHUB_IDS` | カンマ区切り数値 id |
 | `RELAY_MAX_TOTAL_STORAGE_BYTES` | relay 添付の全部屋の合計上限（既定 67108864 = 64 MB、1 部屋はその半分）。relay の env はこれだけ |
+| `DATABASE_PATH` | OAuth と relay を残す SQLite のファイル（既定 `mcp.db`、作業ディレクトリからの相対パス） |
+| `SQLITE_WAL_AUTOCHECKPOINT` | 未設定なら SQLite の既定。Litestream と組むときだけ 0 にする |
 | `RUST_LOG` | ログの絞り込み（未設定なら `info`） |
 | `CLOUDFLARED_TOKEN_FILE` | Tunnel トークンファイル（`scripts/run.sh`） |
 | `MCP_BIN` | ゲートウェイ実行ファイル（`scripts/run.sh`） |
@@ -188,3 +194,6 @@ curl -si -X POST http://127.0.0.1:8000/relay/v1 \
   `mcp-duxca-com-tunnel.service`（cloudflared）。どちらも専用ユーザー `mcp-duxca` で動く。
 - 秘密は GitHub Secrets: `MCP_GITHUB_CLIENT_ID`, `MCP_GITHUB_CLIENT_SECRET`, `MCP_TUNNEL_TOKEN`,
   `DUXCA_SSH_KEY`, `DUXCA_KNOWN_HOSTS`。VM 上では `/etc/mcp-duxca-com/`（root:mcp-duxca 640）。
+- DB は `/var/lib/mcp-duxca-com/mcp.db`。`install.sh` はゲートウェイを再起動するときだけ、止めてから
+  `mcp.db`（と `-wal` / `-shm`）を `/var/lib/mcp-duxca-com/backup/<時刻>/` に写して起動する（新しい 3 世代を残す）。
+  スキーマは前進だけで、DB の版がバイナリより新しいと起動しない。バイナリを戻すときは DB もここから戻す。

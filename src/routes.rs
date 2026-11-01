@@ -5,6 +5,7 @@ use crate::auth::{
     ClientRecord, IssuedToken, OAuthServer, TokenError, AUTHORIZATION_PATH, GITHUB_SETUP_PATH,
     REDIRECT_PATH, REGISTRATION_PATH, TOKEN_PATH,
 };
+use crate::db::DbError;
 use crate::relay::Relay;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, RawQuery, Request, State};
@@ -82,6 +83,23 @@ fn redirect(location: &str) -> Response {
     no_store(response)
 }
 
+/// DB の失敗は 503。401 や invalid_grant にはしない（クライアントに再認可を促してしまう）。
+impl IntoResponse for DbError {
+    fn into_response(self) -> Response {
+        tracing::error!(error = %self, "store failed");
+        no_store(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": "temporarily_unavailable",
+                    "error_description": "the server's storage failed; try again later",
+                })),
+            )
+                .into_response(),
+        )
+    }
+}
+
 /// x-www-form-urlencoded を辞書にする（同じキーは後勝ち）。
 fn parse_form(raw: &[u8]) -> HashMap<String, String> {
     url::form_urlencoded::parse(raw).into_owned().collect()
@@ -132,10 +150,10 @@ impl AuthorizeContext {
         error: &str,
         description: &str,
         load_client: bool,
-    ) -> Response {
+    ) -> Result<Response, DbError> {
         if self.client.is_none() && load_client {
             if let Some(id) = self.params.get("client_id").filter(|s| !s.is_empty()) {
-                self.client = oauth.get_client(id).await;
+                self.client = oauth.get_client(id).await?;
             }
         }
         if self.redirect_uri.is_none() {
@@ -151,7 +169,7 @@ impl AuthorizeContext {
         if self.state.is_none() {
             self.state = self.params.get("state").cloned();
         }
-        match (&self.redirect_uri, &self.client) {
+        Ok(match (&self.redirect_uri, &self.client) {
             (Some(uri), Some(_)) => redirect(&construct_redirect_uri(
                 uri,
                 &[
@@ -167,7 +185,7 @@ impl AuthorizeContext {
                 }
                 no_store((StatusCode::BAD_REQUEST, Json(body)).into_response())
             }
-        }
+        })
     }
 }
 
@@ -176,7 +194,7 @@ async fn authorize(
     method: Method,
     RawQuery(query): RawQuery,
     body: Bytes,
-) -> Response {
+) -> Result<Response, DbError> {
     let oauth = state.oauth.as_ref();
     let params = if method == Method::POST {
         parse_form(&body)
@@ -224,7 +242,7 @@ async fn authorize(
     }
 
     let client_id = ctx.params["client_id"].clone();
-    let Some(client) = oauth.get_client(&client_id).await else {
+    let Some(client) = oauth.get_client(&client_id).await? else {
         let description = format!("Client ID '{client_id}' not found");
         return ctx
             .error(oauth, "invalid_request", &description, false)
@@ -258,8 +276,8 @@ async fn authorize(
         redirect_uri_provided_explicitly: requested_redirect.is_some(),
         resource: ctx.params.get("resource").cloned(),
     };
-    match oauth.authorize(&client, params) {
-        Ok(next) => redirect(&next),
+    match oauth.authorize(&client, params)? {
+        Ok(next) => Ok(redirect(&next)),
         Err(e) => ctx.error(oauth, e.error, &e.description, true).await,
     }
 }
@@ -267,7 +285,10 @@ async fn authorize(
 // ---------------------------------------------------------------------------
 // /oauth/callback/github, /oauth/setup/github
 
-async fn github_callback(State(state): State<AppState>, RawQuery(query): RawQuery) -> Response {
+async fn github_callback(
+    State(state): State<AppState>,
+    RawQuery(query): RawQuery,
+) -> Result<Response, DbError> {
     let q = parse_form(query.unwrap_or_default().as_bytes());
     let outcome = state
         .oauth
@@ -276,11 +297,11 @@ async fn github_callback(State(state): State<AppState>, RawQuery(query): RawQuer
             q.get("state").map(String::as_str),
             q.get("error").map(String::as_str),
         )
-        .await;
-    match outcome {
+        .await?;
+    Ok(match outcome {
         CallbackOutcome::Redirect(url) => redirect(&url),
         CallbackOutcome::Text(status, body) => text(status, body),
-    }
+    })
 }
 
 async fn github_setup(State(state): State<AppState>) -> Response {
@@ -320,58 +341,76 @@ impl From<TokenError> for Response {
     }
 }
 
-async fn token(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+async fn token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, DbError> {
     let oauth = state.oauth.as_ref();
     let form = parse_form(&body);
     let authorization = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
-    let client = match oauth.authenticate_client(&form, authorization).await {
+    let client = match oauth.authenticate_client(&form, authorization).await? {
         Ok(client) => client,
         Err(message) => {
-            return token_response(
+            return Ok(token_response(
                 StatusCode::UNAUTHORIZED,
                 json!({ "error": "invalid_client", "error_description": message }),
-            )
+            ))
         }
     };
 
     let grant_type = match form.get("grant_type").map(String::as_str) {
         Some(g @ ("authorization_code" | "refresh_token")) => g,
-        Some(_) => return token_error("unsupported_grant_type", "Unsupported grant type"),
-        None => return token_error("invalid_request", "grant_type: Field required"),
+        Some(_) => {
+            return Ok(token_error(
+                "unsupported_grant_type",
+                "Unsupported grant type",
+            ))
+        }
+        None => return Ok(token_error("invalid_request", "grant_type: Field required")),
     };
     if !client.grant_types.iter().any(|g| g == grant_type) {
-        return token_error(
+        return Ok(token_error(
             "unsupported_grant_type",
             &format!(
                 "Unsupported grant type (supported grant types are {:?})",
                 client.grant_types
             ),
-        );
+        ));
     }
 
     let tokens = if grant_type == "authorization_code" {
         let (Some(code), Some(verifier)) = (form.get("code"), form.get("code_verifier")) else {
-            return token_error("invalid_request", "code and code_verifier are required");
+            return Ok(token_error(
+                "invalid_request",
+                "code and code_verifier are required",
+            ));
         };
         let token_redirect = match form.get("redirect_uri") {
             Some(raw) => match normalize_url(raw) {
                 Some(uri) => Some(uri),
                 None => {
-                    return token_error(
+                    return Ok(token_error(
                         "invalid_request",
                         "redirect_uri: Input should be a valid URL",
-                    )
+                    ))
                 }
             },
             None => None,
         };
-        let Some(auth_code) = oauth.load_authorization_code(&client, code) else {
-            return token_error("invalid_grant", "authorization code does not exist");
+        let Some(auth_code) = oauth.load_authorization_code(&client, code)? else {
+            return Ok(token_error(
+                "invalid_grant",
+                "authorization code does not exist",
+            ));
         };
         if auth_code.expires_at < crate::auth::now() {
-            return token_error("invalid_grant", "authorization code has expired");
+            return Ok(token_error(
+                "invalid_grant",
+                "authorization code has expired",
+            ));
         }
         // /authorize と /token で redirect_uri が変わっていないこと（RFC 6749 10.6）
         let redirect_ok = if auth_code.redirect_uri_provided_explicitly {
@@ -381,53 +420,56 @@ async fn token(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -
                 || token_redirect.as_deref() == Some(auth_code.redirect_uri.as_str())
         };
         if !redirect_ok {
-            return token_error(
+            return Ok(token_error(
                 "invalid_request",
                 "redirect_uri did not match the one used when creating auth code",
-            );
+            ));
         }
         if pkce_s256(verifier) != auth_code.code_challenge {
-            return token_error("invalid_grant", "incorrect code_verifier");
+            return Ok(token_error("invalid_grant", "incorrect code_verifier"));
         }
-        match oauth.exchange_authorization_code(&client, &auth_code) {
+        match oauth.exchange_authorization_code(&client, &auth_code)? {
             Ok(t) => t,
-            Err(e) => return e.into(),
+            Err(e) => return Ok(e.into()),
         }
     } else {
         let Some(refresh) = form.get("refresh_token") else {
-            return token_error("invalid_request", "refresh_token: Field required");
+            return Ok(token_error(
+                "invalid_request",
+                "refresh_token: Field required",
+            ));
         };
-        let Some(current) = oauth.load_refresh_token(&client, refresh) else {
-            return token_error("invalid_grant", "refresh token does not exist");
+        let Some(current) = oauth.load_refresh_token(&client, refresh)? else {
+            return Ok(token_error("invalid_grant", "refresh token does not exist"));
         };
         if current.expires_at < crate::auth::now() {
-            return token_error("invalid_grant", "refresh token has expired");
+            return Ok(token_error("invalid_grant", "refresh token has expired"));
         }
         let scopes: Vec<String> = match form.get("scope").filter(|s| !s.is_empty()) {
             Some(s) => s.split(' ').map(str::to_string).collect(),
             None => current.scopes.clone(),
         };
         if let Some(bad) = scopes.iter().find(|s| !current.scopes.contains(s)) {
-            return token_error(
+            return Ok(token_error(
                 "invalid_scope",
                 &format!("cannot request scope `{bad}` not provided by refresh token"),
-            );
+            ));
         }
-        match oauth.exchange_refresh_token(&client, refresh, scopes) {
+        match oauth.exchange_refresh_token(&client, refresh, scopes)? {
             Ok(t) => t,
-            Err(e) => return e.into(),
+            Err(e) => return Ok(e.into()),
         }
     };
-    token_response(
+    Ok(token_response(
         StatusCode::OK,
         serde_json::to_value(tokens).unwrap_or_default(),
-    )
+    ))
 }
 
 // ---------------------------------------------------------------------------
 // /register（RFC 7591）
 
-async fn register(State(state): State<AppState>, body: Bytes) -> Response {
+async fn register(State(state): State<AppState>, body: Bytes) -> Result<Response, DbError> {
     let invalid = |description: String| {
         (
             StatusCode::BAD_REQUEST,
@@ -437,21 +479,22 @@ async fn register(State(state): State<AppState>, body: Bytes) -> Response {
     };
     let value: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(e) => return invalid(format!("Invalid JSON: {e}")),
+        Err(e) => return Ok(invalid(format!("Invalid JSON: {e}"))),
     };
     let client =
         match crate::auth::client_from_registration(&value, &state.oauth.redirect_allowlist) {
             Ok(client) => client,
-            Err(description) => return invalid(description),
+            Err(description) => return Ok(invalid(description)),
         };
     tracing::info!(
         client_name = client.client_name.as_deref().unwrap_or("-"),
         method = %client.token_endpoint_auth_method,
         "registered oauth client"
     );
+    // 平文の client_secret を返すのはこの 1 回だけ（DB にはハッシュだけを置く）
     let body = serde_json::to_value(&client).unwrap_or_default();
-    state.oauth.register_client(client);
-    no_store((StatusCode::CREATED, Json(body)).into_response())
+    state.oauth.register_client(client)?;
+    Ok(no_store((StatusCode::CREATED, Json(body)).into_response()))
 }
 
 // ---------------------------------------------------------------------------
@@ -491,6 +534,7 @@ fn authenticate(oauth: &OAuthServer, headers: &HeaderMap) -> Result<IssuedToken,
     };
     oauth
         .load_access_token(token, &oauth.resource_url)
+        .map_err(|e| Box::new(e.into_response()))?
         .ok_or_else(|| Box::new(unauthorized(oauth)))
 }
 

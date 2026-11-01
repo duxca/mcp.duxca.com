@@ -1,24 +1,28 @@
-//! メモリ内ストア（元 lib/store.js の移植）。再起動で全て消える。
+//! relay のストア（元 lib/store.js の移植）。SQLite（`crate::db`）に置き、再起動しても残る。
 //!
 //! データは「部屋」（OAuth の subject = GitHub 数値 id）ごとに分かれ、部屋をまたいで見えない。
-//! メッセージ id はカーソルを兼ねる。部屋ごとのカウンタを部屋を最初に使った時刻の Unix ミリ秒から始めるので、
-//! 再起動前のカーソルより新しいメッセージの id が必ず大きくなり、id の差から他の部屋の動きは読めない。
+//! メッセージ id はカーソルを兼ねる。部屋ごとのカウンタ（`relay_rooms.next_id`）を部屋を最初に使った時刻の
+//! Unix ミリ秒から始めて DB に残すので、id は戻らず、id の差から他の部屋の動きは読めない。
 //!
-//! 保存量は部屋ごとと全部屋の合計の両方で数え（`Limits`）、上限を超える書き込みは断る。自動では消さない。
+//! 保存量は部屋ごとと全部屋の合計の両方で数え（`Limits`）、上限を超える書き込みは断る。保存量は持たずに
+//! 書き込みのたびに SUM で数え直す。メッセージ（と添付）は `RETENTION_DAYS` 日で消える。消すのは
+//! send_message / register_agent の書き込みのついでで、常駐タスクは無い。
+//! long-poll の待機と起床、`closed` はプロセス内の調整なのでメモリに置く。
 
 use super::js::{self, is_js_whitespace, utf16_len};
 use super::webhook::WebhookTarget;
 use super::RelayError;
+use crate::db::Db;
 use axum::body::Bytes;
 use base64::alphabet;
 use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
 use base64::Engine;
 use rand::RngCore;
+use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
-use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -35,14 +39,17 @@ pub const DEFAULT_MAX_TOTAL_STORAGE_BYTES: u64 = 64 * MB;
 pub const MAX_WAIT_SECONDS: f64 = 280.0;
 pub const MAX_THREAD_MESSAGES: usize = 500;
 pub const MAX_AGENT_NAME: usize = 64;
+/// メッセージ（と添付）を残す日数。スレッドは最後のメッセージと一緒に消える。登録は消さない。
+pub const RETENTION_DAYS: i64 = 7;
+const RETENTION_MS: i64 = RETENTION_DAYS * 24 * 60 * 60 * 1000;
 
-// 保存量の概算で 1 件ごとに足す固定分（構造体・map のノード・id 文字列・アロケータの端数）
+// 保存量の概算で 1 件ごとに足す固定分。メモリ版の見積もりのまま（上限の意味を変えない）
 const MESSAGE_OVERHEAD: u64 = 320;
 const THREAD_OVERHEAD: u64 = 256;
 const ATTACHMENT_OVERHEAD: u64 = 256;
 const AGENT_OVERHEAD: u64 = 128;
 
-/// relay がメモリに抱える量の上限。部屋ごとの値と全部屋の合計の両方で数える。
+/// relay が保存する量の上限。部屋ごとの値と全部屋の合計の両方で数える。
 #[derive(Debug, Clone)]
 pub struct Limits {
     pub room_messages: usize,
@@ -77,7 +84,7 @@ impl Limits {
     }
 }
 
-/// 保存済みの量。メッセージと添付は消さないので増えるだけ、登録は置き換え・解除で戻る。
+/// 保存済みの量。保持期間を過ぎたメッセージと、登録の置き換え・解除で戻る。
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Usage {
     pub messages: usize,
@@ -85,19 +92,55 @@ pub struct Usage {
     pub attachment_bytes: u64,
 }
 
-impl Usage {
-    fn add(&mut self, other: Usage) {
-        self.messages += other.messages;
-        self.data_bytes += other.data_bytes;
-        self.attachment_bytes += other.attachment_bytes;
+/// `room` が None なら全部屋の合計。
+fn usage(c: &Connection, room: Option<&str>) -> rusqlite::Result<Usage> {
+    let w = if room.is_some() {
+        "WHERE room = ?1"
+    } else {
+        ""
+    };
+    c.prepare_cached(&format!(
+        "SELECT (SELECT COUNT(*) FROM relay_messages {w}), \
+                (SELECT COALESCE(SUM(data_bytes), 0) FROM relay_messages {w}) \
+                + (SELECT COALESCE(SUM(data_bytes), 0) FROM relay_agents {w}), \
+                (SELECT COALESCE(SUM(size), 0) FROM relay_attachments {w})"
+    ))?
+    .query_row(rusqlite::params_from_iter(room), |r| {
+        Ok(Usage {
+            messages: r.get::<_, i64>(0)? as usize,
+            data_bytes: r.get::<_, i64>(1)? as u64,
+            attachment_bytes: r.get::<_, i64>(2)? as u64,
+        })
+    })
+}
+
+/// 保持期間を過ぎたメッセージ（添付は CASCADE）と、空になったスレッドを消し、空いたページをファイルから返す。
+fn prune(tx: &Connection, now: i64) -> rusqlite::Result<()> {
+    let cutoff = now - RETENTION_MS;
+    let expired: bool = tx
+        .prepare_cached("SELECT EXISTS (SELECT 1 FROM relay_messages WHERE created_at < ?1)")?
+        .query_row([cutoff], |r| r.get(0))?;
+    if !expired {
+        return Ok(());
     }
+    tx.execute("DELETE FROM relay_messages WHERE created_at < ?1", [cutoff])?;
+    tx.execute(
+        "DELETE FROM relay_threads WHERE NOT EXISTS (SELECT 1 FROM relay_messages AS m \
+         WHERE m.room = relay_threads.room AND m.thread_id = relay_threads.id)",
+        [],
+    )?;
+    // 1 ページ返すごとに 1 行返るので最後まで回す
+    let mut vacuum = tx.prepare("PRAGMA incremental_vacuum")?;
+    let mut rows = vacuum.query([])?;
+    while rows.next()?.is_some() {}
+    Ok(())
 }
 
 /// 上限に達したときのエラー（507 相当）。
 fn full(what: String) -> RelayError {
     RelayError::new(
         507,
-        format!("{what}; the relay keeps data in memory and frees it only when it restarts"),
+        format!("{what}; messages and their files are deleted {RETENTION_DAYS} days after they are sent, which frees space"),
     )
 }
 
@@ -180,65 +223,11 @@ pub struct AttachmentContent {
     pub data: Bytes,
 }
 
-struct Thread {
-    id: String,
-    subject: String,
-    started_by: String,
-    created_at: i64,
-    updated_at: i64,
-    message_ids: Vec<u64>,
-}
-
-struct Message {
-    id: u64,
-    thread_id: String,
-    from: String,
-    to: String,
-    text: String,
-    created_at: i64,
-    read_at: Option<i64>,
-    attachment_ids: Vec<String>,
-    /// 内部記録専用。API には出さない。
-    webhook_status: Option<String>,
-}
-
-struct Attachment {
-    id: String,
-    message_id: u64,
-    filename: String,
-    content_type: String,
-    sha256: String,
-    data: Bytes,
-}
-
-/// `register_agent` の登録。webhook の値は API に出さない。
-struct AgentRecord {
-    webhook: Option<WebhookTarget>,
-    /// 保存量に数えた分
-    bytes: u64,
-}
-
 fn agent_bytes(name: &str, webhook: Option<&WebhookTarget>) -> u64 {
     let webhook = webhook.map_or(0, |w| {
         w.url.len() + w.auth.as_ref().map_or(0, String::len) + w.secret.len()
     });
     AGENT_OVERHEAD + (name.len() + webhook) as u64
-}
-
-struct Room {
-    /// 次のメッセージ id（部屋ごと）
-    next_id: u64,
-    threads: HashMap<String, Thread>,
-    messages: BTreeMap<u64, Message>,
-    attachments: HashMap<String, Attachment>,
-    agents: BTreeMap<String, AgentRecord>,
-    usage: Usage,
-}
-
-struct Inner {
-    rooms: HashMap<String, Room>,
-    /// 全部屋の合計
-    usage: Usage,
 }
 
 /// 待機中の long-poll。部屋ごとに起床用の `Notify` を持ち、送信はその部屋の待機だけを起こす。
@@ -275,7 +264,7 @@ impl Drop for WaitSlot<'_> {
 }
 
 pub struct Store {
-    inner: Mutex<Inner>,
+    db: Db,
     waiters: Mutex<Waiters>,
     /// 停止中。以後の long-poll は待たずに返す。
     closed: AtomicBool,
@@ -498,95 +487,91 @@ fn number_string(n: f64) -> String {
     }
 }
 
-impl Room {
-    fn new() -> Self {
-        Self {
-            next_id: now_ms().max(1) as u64,
-            threads: HashMap::new(),
-            messages: BTreeMap::new(),
-            attachments: HashMap::new(),
-            agents: BTreeMap::new(),
-            usage: Usage::default(),
-        }
-    }
-
-    fn fmt_attachment(&self, id: &str) -> Option<AttachmentView> {
-        let a = self.attachments.get(id)?;
-        Some(AttachmentView {
-            id: a.id.clone(),
-            filename: a.filename.clone(),
-            content_type: a.content_type.clone(),
-            size: a.data.len(),
-            sha256: a.sha256.clone(),
-        })
-    }
-
-    fn fmt_message(&self, m: &Message) -> MessageView {
-        MessageView {
-            id: m.id.to_string(),
-            cursor: m.id.to_string(),
-            thread_id: m.thread_id.clone(),
-            from: m.from.clone(),
-            to: m.to.clone(),
-            text: m.text.clone(),
-            created_at: iso_ms(m.created_at),
-            read: m.read_at.is_some(),
-            read_at: m.read_at.map(iso_ms),
-            attachments: m
-                .attachment_ids
-                .iter()
-                .filter_map(|id| self.fmt_attachment(id))
-                .collect(),
-        }
-    }
-
-    /// `counts` が Some なら message_count を付け、さらに Some(agent) ならその宛先の未読数も付ける。
-    fn fmt_thread(&self, t: &Thread, counts: Option<Option<&str>>) -> ThreadView {
-        let (message_count, unread_count) = match counts {
-            None => (None, None),
-            Some(reader) => {
-                let unread = reader.map(|agent| {
-                    t.message_ids
-                        .iter()
-                        .filter_map(|id| self.messages.get(id))
-                        .filter(|m| m.to == agent && m.read_at.is_none())
-                        .count()
-                });
-                (Some(t.message_ids.len()), unread)
-            }
-        };
-        ThreadView {
-            id: t.id.clone(),
-            subject: t.subject.clone(),
-            started_by: t.started_by.clone(),
-            created_at: iso_ms(t.created_at),
-            updated_at: iso_ms(t.updated_at),
-            message_count,
-            unread_count,
-        }
-    }
-
-    fn unread_to(&self, agent: &str) -> usize {
-        self.messages
-            .values()
-            .filter(|m| m.to == agent && m.read_at.is_none())
-            .count()
-    }
+/// id を SQL の INTEGER にする。i64 を超える値（どの id よりも大きい）は i64::MAX に丸める。
+fn sql_id(id: u64) -> i64 {
+    i64::try_from(id).unwrap_or(i64::MAX)
 }
 
-impl Inner {
-    fn room(&self, room: &str) -> Option<&Room> {
-        self.rooms.get(room)
-    }
+const MESSAGE_COLUMNS: &str = "id, thread_id, sender, recipient, text, created_at, read_at";
+
+/// `sql` は `MESSAGE_COLUMNS` を選ぶ。添付のメタ情報は位置の順に付ける。
+fn messages(
+    c: &Connection,
+    room: &str,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> rusqlite::Result<Vec<MessageView>> {
+    let rows = c
+        .prepare_cached(sql)?
+        .query_map(params, |r| {
+            let id: i64 = r.get(0)?;
+            let read_at: Option<i64> = r.get(6)?;
+            let view = MessageView {
+                id: id.to_string(),
+                cursor: id.to_string(),
+                thread_id: r.get(1)?,
+                from: r.get(2)?,
+                to: r.get(3)?,
+                text: r.get(4)?,
+                created_at: iso_ms(r.get(5)?),
+                read: read_at.is_some(),
+                read_at: read_at.map(iso_ms),
+                attachments: Vec::new(),
+            };
+            Ok((id, view))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut attachments = c.prepare_cached(
+        "SELECT id, filename, content_type, size, sha256 FROM relay_attachments \
+         WHERE room = ?1 AND message_id = ?2 ORDER BY position",
+    )?;
+    rows.into_iter()
+        .map(|(id, mut view)| {
+            view.attachments = attachments
+                .query_map(params![room, id], attachment_view)?
+                .collect::<rusqlite::Result<_>>()?;
+            Ok(view)
+        })
+        .collect()
+}
+
+/// id, filename, content_type, size, sha256 の順。
+fn attachment_view(r: &Row) -> rusqlite::Result<AttachmentView> {
+    Ok(AttachmentView {
+        id: r.get(0)?,
+        filename: r.get(1)?,
+        content_type: r.get(2)?,
+        size: r.get::<_, i64>(3)? as usize,
+        sha256: r.get(4)?,
+    })
+}
+
+/// id, subject, started_by, created_at, updated_at の順。
+fn thread_view(r: &Row) -> rusqlite::Result<ThreadView> {
+    Ok(ThreadView {
+        id: r.get(0)?,
+        subject: r.get(1)?,
+        started_by: r.get(2)?,
+        created_at: iso_ms(r.get(3)?),
+        updated_at: iso_ms(r.get(4)?),
+        message_count: None,
+        unread_count: None,
+    })
+}
+
+/// 部屋を初めて使うなら、id をいまの時刻から数え始める。
+fn ensure_room(tx: &Connection, room: &str) -> rusqlite::Result<()> {
+    tx.prepare_cached(
+        "INSERT INTO relay_rooms (room, next_id) VALUES (?1, ?2) ON CONFLICT (room) DO NOTHING",
+    )?
+    .execute(params![room, now_ms().max(1)])?;
+    Ok(())
 }
 
 impl Store {
-    pub fn new(limits: Limits) -> Self {
+    pub fn new(limits: Limits, db: Db) -> Self {
         Self {
-            inner: Mutex::new(Inner {
-                rooms: HashMap::new(),
-                usage: Usage::default(),
-            }),
+            db,
             waiters: Mutex::default(),
             closed: AtomicBool::new(false),
             limits,
@@ -597,8 +582,9 @@ impl Store {
         &self.limits
     }
 
-    fn lock(&self) -> MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    #[cfg(test)]
+    pub fn db(&self) -> &Db {
+        &self.db
     }
 
     fn lock_waiters(&self) -> MutexGuard<'_, Waiters> {
@@ -666,29 +652,29 @@ impl Store {
 
     /// `check` が値を返すか `wait` が過ぎるまで待つ。枠が無いか `wait` が 0 なら 1 回だけ見る。
     /// 同じ部屋へのメッセージ追加で再判定する。呼び出し側の future が drop されれば（クライアント切断）
-    /// 待機もそこで終わる。
+    /// 待機もそこで終わる。DB のロックは `check` の間だけ持つ。
     async fn wait_for<T>(
         &self,
         slot: Option<&WaitSlot<'_>>,
         wait: Duration,
-        mut check: impl FnMut(&Inner) -> Option<T>,
-    ) -> Option<T> {
+        mut check: impl FnMut(&Connection) -> rusqlite::Result<Option<T>>,
+    ) -> rusqlite::Result<Option<T>> {
         let Some(slot) = slot.filter(|_| !wait.is_zero()) else {
-            return check(&self.lock());
+            return self.db.read(check);
         };
         let deadline = Instant::now() + wait;
         loop {
             let notified = slot.wake.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if let Some(found) = check(&self.lock()) {
-                return Some(found);
+            if let Some(found) = self.db.read(&mut check)? {
+                return Ok(Some(found));
             }
             if self.closed.load(Ordering::SeqCst) {
-                return None;
+                return Ok(None);
             }
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                return None;
+                return Ok(None);
             }
         }
     }
@@ -753,7 +739,13 @@ impl Store {
         Ok(())
     }
 
-    /// `from` から `to` へのメッセージを保存する。宛先に webhook の登録があればそれも返す。
+    /// `add` を足しても上限に収まるかを、保存済みの量を数え直して確かめる。
+    fn check_room(&self, tx: &Connection, room: &str, add: Usage) -> Result<(), RelayError> {
+        self.check_capacity(usage(tx, Some(room))?, usage(tx, None)?, add)
+    }
+
+    /// `from` から `to` へのメッセージを添付と一緒に 1 つのトランザクションで保存する。
+    /// 宛先に webhook の登録があればそれも返す。
     pub fn send_message(
         &self,
         room: &str,
@@ -816,92 +808,127 @@ impl Store {
             attachment_bytes: atts.iter().map(|a| a.data.len() as u64).sum(),
         };
 
-        let mut guard = self.lock();
-        let inner = &mut *guard;
-        let existing = inner.rooms.get(room);
-        if let Some(tid) = thread_id {
-            let Some(t) = existing.and_then(|r| r.threads.get(tid)) else {
-                return Err(RelayError::new(404, format!("thread {tid} not found")));
+        let (view, target) = self.db.write(|tx| -> Result<_, RelayError> {
+            // 先に消す（期限を過ぎたスレッドへの返信は 404 にし、空いた分は上限の計算に入れる）
+            prune(tx, now_ms())?;
+            if let Some(tid) = thread_id {
+                let count: Option<i64> = tx
+                    .prepare_cached(
+                        "SELECT (SELECT COUNT(*) FROM relay_messages WHERE room = ?1 AND thread_id = ?2) \
+                         FROM relay_threads WHERE room = ?1 AND id = ?2",
+                    )?
+                    .query_row(params![room, tid], |r| r.get(0))
+                    .optional()?;
+                let Some(count) = count else {
+                    return Err(RelayError::new(404, format!("thread {tid} not found")));
+                };
+                if count as usize >= MAX_THREAD_MESSAGES {
+                    return Err(RelayError::new(
+                        409,
+                        format!("thread {tid} is full ({MAX_THREAD_MESSAGES} messages); start a new thread by omitting thread_id"),
+                    ));
+                }
+            }
+            self.check_room(tx, room, add)?;
+            ensure_room(tx, room)?;
+            let id: i64 = tx
+                .prepare_cached(
+                    "UPDATE relay_rooms SET next_id = next_id + 1 WHERE room = ?1 RETURNING next_id - 1",
+                )?
+                .query_row([room], |r| r.get(0))?;
+            let now = now_ms();
+            let thread_id = match (thread_id, new_subject) {
+                (Some(tid), _) => {
+                    tx.prepare_cached(
+                        "UPDATE relay_threads SET updated_at = ?3 WHERE room = ?1 AND id = ?2",
+                    )?
+                    .execute(params![room, tid, now])?;
+                    tid.to_string()
+                }
+                (None, subject) => {
+                    let tid = format!("thr_{}", random_hex(8));
+                    tx.prepare_cached(
+                        "INSERT INTO relay_threads (room, id, subject, started_by, created_at, updated_at) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                    )?
+                    .execute(params![room, tid, subject.unwrap_or_default(), from, now])?;
+                    tid
+                }
             };
-            if t.message_ids.len() >= MAX_THREAD_MESSAGES {
-                return Err(RelayError::new(
-                    409,
-                    format!("thread {tid} is full ({MAX_THREAD_MESSAGES} messages); start a new thread by omitting thread_id"),
-                ));
-            }
-        }
-        self.check_capacity(
-            existing.map_or_else(Usage::default, |r| r.usage),
-            inner.usage,
-            add,
-        )?;
-        inner.usage.add(add);
-        let r = inner
-            .rooms
-            .entry(room.to_string())
-            .or_insert_with(Room::new);
-        r.usage.add(add);
-        let id = r.next_id;
-        r.next_id += 1;
-        let now = now_ms();
-        let thread_id = match (thread_id, new_subject) {
-            (Some(tid), _) => tid.to_string(),
-            (None, subject) => {
-                let tid = format!("thr_{}", random_hex(8));
-                r.threads.insert(
-                    tid.clone(),
-                    Thread {
-                        id: tid.clone(),
-                        subject: subject.unwrap_or_default(),
-                        started_by: from.to_string(),
-                        created_at: now,
-                        updated_at: now,
-                        message_ids: Vec::new(),
-                    },
-                );
-                tid
-            }
-        };
-        if let Some(t) = r.threads.get_mut(&thread_id) {
-            t.updated_at = now;
-            t.message_ids.push(id);
-        }
-
-        let mut attachment_ids = Vec::with_capacity(atts.len());
-        for a in atts {
-            let att_id = format!("att_{}", random_hex(10));
-            let sha256 = Sha256::digest(&a.data)
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect();
-            r.attachments.insert(
-                att_id.clone(),
-                Attachment {
-                    id: att_id.clone(),
-                    message_id: id,
+            let target = tx
+                .prepare_cached(
+                    "SELECT webhook_url, webhook_auth, webhook_secret FROM relay_agents \
+                     WHERE room = ?1 AND name = ?2 AND webhook_url IS NOT NULL",
+                )?
+                .query_row(params![room, to], |r| {
+                    Ok(WebhookTarget {
+                        url: r.get(0)?,
+                        auth: r.get(1)?,
+                        secret: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    })
+                })
+                .optional()?;
+            tx.prepare_cached(
+                "INSERT INTO relay_messages \
+                 (room, id, thread_id, sender, recipient, text, created_at, webhook_status, data_bytes) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )?
+            .execute(params![
+                room,
+                id,
+                thread_id,
+                from,
+                to,
+                text,
+                now,
+                target.is_none().then_some("skipped:no_webhook"),
+                add.data_bytes as i64,
+            ])?;
+            let mut insert = tx.prepare_cached(
+                "INSERT INTO relay_attachments \
+                 (room, id, message_id, position, filename, content_type, size, sha256, data) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )?;
+            let mut attachments = Vec::with_capacity(atts.len());
+            for (position, a) in atts.into_iter().enumerate() {
+                let view = AttachmentView {
+                    id: format!("att_{}", random_hex(10)),
                     filename: a.filename,
                     content_type: a.content_type,
-                    sha256,
-                    data: Bytes::from(a.data),
-                },
-            );
-            attachment_ids.push(att_id);
-        }
-        let target = r.agents.get(to).and_then(|a| a.webhook.clone());
-        let message = Message {
-            id,
-            thread_id,
-            from: from.to_string(),
-            to: to.to_string(),
-            text: text.to_string(),
-            created_at: now,
-            read_at: None,
-            attachment_ids,
-            webhook_status: target.is_none().then(|| "skipped:no_webhook".to_string()),
-        };
-        let view = r.fmt_message(&message);
-        r.messages.insert(id, message);
-        drop(guard);
+                    size: a.data.len(),
+                    sha256: Sha256::digest(&a.data)
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect(),
+                };
+                insert.execute(params![
+                    room,
+                    view.id,
+                    id,
+                    position as i64,
+                    view.filename,
+                    view.content_type,
+                    view.size as i64,
+                    view.sha256,
+                    a.data,
+                ])?;
+                attachments.push(view);
+            }
+            let view = MessageView {
+                id: id.to_string(),
+                cursor: id.to_string(),
+                thread_id,
+                from: from.to_string(),
+                to: to.to_string(),
+                text: text.to_string(),
+                created_at: iso_ms(now),
+                read: false,
+                read_at: None,
+                attachments,
+            };
+            Ok((view, target))
+        })?;
+        // 起こすのはコミットのあと
         self.wake(room);
         Ok((view, target))
     }
@@ -935,32 +962,50 @@ impl Store {
         };
         let mut start = first_id_after(after);
 
-        let query = |inner: &Inner| -> Option<Vec<MessageView>> {
-            let r = inner.room(room)?;
-            let rows: Vec<MessageView> = r
-                .messages
-                .range((Bound::Included(start), Bound::Unbounded))
-                .map(|(_, m)| m)
-                .filter(|m| m.to == agent)
-                .filter(|m| !unread_only || m.read_at.is_none())
-                .filter(|m| thread_id.as_deref().is_none_or(|t| m.thread_id == t))
-                .take(limit)
-                .map(|m| r.fmt_message(m))
-                .collect();
+        let sql = format!(
+            "SELECT {MESSAGE_COLUMNS} FROM relay_messages \
+             WHERE room = ?1 AND recipient = ?2 AND id >= ?3 AND (NOT ?4 OR read_at IS NULL) \
+             AND (?5 IS NULL OR thread_id = ?5) ORDER BY id LIMIT ?6"
+        );
+        let query = |c: &Connection| -> rusqlite::Result<Option<Vec<MessageView>>> {
+            let rows = messages(
+                c,
+                room,
+                &sql,
+                params![
+                    room,
+                    agent,
+                    sql_id(start),
+                    unread_only,
+                    thread_id,
+                    limit as i64
+                ],
+            )?;
             if rows.is_empty() {
                 // 既存のメッセージが後から条件に合うことはないので、次は新しく増えた分だけ見る
-                start = start.max(r.next_id);
-                return None;
+                let next: Option<i64> = c
+                    .prepare_cached("SELECT next_id FROM relay_rooms WHERE room = ?1")?
+                    .query_row([room], |r| r.get(0))
+                    .optional()?;
+                if let Some(next) = next {
+                    start = start.max(next as u64);
+                }
+                return Ok(None);
             }
-            Some(rows)
+            Ok(Some(rows))
         };
         let messages = self
             .wait_for(slot.as_ref(), Duration::from_secs_f64(wait), query)
-            .await
+            .await?
             .unwrap_or_default();
         drop(slot);
 
-        let unread_total = self.lock().room(room).map_or(0, |r| r.unread_to(agent));
+        let unread_total: i64 = self.db.read(|c| {
+            c.prepare_cached(
+                "SELECT COUNT(*) FROM relay_messages WHERE room = ?1 AND recipient = ?2 AND read_at IS NULL",
+            )?
+            .query_row(params![room, agent], |r| r.get(0))
+        })?;
         let next_cursor = match messages.last() {
             Some(m) => Value::String(m.cursor.clone()),
             None if after != 0.0 => Value::String(number_string(after)),
@@ -992,20 +1037,20 @@ impl Store {
         thread_id: &str,
         after_id: u64,
         wait_seconds: f64,
-    ) -> Option<MessageView> {
+    ) -> Result<Option<MessageView>, RelayError> {
         let wait = Duration::from_secs_f64(wait_seconds.clamp(0.0, MAX_WAIT_SECONDS));
-        self.wait_for(slot, wait, |inner| {
-            let r = inner.room(room)?;
-            let thread = r.threads.get(thread_id)?;
-            thread
-                .message_ids
-                .iter()
-                .filter(|id| **id > after_id)
-                .filter_map(|id| r.messages.get(id))
-                .find(|m| m.from == peer && m.to == agent)
-                .map(|m| r.fmt_message(m))
-        })
-        .await
+        let sql = format!(
+            "SELECT {MESSAGE_COLUMNS} FROM relay_messages \
+             WHERE room = ?1 AND thread_id = ?2 AND id > ?3 AND sender = ?4 AND recipient = ?5 \
+             ORDER BY id LIMIT 1"
+        );
+        let reply = self
+            .wait_for(slot, wait, |c| {
+                let params = params![room, thread_id, sql_id(after_id), peer, agent];
+                Ok(messages(c, room, &sql, params)?.pop())
+            })
+            .await?;
+        Ok(reply)
     }
 
     pub fn get_thread(&self, room: &str, id: &Value) -> Result<Value, RelayError> {
@@ -1013,18 +1058,25 @@ impl Store {
             Some(s) if !s.is_empty() => s,
             _ => return Err(RelayError::bad_request("\"thread_id\" is required")),
         };
-        let inner = self.lock();
-        let Some((r, t)) = inner.room(room).and_then(|r| Some((r, r.threads.get(id)?))) else {
-            return Err(RelayError::new(404, format!("thread {id} not found")));
-        };
-        let messages: Vec<MessageView> = t
-            .message_ids
-            .iter()
-            .take(MAX_THREAD_MESSAGES)
-            .filter_map(|id| r.messages.get(id))
-            .map(|m| r.fmt_message(m))
-            .collect();
-        Ok(json!({ "thread": r.fmt_thread(t, None), "messages": messages }))
+        let found = self.db.read(|c| {
+            let thread = c
+                .prepare_cached(
+                    "SELECT id, subject, started_by, created_at, updated_at FROM relay_threads \
+                     WHERE room = ?1 AND id = ?2",
+                )?
+                .query_row(params![room, id], thread_view)
+                .optional()?;
+            let Some(thread) = thread else {
+                return Ok(None);
+            };
+            let sql = format!(
+                "SELECT {MESSAGE_COLUMNS} FROM relay_messages WHERE room = ?1 AND thread_id = ?2 \
+                 ORDER BY id LIMIT ?3"
+            );
+            let messages = messages(c, room, &sql, params![room, id, MAX_THREAD_MESSAGES as i64])?;
+            Ok(Some(json!({ "thread": thread, "messages": messages })))
+        })?;
+        found.ok_or_else(|| RelayError::new(404, format!("thread {id} not found")))
     }
 
     pub fn get_attachment(&self, room: &str, id: &Value) -> Result<AttachmentContent, RelayError> {
@@ -1044,37 +1096,54 @@ impl Store {
                 ))
             }
         };
-        let inner = self.lock();
-        let found = inner
-            .room(room)
-            .and_then(|r| Some((r.attachments.get(id)?, r.fmt_attachment(id)?)));
-        let Some((a, meta)) = found else {
-            return Err(RelayError::new(404, format!("attachment {id} not found")));
-        };
-        Ok(AttachmentContent {
-            meta,
-            message_id: a.message_id,
-            data: a.data.clone(),
-        })
+        let found = self.db.read(|c| {
+            c.prepare_cached(
+                "SELECT id, filename, content_type, size, sha256, message_id, data \
+                 FROM relay_attachments WHERE room = ?1 AND id = ?2",
+            )?
+            .query_row(params![room, id], |r| {
+                Ok(AttachmentContent {
+                    meta: attachment_view(r)?,
+                    message_id: r.get::<_, i64>(5)? as u64,
+                    data: Bytes::from(r.get::<_, Vec<u8>>(6)?),
+                })
+            })
+            .optional()
+        })?;
+        found.ok_or_else(|| RelayError::new(404, format!("attachment {id} not found")))
     }
 
     /// 部屋内のスレッドを新しい順に。`agent` があればその宛先の未読数を付ける。
-    pub fn list_threads(&self, room: &str, agent: Option<&str>, limit: &Value) -> Value {
+    pub fn list_threads(
+        &self,
+        room: &str,
+        agent: Option<&str>,
+        limit: &Value,
+    ) -> Result<Value, RelayError> {
         let limit = clamp_limit(limit, 20.0, 100.0);
-        let inner = self.lock();
-        let Some(r) = inner.room(room) else {
-            return json!({ "threads": [] });
-        };
-        let mut threads: Vec<&Thread> = r.threads.values().collect();
-        threads.sort_by(|a, b| {
-            (b.updated_at, b.message_ids.last()).cmp(&(a.updated_at, a.message_ids.last()))
-        });
-        let threads: Vec<ThreadView> = threads
-            .into_iter()
-            .take(limit)
-            .map(|t| r.fmt_thread(t, Some(agent)))
-            .collect();
-        json!({ "threads": threads })
+        let threads = self.db.read(|c| {
+            c.prepare_cached(
+                "SELECT t.id, t.subject, t.started_by, t.created_at, t.updated_at, \
+                 (SELECT COUNT(*) FROM relay_messages AS m WHERE m.room = t.room AND m.thread_id = t.id), \
+                 (SELECT COUNT(*) FROM relay_messages AS m WHERE m.room = t.room AND m.thread_id = t.id \
+                  AND m.recipient = ?2 AND m.read_at IS NULL), \
+                 (SELECT MAX(m.id) FROM relay_messages AS m WHERE m.room = t.room AND m.thread_id = t.id) AS last_id \
+                 FROM relay_threads AS t WHERE t.room = ?1 \
+                 ORDER BY t.updated_at DESC, last_id DESC LIMIT ?3",
+            )?
+            .query_map(params![room, agent, limit as i64], |r| {
+                Ok(ThreadView {
+                    message_count: Some(r.get::<_, i64>(5)? as usize),
+                    unread_count: match agent {
+                        Some(_) => Some(r.get::<_, i64>(6)? as usize),
+                        None => None,
+                    },
+                    ..thread_view(r)?
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+        })?;
+        Ok(json!({ "threads": threads }))
     }
 
     /// `agent` 宛てのメッセージを既読にする。`message_ids` > `thread_id` > `up_to_cursor`。
@@ -1128,55 +1197,42 @@ impl Store {
         };
 
         let now = now_ms();
-        let mut inner = self.lock();
-        let mut marked = Vec::new();
-        if let Some(r) = inner.rooms.get_mut(room) {
-            let mut mark = |m: &mut Message| {
-                if m.to == agent && m.read_at.is_none() {
-                    m.read_at = Some(now);
-                    marked.push(m.id);
-                }
-            };
-            match target {
+        let mark = |tx: &Connection, which: &str, value: &dyn rusqlite::ToSql| {
+            tx.prepare_cached(&format!(
+                "UPDATE relay_messages SET read_at = ?1 \
+                 WHERE room = ?2 AND recipient = ?3 AND read_at IS NULL AND {which} RETURNING id"
+            ))?
+            .query_map(params![now, room, agent, value], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<i64>>>()
+        };
+        let mut marked = self.db.write(|tx| -> rusqlite::Result<Vec<i64>> {
+            Ok(match target {
                 Target::Ids(ids) => {
+                    let mut marked = Vec::new();
                     for id in ids {
-                        if let Some(m) = r.messages.get_mut(&id) {
-                            mark(m);
-                        }
+                        marked.extend(mark(tx, "id = ?4", &sql_id(id))?);
                     }
+                    marked
                 }
-                Target::Thread(tid) => {
-                    let ids = r
-                        .threads
-                        .get(&tid)
-                        .map(|t| t.message_ids.clone())
-                        .unwrap_or_default();
-                    for id in ids {
-                        if let Some(m) = r.messages.get_mut(&id) {
-                            mark(m);
-                        }
-                    }
-                }
+                Target::Thread(tid) => mark(tx, "thread_id = ?4", &tid)?,
                 Target::UpTo(c) if c >= 0.0 => {
                     let upper = if c >= u64::MAX as f64 {
                         u64::MAX
                     } else {
                         c.floor() as u64
                     };
-                    for (_, m) in r.messages.range_mut(..=upper) {
-                        mark(m);
-                    }
+                    mark(tx, "id <= ?4", &sql_id(upper))?
                 }
-                Target::UpTo(_) => {}
-            }
-        }
+                Target::UpTo(_) => Vec::new(),
+            })
+        })?;
         marked.sort_unstable();
         marked.dedup();
-        let ids: Vec<String> = marked.iter().map(u64::to_string).collect();
+        let ids: Vec<String> = marked.iter().map(i64::to_string).collect();
         Ok(json!({ "marked_read": ids.len(), "message_ids": ids }))
     }
 
-    /// 登録を丸ごと置き換える。webhook の有無を返す。
+    /// 登録を丸ごと置き換える。webhook の有無を返す。webhook の値は平文で保存する（U4）が、どの API からも返さない。
     pub fn register_agent(
         &self,
         room: &str,
@@ -1184,115 +1240,129 @@ impl Store {
         webhook: Option<WebhookTarget>,
     ) -> Result<bool, RelayError> {
         let bytes = agent_bytes(agent, webhook.as_ref());
-        let mut guard = self.lock();
-        let inner = &mut *guard;
-        let existing = inner.rooms.get(room);
-        let old = existing.and_then(|r| r.agents.get(agent)).map(|a| a.bytes);
-        if old.is_none() && existing.is_some_and(|r| r.agents.len() >= self.limits.room_agents) {
-            return Err(RelayError::new(
-                507,
-                format!(
-                    "this room already has {} registered agents (its limit); unregister one first",
-                    self.limits.room_agents
-                ),
-            ));
-        }
-        let old = old.unwrap_or(0);
-        let grow = Usage {
-            data_bytes: bytes.saturating_sub(old),
-            ..Usage::default()
-        };
-        self.check_capacity(
-            existing.map_or_else(Usage::default, |r| r.usage),
-            inner.usage,
-            grow,
-        )?;
-        let r = inner
-            .rooms
-            .entry(room.to_string())
-            .or_insert_with(Room::new);
-        for usage in [&mut inner.usage, &mut r.usage] {
-            usage.data_bytes = usage.data_bytes - old + bytes;
-        }
-        let has_webhook = webhook.is_some();
-        r.agents
-            .insert(agent.to_string(), AgentRecord { webhook, bytes });
-        Ok(has_webhook)
+        self.db.write(|tx| -> Result<_, RelayError> {
+            prune(tx, now_ms())?;
+            let old: Option<i64> = tx
+                .prepare_cached("SELECT data_bytes FROM relay_agents WHERE room = ?1 AND name = ?2")?
+                .query_row(params![room, agent], |r| r.get(0))
+                .optional()?;
+            if old.is_none() {
+                let count: i64 = tx
+                    .prepare_cached("SELECT COUNT(*) FROM relay_agents WHERE room = ?1")?
+                    .query_row([room], |r| r.get(0))?;
+                if count as usize >= self.limits.room_agents {
+                    return Err(RelayError::new(
+                        507,
+                        format!(
+                            "this room already has {} registered agents (its limit); unregister one first",
+                            self.limits.room_agents
+                        ),
+                    ));
+                }
+            }
+            let grow = Usage {
+                data_bytes: bytes.saturating_sub(old.unwrap_or(0) as u64),
+                ..Usage::default()
+            };
+            self.check_room(tx, room, grow)?;
+            ensure_room(tx, room)?;
+            let (url, auth, secret) = match &webhook {
+                Some(w) => (Some(&w.url), w.auth.as_ref(), Some(&w.secret)),
+                None => (None, None, None),
+            };
+            tx.prepare_cached(
+                "INSERT INTO relay_agents (room, name, webhook_url, webhook_auth, webhook_secret, data_bytes) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT (room, name) DO UPDATE SET \
+                 webhook_url = excluded.webhook_url, webhook_auth = excluded.webhook_auth, \
+                 webhook_secret = excluded.webhook_secret, data_bytes = excluded.data_bytes",
+            )?
+            .execute(params![room, agent, url, auth, secret, bytes as i64])?;
+            Ok(webhook.is_some())
+        })
     }
 
     /// 登録を消す（メッセージは残る）。消えたかどうかを返す。
-    pub fn unregister_agent(&self, room: &str, agent: &str) -> bool {
-        let mut guard = self.lock();
-        let inner = &mut *guard;
-        let Some(r) = inner.rooms.get_mut(room) else {
-            return false;
-        };
-        let Some(old) = r.agents.remove(agent) else {
-            return false;
-        };
-        r.usage.data_bytes -= old.bytes;
-        inner.usage.data_bytes -= old.bytes;
-        true
+    pub fn unregister_agent(&self, room: &str, agent: &str) -> Result<bool, RelayError> {
+        let removed = self.db.write(|tx| {
+            tx.execute(
+                "DELETE FROM relay_agents WHERE room = ?1 AND name = ?2",
+                params![room, agent],
+            )
+        })?;
+        Ok(removed > 0)
     }
 
     /// 登録 ∪ メッセージの from/to を名前順に。webhook の値は出さない。
-    pub fn list_agents(&self, room: &str) -> Value {
-        let inner = self.lock();
-        let Some(r) = inner.room(room) else {
-            return json!({ "agents": [] });
-        };
-        let mut names: BTreeMap<&str, bool> = r
-            .agents
-            .iter()
-            .map(|(name, a)| (name.as_str(), a.webhook.is_some()))
-            .collect();
-        for m in r.messages.values() {
-            names.entry(&m.from).or_insert(false);
-            names.entry(&m.to).or_insert(false);
-        }
+    pub fn list_agents(&self, room: &str) -> Result<Value, RelayError> {
+        let names = self.db.read(|c| {
+            let mut names: BTreeMap<String, bool> = c
+                .prepare_cached(
+                    "SELECT name, webhook_url IS NOT NULL FROM relay_agents WHERE room = ?1",
+                )?
+                .query_map([room], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            let seen = c
+                .prepare_cached(
+                    "SELECT sender FROM relay_messages WHERE room = ?1 \
+                     UNION SELECT recipient FROM relay_messages WHERE room = ?1",
+                )?
+                .query_map([room], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for name in seen {
+                names.entry(name).or_insert(false);
+            }
+            Ok(names)
+        })?;
         let agents: Vec<Value> = names
             .into_iter()
             .map(|(name, webhook)| json!({ "name": name, "webhook": webhook }))
             .collect();
-        json!({ "agents": agents })
+        Ok(json!({ "agents": agents }))
     }
 
+    /// 内部の記録なので、保存に失敗してもログに出すだけにする（メッセージはもう保存してある）。
     pub fn set_webhook_status(&self, room: &str, id: &str, status: String) {
-        let Ok(id) = id.parse::<u64>() else { return };
-        if let Some(m) = self
-            .lock()
-            .rooms
-            .get_mut(room)
-            .and_then(|r| r.messages.get_mut(&id))
-        {
-            m.webhook_status = Some(status);
+        let Ok(id) = id.parse::<i64>() else { return };
+        let saved = self.db.write(|tx| {
+            tx.execute(
+                "UPDATE relay_messages SET webhook_status = ?1 WHERE room = ?2 AND id = ?3",
+                params![status, room, id],
+            )
+        });
+        if let Err(e) = saved {
+            tracing::error!(error = %e, room, message_id = id, "relay: storing webhook status failed");
         }
     }
 
     #[cfg(test)]
     pub fn webhook_status(&self, room: &str, id: &str) -> Option<String> {
-        let id = id.parse::<u64>().ok()?;
-        self.lock()
-            .rooms
-            .get(room)?
-            .messages
-            .get(&id)?
-            .webhook_status
-            .clone()
+        let id = id.parse::<i64>().ok()?;
+        self.db
+            .read(|c| {
+                c.query_row(
+                    "SELECT webhook_status FROM relay_messages WHERE room = ?1 AND id = ?2",
+                    params![room, id],
+                    |r| r.get(0),
+                )
+                .optional()
+            })
+            .unwrap()
+            .flatten()
     }
 
     /// 部屋の保存量と全体の保存量。
     #[cfg(test)]
     pub fn usage(&self, room: &str) -> (Usage, Usage) {
-        let inner = self.lock();
-        let r = inner.room(room).map_or_else(Usage::default, |r| r.usage);
-        (r, inner.usage)
+        self.db
+            .read(|c| Ok((usage(c, Some(room))?, usage(c, None)?)))
+            .unwrap()
     }
 }
 
 #[cfg(test)]
 mod store_tests {
     use super::*;
+    use crate::db::Db;
     use base64::engine::general_purpose::STANDARD;
 
     /// 今すぐ終わっているか（待たない）。
@@ -1316,7 +1386,10 @@ mod store_tests {
     }
 
     fn store() -> Store {
-        Store::new(Limits::with_total_attachment_bytes(1024))
+        Store::new(
+            Limits::with_total_attachment_bytes(1024),
+            Db::open_in_memory(),
+        )
     }
 
     fn send(store: &Store, room: &str, v: Value) -> Result<MessageView, RelayError> {
@@ -1404,6 +1477,7 @@ mod store_tests {
         assert!(store
             .wait_for_reply(Some(&slot), ROOM, "muse", "grok", "thr_x", 0, 30.0)
             .await
+            .unwrap()
             .is_none());
         drop(slot);
         assert_eq!(store.waiting(), 0);
@@ -1468,10 +1542,12 @@ mod store_tests {
             404
         );
         assert_eq!(
-            store.list_threads(OTHER, Some("grok"), &Value::Null),
+            store
+                .list_threads(OTHER, Some("grok"), &Value::Null)
+                .unwrap(),
             json!({ "threads": [] })
         );
-        assert_eq!(store.list_agents(OTHER), json!({ "agents": [] }));
+        assert_eq!(store.list_agents(OTHER).unwrap(), json!({ "agents": [] }));
         assert_eq!(
             store
                 .mark_read(OTHER, "grok", &json!({ "message_ids": [m.id] }))
@@ -1498,8 +1574,8 @@ mod store_tests {
             .send_message(ROOM, "muse", "grok", &args(json!({ "text": "x" })))
             .unwrap();
         assert_eq!(hook.unwrap().url, "https://hook.example/a");
-        assert!(!store.unregister_agent(OTHER, "grok"));
-        assert!(store.unregister_agent(ROOM, "grok"));
+        assert!(!store.unregister_agent(OTHER, "grok").unwrap());
+        assert!(store.unregister_agent(ROOM, "grok").unwrap());
         let (_, hook) = store
             .send_message(ROOM, "muse", "grok", &args(json!({ "text": "x" })))
             .unwrap();
@@ -1522,7 +1598,8 @@ mod store_tests {
             .unwrap();
         let reply = store
             .wait_for_reply(None, ROOM, "muse", "grok", &q.thread_id, after, 0.0)
-            .await;
+            .await
+            .unwrap();
         assert!(reply.is_none());
         store
             .send_message(ROOM, "grok", "muse", &in_thread("answer"))
@@ -1530,12 +1607,14 @@ mod store_tests {
         let reply = store
             .wait_for_reply(None, ROOM, "muse", "grok", &q.thread_id, after, 0.0)
             .await
+            .unwrap()
             .unwrap();
         assert_eq!(reply.text, "answer");
         assert_eq!(
             store
                 .wait_for_reply(None, OTHER, "muse", "grok", &q.thread_id, after, 0.0)
                 .await
+                .unwrap()
                 .map(|m| m.id),
             None
         );
@@ -1579,11 +1658,14 @@ mod store_tests {
 
     #[test]
     fn message_counts_are_limited_per_room_and_in_total() {
-        let store = Store::new(Limits {
-            room_messages: 3,
-            total_messages: 5,
-            ..Limits::with_total_attachment_bytes(1024)
-        });
+        let store = Store::new(
+            Limits {
+                room_messages: 3,
+                total_messages: 5,
+                ..Limits::with_total_attachment_bytes(1024)
+            },
+            Db::open_in_memory(),
+        );
         for _ in 0..3 {
             send(&store, ROOM, json!({ "text": "x" })).unwrap();
         }
@@ -1611,11 +1693,14 @@ mod store_tests {
 
     #[test]
     fn message_data_is_counted_per_room_and_in_total() {
-        let store = Store::new(Limits {
-            room_data_bytes: 3_000,
-            total_data_bytes: 4_000,
-            ..Limits::with_total_attachment_bytes(1024)
-        });
+        let store = Store::new(
+            Limits {
+                room_data_bytes: 3_000,
+                total_data_bytes: 4_000,
+                ..Limits::with_total_attachment_bytes(1024)
+            },
+            Db::open_in_memory(),
+        );
         // 本文・名前・件名・スレッドの固定分も数える
         let m = send(&store, ROOM, json!({ "text": "x".repeat(1_000) })).unwrap();
         let (room, total) = store.usage(ROOM);
@@ -1650,7 +1735,10 @@ mod store_tests {
 
     #[test]
     fn attachment_bytes_are_limited_per_room_and_in_total() {
-        let store = Store::new(Limits::with_total_attachment_bytes(24));
+        let store = Store::new(
+            Limits::with_total_attachment_bytes(24),
+            Db::open_in_memory(),
+        );
         let file = |n: usize| json!({ "text": "f", "attachments": [{ "filename": "a", "content_base64": STANDARD.encode(vec![1u8; n]) }] });
         send(&store, ROOM, file(8)).unwrap();
         // 1 部屋は全体（24）の半分（12）まで
@@ -1705,10 +1793,13 @@ mod store_tests {
 
     #[test]
     fn registrations_are_counted_and_given_back() {
-        let store = Store::new(Limits {
-            room_agents: 2,
-            ..Limits::with_total_attachment_bytes(1024)
-        });
+        let store = Store::new(
+            Limits {
+                room_agents: 2,
+                ..Limits::with_total_attachment_bytes(1024)
+            },
+            Db::open_in_memory(),
+        );
         assert!(!store.register_agent(ROOM, "a", None).unwrap());
         let only_name = store.usage(ROOM).0.data_bytes;
         assert_eq!(only_name, AGENT_OVERHEAD + 1);
@@ -1733,17 +1824,20 @@ mod store_tests {
         );
         // 登録済みの名前の置き換えは数に関係なくできる
         store.register_agent(ROOM, "b", None).unwrap();
-        assert!(store.unregister_agent(ROOM, "a"));
+        assert!(store.unregister_agent(ROOM, "a").unwrap());
         store.register_agent(ROOM, "c", None).unwrap();
-        assert!(store.unregister_agent(ROOM, "b"));
-        assert!(store.unregister_agent(ROOM, "c"));
+        assert!(store.unregister_agent(ROOM, "b").unwrap());
+        assert!(store.unregister_agent(ROOM, "c").unwrap());
         assert_eq!(store.usage(ROOM), (Usage::default(), Usage::default()));
 
         // 登録も保存量の上限に入る
-        let store = Store::new(Limits {
-            room_data_bytes: AGENT_OVERHEAD + 10,
-            ..Limits::with_total_attachment_bytes(1024)
-        });
+        let store = Store::new(
+            Limits {
+                room_data_bytes: AGENT_OVERHEAD + 10,
+                ..Limits::with_total_attachment_bytes(1024)
+            },
+            Db::open_in_memory(),
+        );
         store.register_agent(ROOM, "short", None).unwrap();
         let err = store
             .register_agent(ROOM, "short", Some(target("https://hook.example/a")))
@@ -1756,11 +1850,14 @@ mod store_tests {
 
     #[tokio::test]
     async fn waits_are_admitted_per_room_and_in_total() {
-        let store = Store::new(Limits {
-            room_waits: 2,
-            total_waits: 3,
-            ..Limits::with_total_attachment_bytes(1024)
-        });
+        let store = Store::new(
+            Limits {
+                room_waits: 2,
+                total_waits: 3,
+                ..Limits::with_total_attachment_bytes(1024)
+            },
+            Db::open_in_memory(),
+        );
         let a = store.reserve_wait(ROOM).unwrap();
         let b = store.reserve_wait(ROOM).unwrap();
         let err = store.reserve_wait(ROOM).err().unwrap();
@@ -1799,6 +1896,123 @@ mod store_tests {
         drop((a, b, c));
         assert_eq!(store.waiting(), 0);
         store.reserve_wait(ROOM).unwrap();
+    }
+
+    /// 7 日を過ぎたメッセージは、添付・空になったスレッドと一緒に書き込みのついでに消え、ファイルも縮む。
+    #[tokio::test]
+    async fn writes_prune_messages_older_than_the_retention() {
+        let path = crate::db::TempPath::new("retention");
+        let store = Store::new(
+            Limits::with_total_attachment_bytes(64 * MB),
+            Db::open(&path.0, None).unwrap(),
+        );
+        let big = STANDARD.encode(vec![7u8; MAX_FILE_BYTES]);
+        let file = || json!([{ "filename": "big.bin", "content_base64": big }]);
+        let gone = send(
+            &store,
+            ROOM,
+            json!({ "text": "old", "attachments": file() }),
+        )
+        .unwrap();
+        let mixed = send(&store, ROOM, json!({ "text": "old too" })).unwrap();
+        let kept = send(
+            &store,
+            ROOM,
+            json!({ "text": "recent", "thread_id": mixed.thread_id, "attachments": file() }),
+        )
+        .unwrap();
+        let other_room = send(&store, OTHER, json!({ "text": "old elsewhere" })).unwrap();
+        let day = 24 * 60 * 60 * 1000;
+        let age = |id: &str, ms: i64| {
+            store
+                .db
+                .read(|c| {
+                    c.execute(
+                        "UPDATE relay_messages SET created_at = ?1 WHERE id = ?2",
+                        params![now_ms() - ms, id.parse::<i64>().unwrap()],
+                    )
+                })
+                .unwrap()
+        };
+        age(&gone.id, RETENTION_DAYS * day + 1_000);
+        age(&mixed.id, RETENTION_DAYS * day + 1_000);
+        age(&other_room.id, RETENTION_DAYS * day + 1_000);
+        age(&kept.id, RETENTION_DAYS * day - 60_000);
+        let pages = |name: &str| -> i64 {
+            store
+                .db
+                .read(|c| c.pragma_query_value(None, name, |r| r.get(0)))
+                .unwrap()
+        };
+        let before = pages("page_count");
+        assert_eq!(store.usage(ROOM).1.messages, 4);
+
+        // 読むだけでは消えない
+        store.list_threads(ROOM, None, &Value::Null).unwrap();
+        assert_eq!(store.usage(ROOM).1.messages, 4);
+
+        // 期限を過ぎたスレッドへの返信は（消してから見るので）404
+        let reply = json!({ "text": "late", "thread_id": gone.thread_id });
+        assert_eq!(send(&store, ROOM, reply).unwrap_err().status, 404);
+        // 書き込み（send_message）で消える。部屋は問わない
+        send(&store, OTHER, json!({ "text": "trigger" })).unwrap();
+        assert_eq!(
+            store
+                .get_thread(ROOM, &json!(gone.thread_id))
+                .unwrap_err()
+                .status,
+            404
+        );
+        let att = json!(gone.attachments[0].id);
+        assert_eq!(store.get_attachment(ROOM, &att).err().unwrap().status, 404);
+        let thread = store.get_thread(ROOM, &json!(mixed.thread_id)).unwrap();
+        let texts: Vec<&str> = thread["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(texts, ["recent"]);
+        assert!(store
+            .get_attachment(ROOM, &json!(kept.attachments[0].id))
+            .is_ok());
+        assert_eq!(
+            store
+                .get_thread(OTHER, &json!(other_room.thread_id))
+                .unwrap_err()
+                .status,
+            404
+        );
+        let (room, total) = store.usage(ROOM);
+        assert_eq!((room.messages, total.messages), (1, 2));
+        assert_eq!(room.attachment_bytes, MAX_FILE_BYTES as u64);
+        // 空いたページはファイルから返っている
+        assert_eq!(pages("freelist_count"), 0);
+        assert!(
+            pages("page_count") < before - 500,
+            "{} -> {}",
+            before,
+            pages("page_count")
+        );
+
+        // register_agent でも消える
+        age(&kept.id, RETENTION_DAYS * day + 1_000);
+        store.register_agent(ROOM, "grok", None).unwrap();
+        assert_eq!(
+            store
+                .get_thread(ROOM, &json!(mixed.thread_id))
+                .unwrap_err()
+                .status,
+            404
+        );
+        assert_eq!(store.usage(ROOM).0.attachment_bytes, 0);
+        // id は消えても戻らない
+        let after: u64 = send(&store, ROOM, json!({ "text": "x" }))
+            .unwrap()
+            .id
+            .parse()
+            .unwrap();
+        assert!(after > kept.id.parse::<u64>().unwrap());
     }
 
     /// 送信はその部屋の待機だけを起こす。
