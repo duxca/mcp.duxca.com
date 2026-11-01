@@ -1,5 +1,4 @@
 mod auth;
-mod backend;
 mod config;
 mod relay;
 mod routes;
@@ -7,7 +6,6 @@ mod routes;
 mod tests;
 
 use auth::{GitHubLogin, GitHubOAuth, HttpClientMetadataFetcher, OAuthServer};
-use backend::{BackendRegistry, StdioMcpBackend};
 use config::Config;
 use routes::{router, AppState};
 use std::sync::{Arc, RwLock};
@@ -37,26 +35,11 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET 未設定。OAuth は動かない");
     }
 
-    let services = config.services()?;
-    if services.is_empty() {
-        anyhow::bail!("no MCP services configured");
-    }
-    let service_paths: Vec<String> = services.iter().map(|s| s.path.clone()).collect();
-    for svc in &services {
-        tracing::info!(
-            path = %svc.path,
-            command = %svc.command.join(" "),
-            cwd = %svc.cwd.display(),
-            "configured MCP service"
-        );
-    }
-
     let allowed_ids = Arc::new(RwLock::new(config.allowed_ids()));
     tracing::info!(
         %public_url,
         port = config.port,
         allowed = ?allowed_ids.read().ok().as_deref(),
-        services = ?service_paths,
         "starting mcp.duxca.com gateway"
     );
 
@@ -65,19 +48,8 @@ async fn main() -> anyhow::Result<()> {
         allowed_ids,
         github,
         Arc::new(HttpClientMetadataFetcher),
-        service_paths.clone(),
         config.redirect_allowlist()?,
     ));
-
-    let mut backends = BackendRegistry::new();
-    for svc in &services {
-        let backend = StdioMcpBackend::named(
-            format!("{}/{}", svc.name, svc.version),
-            svc.command.clone(),
-            svc.cwd.clone(),
-        );
-        backends.insert(svc.path.clone(), backend);
-    }
 
     let relay = Arc::new(relay::Relay::new(
         &public_url,
@@ -86,11 +58,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(endpoint = %relay.base_url(), "relay ready (OAuth, rooms per GitHub id)");
 
     let relay_on_shutdown = relay.clone();
-    let state = AppState {
-        backends: Arc::new(backends),
-        oauth,
-        relay,
-    };
+    let state = AppState { oauth, relay };
 
     let app = router(state)
         .layer(CorsLayer::permissive())
@@ -99,8 +67,6 @@ async fn main() -> anyhow::Result<()> {
     let addr = config.listen_addr()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("listening on {addr} (Ctrl+C for graceful shutdown)");
-    // StdioMcpBackend uses kill_on_drop(true); dropping AppState on shutdown
-    // tears down MCP child processes with the gateway.
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             shutdown_signal().await;

@@ -4,7 +4,6 @@ use crate::auth::{
     is_cimd_client_id, pkce_s256, token_urlsafe, ClientMetadataFetcher, GitHubLogin,
     GitHubLoginError, OAuthServer, RedirectAllowlist,
 };
-use crate::backend::{BackendRegistry, McpBackend};
 use crate::relay::Relay;
 use crate::routes::{router, AppState};
 use async_trait::async_trait;
@@ -19,8 +18,8 @@ use url::Url;
 
 pub(crate) const PUBLIC_URL: &str = "https://demo.trycloudflare.com";
 const REDIRECT_URI: &str = "http://127.0.0.1:9/cb";
-/// テスト用の単一サービスパス（設定駆動の例）。
-const TEST_MCP_PATH: &str = "/default/v1";
+/// 保護リソースは relay だけ。
+const TEST_MCP_PATH: &str = crate::relay::PREFIX;
 
 pub(crate) fn resource() -> String {
     format!("{PUBLIC_URL}{TEST_MCP_PATH}")
@@ -60,19 +59,6 @@ impl ClientMetadataFetcher for FakeFetcher {
     }
 }
 
-struct FakeBackend;
-
-#[async_trait]
-impl McpBackend for FakeBackend {
-    async fn handle(&self, message: Value) -> Option<Value> {
-        Some(json!({
-            "jsonrpc": "2.0",
-            "id": message.get("id").cloned(),
-            "result": { "tools": [{ "name": "Bash" }] },
-        }))
-    }
-}
-
 pub(crate) struct Harness {
     pub(crate) app: Router,
     pub(crate) allowed: Arc<RwLock<HashSet<String>>>,
@@ -89,7 +75,7 @@ fn harness_with(logins: &[(&str, &str, &str)], configured: bool, cimd: Option<Va
     )
 }
 
-/// OAuth（フェイクの GitHub ログイン）+ default/v1 + relay のゲートウェイ全体。
+/// OAuth（フェイクの GitHub ログイン）+ relay のゲートウェイ全体。
 pub(crate) fn gateway(
     logins: &[(&str, &str, &str)],
     configured: bool,
@@ -109,14 +95,10 @@ pub(crate) fn gateway(
         allowed.clone(),
         Arc::new(github),
         Arc::new(FakeFetcher(cimd)),
-        vec![TEST_MCP_PATH.to_string()],
         RedirectAllowlist::default(),
     ));
     let relay = Arc::new(relay);
-    let mut backends = BackendRegistry::new();
-    backends.insert(TEST_MCP_PATH.to_string(), Arc::new(FakeBackend));
     let app = router(AppState {
-        backends: Arc::new(backends),
         oauth: oauth.clone(),
         relay: relay.clone(),
     });
@@ -421,7 +403,7 @@ async fn allowed_github_login_can_call_tools_and_refresh() {
     let (access, refresh, client_id) = issue_token(&h.app).await;
     let listed = mcp(&h.app, Some(&access), 2).await;
     assert_eq!(listed.status, StatusCode::OK, "{}", listed.body);
-    assert_eq!(listed.json()["result"]["tools"][0]["name"], "Bash");
+    assert_eq!(listed.json()["result"]["tools"][0]["name"], "send_message");
 
     let refreshed = post_form(
         &h.app,
@@ -601,17 +583,24 @@ async fn wrong_resource_is_redirected_back_with_invalid_target() {
     let h = harness();
     let client_id = register_client(&h.app).await;
     let (_verifier, challenge) = pkce();
-    let started = get(
-        &h.app,
-        &authorize_path(&client_id, &challenge, Some("https://evil.example/mcp")),
-    )
-    .await;
-    assert_eq!(started.status, StatusCode::FOUND);
-    let location = started.location();
-    assert!(location.as_str().starts_with(REDIRECT_URI));
-    let q = query(&location);
-    assert_eq!(q["error"], "invalid_target");
-    assert_eq!(q["state"], "client-state");
+    // 撤去した stdio サービスのパスも、もう保護リソースではない
+    for wrong in [
+        "https://evil.example/mcp".to_string(),
+        format!("{PUBLIC_URL}/default/v1"),
+        format!("{PUBLIC_URL}/adb/v1"),
+    ] {
+        let started = get(
+            &h.app,
+            &authorize_path(&client_id, &challenge, Some(&wrong)),
+        )
+        .await;
+        assert_eq!(started.status, StatusCode::FOUND, "{wrong}");
+        let location = started.location();
+        assert!(location.as_str().starts_with(REDIRECT_URI), "{wrong}");
+        let q = query(&location);
+        assert_eq!(q["error"], "invalid_target", "{wrong}");
+        assert_eq!(q["state"], "client-state", "{wrong}");
+    }
 }
 
 #[tokio::test]
@@ -777,113 +766,6 @@ fn github_oauth_uses_river_style_callback_and_keeps_state() {
 }
 
 #[tokio::test]
-async fn two_services_require_resource_and_isolate_tokens() {
-    let allowed = Arc::new(RwLock::new(HashSet::from(["2429307".to_string()])));
-    let github = FakeGitHub {
-        logins: HashMap::from([("ok".into(), ("2429307".into(), "legokichi".into()))]),
-        configured: true,
-    };
-    let paths = vec!["/claude/v1".to_string(), "/adb/v1".to_string()];
-    let oauth = Arc::new(OAuthServer::new(
-        PUBLIC_URL,
-        allowed,
-        Arc::new(github),
-        Arc::new(FakeFetcher(None)),
-        paths.clone(),
-        RedirectAllowlist::default(),
-    ));
-    let mut backends = BackendRegistry::new();
-    backends.insert("/claude/v1".into(), Arc::new(FakeBackend));
-    backends.insert("/adb/v1".into(), Arc::new(FakeBackend));
-    let app = router(AppState {
-        backends: Arc::new(backends),
-        oauth,
-        relay: Arc::new(Relay::new(
-            PUBLIC_URL,
-            crate::relay::DEFAULT_MAX_TOTAL_STORAGE_BYTES,
-        )),
-    });
-
-    // 複数サービス時、resource 無しの authorize は invalid_target
-    let client_id = register_client(&app).await;
-    let (_verifier, challenge) = pkce();
-    let started = get(&app, &authorize_path(&client_id, &challenge, None)).await;
-    assert_eq!(started.status, StatusCode::FOUND, "{}", started.body);
-    let q = query(&started.location());
-    assert_eq!(q["error"], "invalid_target");
-
-    // adb/v1 向けトークンは claude/v1 では 401
-    let adb_resource = format!("{PUBLIC_URL}/adb/v1");
-    let (verifier, challenge) = pkce();
-    let started = get(
-        &app,
-        &authorize_path(&client_id, &challenge, Some(&adb_resource)),
-    )
-    .await;
-    assert_eq!(started.status, StatusCode::FOUND, "{}", started.body);
-    let state = query(&started.location())["state"].clone();
-    let finished = get(
-        &app,
-        &format!(
-            "/oauth/callback/github?{}",
-            encode(&[("code", "ok"), ("state", &state)])
-        ),
-    )
-    .await;
-    assert_eq!(finished.status, StatusCode::FOUND, "{}", finished.body);
-    let code = query(&finished.location())["code"].clone();
-    let token = post_form(
-        &app,
-        "/token",
-        &[
-            ("grant_type", "authorization_code"),
-            ("code", &code),
-            ("redirect_uri", REDIRECT_URI),
-            ("client_id", &client_id),
-            ("code_verifier", &verifier),
-        ],
-    )
-    .await;
-    assert_eq!(token.status, StatusCode::OK, "{}", token.body);
-    let access = token.json()["access_token"].as_str().unwrap().to_string();
-
-    async fn mcp_at(app: &Router, path: &str, token: &str) -> Reply {
-        let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }).to_string();
-        send(
-            app,
-            Request::post(path)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                .body(Body::from(body))
-                .unwrap(),
-        )
-        .await
-    }
-
-    assert_eq!(
-        mcp_at(&app, "/adb/v1", &access).await.status,
-        StatusCode::OK
-    );
-    assert_eq!(
-        mcp_at(&app, "/claude/v1", &access).await.status,
-        StatusCode::UNAUTHORIZED
-    );
-
-    let prm = get(&app, "/.well-known/oauth-protected-resource/adb/v1").await;
-    assert_eq!(prm.status, StatusCode::OK);
-    assert_eq!(prm.json()["resource"], adb_resource);
-
-    let index = get(&app, "/.well-known/oauth-protected-resource").await;
-    assert_eq!(index.status, StatusCode::OK);
-    let index_body = index.json();
-    let resources = index_body["resources"].as_array().unwrap();
-    assert!(resources
-        .iter()
-        .any(|r| r == &json!(format!("{PUBLIC_URL}/claude/v1"))));
-    assert!(resources.iter().any(|r| r == &json!(adb_resource)));
-}
-
-#[tokio::test]
 async fn root_is_an_empty_404() {
     let h = harness();
     let r = get(&h.app, "/").await;
@@ -944,12 +826,9 @@ async fn relay_is_a_built_in_resource_and_leaves_the_gateway_alone() {
     let index = get(&h.app, "/.well-known/oauth-protected-resource")
         .await
         .json();
-    assert_eq!(
-        index["resources"],
-        json!([resource(), relay_resource.clone()])
-    );
+    assert_eq!(index["resources"], json!([relay_resource.clone()]));
 
-    // stdio サービスが 1 本なら resource 省略はこれまでどおりそのサービスに束ねる
+    // resource を省略しても relay に束ねる
     let client_id = register_client(&h.app).await;
     let (verifier, challenge) = pkce();
     let started = get(&h.app, &authorize_path(&client_id, &challenge, None)).await;
@@ -979,12 +858,26 @@ async fn relay_is_a_built_in_resource_and_leaves_the_gateway_alone() {
     let access = token.json()["access_token"].as_str().unwrap().to_string();
     assert_eq!(mcp(&h.app, Some(&access), 1).await.status, StatusCode::OK);
 
-    // relay 向けのトークンは default/v1 に通らない
-    let (relay_access, _, _) = issue_token_for(&h.app, "ok", &relay_resource).await;
-    assert_eq!(
-        mcp(&h.app, Some(&relay_access), 1).await.status,
-        StatusCode::UNAUTHORIZED
-    );
+    // stdio サービスのパスはもう無い
+    for path in ["/adb/v1", "/default/v1"] {
+        let r = send(
+            &h.app,
+            Request::post(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {access}"))
+                .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND, "{path}");
+        assert!(r.body.is_empty(), "{path}");
+        let prm = get(
+            &h.app,
+            &format!("/.well-known/oauth-protected-resource{path}"),
+        )
+        .await;
+        assert_eq!(prm.status, StatusCode::NOT_FOUND, "{path}");
+    }
 }
 
 #[test]

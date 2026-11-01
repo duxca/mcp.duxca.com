@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # mcp.duxca.com — supported run mode: foreground CLI only.
-# Ctrl+C (or SIGTERM) stops the gateway, Cloudflare Tunnel, and any MCP child processes.
+# Ctrl+C (or SIGTERM) stops the gateway and Cloudflare Tunnel.
 # No daemon / systemd / nohup.
 
 set -euo pipefail
@@ -157,7 +157,7 @@ fi
 # --- gateway (foreground wait) ---
 MCP_BIN="${MCP_BIN:-}"
 echo "starting gateway (PUBLIC_URL=${PUBLIC_URL} PORT=${PORT})…" >&2
-echo "Ctrl+C stops gateway + tunnel + MCP children. No daemon." >&2
+echo "Ctrl+C stops gateway + tunnel. No daemon." >&2
 
 if [[ -n "$MCP_BIN" ]]; then
   if [[ ! -x "$MCP_BIN" ]]; then
