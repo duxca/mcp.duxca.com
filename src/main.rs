@@ -8,7 +8,10 @@ mod tests;
 use auth::{GitHubLogin, GitHubOAuth, HttpClientMetadataFetcher, OAuthServer};
 use config::Config;
 use routes::{router, AppState};
+use std::future::IntoFuture;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
+use tokio::signal::unix::{signal, SignalKind};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
@@ -66,20 +69,33 @@ async fn main() -> anyhow::Result<()> {
 
     let addr = config.listen_addr()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("listening on {addr} (Ctrl+C for graceful shutdown)");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-            relay_on_shutdown.store.close();
-        })
-        .await?;
+    tracing::info!("listening on {addr} (Ctrl+C / SIGTERM for graceful shutdown)");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        relay_on_shutdown.store.close();
+        let _ = shutdown_tx.send(());
+    });
+    // Cloud Run は SIGTERM の 10 秒後に SIGKILL する。litestream の最終同期の時間を残すため、
+    // 処理中の要求（webhook・GitHub・CIMD の外部呼び出し）を待つのは 3 秒までにする
+    tokio::select! {
+        result = server.into_future() => result?,
+        _ = async {
+            let _ = shutdown_rx.await;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        } => tracing::warn!("graceful shutdown timed out, dropping in-flight requests"),
+    }
     tracing::info!("gateway stopped");
     Ok(())
 }
 
 async fn shutdown_signal() {
-    match tokio::signal::ctrl_c().await {
-        Ok(()) => tracing::info!("received Ctrl+C; shutting down"),
-        Err(err) => tracing::error!(%err, "failed to install Ctrl+C handler"),
+    let mut term = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+    tokio::select! {
+        r = tokio::signal::ctrl_c() => match r {
+            Ok(()) => tracing::info!("received Ctrl+C; shutting down"),
+            Err(err) => tracing::error!(%err, "failed to install Ctrl+C handler"),
+        },
+        _ = term.recv() => tracing::info!("received SIGTERM; shutting down"),
     }
 }
