@@ -31,9 +31,17 @@ pub struct Config {
     #[serde(default = "default_allowed_ids")]
     pub allowed_github_ids: String,
 
-    /// 添付の総量上限（バイト）。メモリに持つので小さめ。
+    /// 添付の総量上限（バイト）。DB に BLOB で持つので小さめ。
     #[serde(default = "default_relay_max_total_storage_bytes")]
     pub relay_max_total_storage_bytes: u64,
+
+    /// OAuth と relay を残す SQLite のファイル。相対パスは作業ディレクトリから。
+    #[serde(default = "default_database_path")]
+    pub database_path: String,
+
+    /// 未設定なら SQLite の既定のまま。Litestream と組むときは 0。
+    #[serde(default)]
+    pub sqlite_wal_autocheckpoint: Option<u32>,
 }
 
 fn default_public_url() -> String {
@@ -50,6 +58,10 @@ fn default_port() -> u16 {
 
 fn default_allowed_ids() -> String {
     "2429307".into()
+}
+
+fn default_database_path() -> String {
+    "mcp.db".into()
 }
 
 fn default_relay_max_total_storage_bytes() -> u64 {

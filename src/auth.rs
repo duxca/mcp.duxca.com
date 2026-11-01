@@ -6,16 +6,20 @@
 //! - GitHub 認可 URL は river と同じ oauth2 クレート + `/oauth/callback/github`
 //! - トークン交換は Accept: application/json の手書き POST（JSON エラーをログ可能）
 //! - 許可は GitHub の数値 id（login は改名で再利用されうるので使わない）
-//! - トークンはメモリだけ。プロセスを再起動すると消える（mcp-test と同じ）
+//! - クライアント・認可の途中・コード・トークンは SQLite（`crate::db`）に置き、再起動しても残る。
+//!   トークン・コード・state・client_secret は SHA-256 だけを保存する
 
+use crate::db::{Db, DbError};
 use async_trait::async_trait;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use rand::RngCore;
-use serde::Serialize;
+use rusqlite::{params, Connection, OptionalExtension, Row};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -38,7 +42,7 @@ pub const REFRESH_TTL: i64 = 14 * 24 * 60 * 60;
 pub const CODE_TTL: i64 = 5 * 60;
 pub const PENDING_TTL: i64 = 10 * 60;
 pub const CIMD_TTL: i64 = 5 * 60;
-/// 動的登録は誰でも叩ける。メモリを食い潰されないよう古いものから捨てる。
+/// 動的登録は誰でも叩ける。DB を食い潰されないよう古いものから捨てる。
 pub const MAX_CLIENTS: usize = 1000;
 const USER_AGENT: &str = "duxca-mcp";
 const JWT_BEARER_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
@@ -65,6 +69,24 @@ fn token_hex() -> String {
 
 pub fn pkce_s256(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+}
+
+/// 保存と照合に使う SHA-256 の hex。照合しかしない値は平文で置かない。
+fn sha256_hex(value: &str) -> String {
+    Sha256::digest(value.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn to_json(value: &impl Serialize) -> rusqlite::Result<String> {
+    serde_json::to_string(value).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+}
+
+fn from_json<T: DeserializeOwned>(raw: &str) -> rusqlite::Result<T> {
+    serde_json::from_str(raw).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -602,11 +624,14 @@ impl ClientMetadataFetcher for HttpClientMetadataFetcher {
 // ---------------------------------------------------------------------------
 // クライアント
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ClientRecord {
     pub client_id: String,
+    /// 平文は登録の応答で 1 回だけ返す。DB には入れない（`secret_sha256` だけを置く）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_secret: Option<String>,
+    #[serde(skip)]
+    pub secret_sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_id_issued_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -813,6 +838,7 @@ pub fn client_from_registration(
     Ok(ClientRecord {
         client_id: uuid::Uuid::new_v4().to_string(),
         client_secret_expires_at: client_secret.as_ref().map(|_| 0),
+        secret_sha256: client_secret.as_deref().map(sha256_hex),
         client_secret,
         client_id_issued_at: Some(issued_at),
         redirect_uris,
@@ -873,6 +899,7 @@ pub fn client_from_cimd(
     Some(ClientRecord {
         client_id: url.to_string(),
         client_secret: None,
+        secret_sha256: None,
         client_id_issued_at: None,
         client_secret_expires_at: None,
         redirect_uris,
@@ -892,7 +919,7 @@ pub fn client_from_cimd(
 // ---------------------------------------------------------------------------
 // 保存物
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AuthorizationParams {
     pub state: Option<String>,
     pub scopes: Vec<String>,
@@ -910,7 +937,6 @@ struct Pending {
 
 #[derive(Clone)]
 pub struct AuthorizationCode {
-    pub client_id: String,
     pub scopes: Vec<String>,
     pub expires_at: i64,
     pub code_challenge: String,
@@ -922,7 +948,6 @@ pub struct AuthorizationCode {
 
 #[derive(Clone)]
 pub struct IssuedToken {
-    pub client_id: String,
     pub scopes: Vec<String>,
     pub expires_at: i64,
     pub resource: String,
@@ -939,38 +964,19 @@ pub struct OAuthToken {
     pub refresh_token: String,
 }
 
-#[derive(Default)]
-struct Store {
-    clients: HashMap<String, ClientRecord>,
-    client_order: VecDeque<String>,
-    cimd_cache: HashMap<String, (i64, ClientRecord)>,
-    pending: HashMap<String, Pending>,
-    codes: HashMap<String, AuthorizationCode>,
-    access_tokens: HashMap<String, IssuedToken>,
-    refresh_tokens: HashMap<String, IssuedToken>,
-    refresh_to_access: HashMap<String, String>,
+/// `oauth_tokens` の行（scopes, expires_at, resource, subject の順に選ぶ）。
+fn issued_token(r: &Row) -> rusqlite::Result<IssuedToken> {
+    Ok(IssuedToken {
+        scopes: from_json(&r.get::<_, String>(0)?)?,
+        expires_at: r.get(1)?,
+        resource: r.get(2)?,
+        subject: r.get(3)?,
+    })
 }
 
-impl Store {
-    fn purge(&mut self, now: i64) {
-        self.cimd_cache.retain(|_, (exp, _)| *exp > now);
-        self.pending.retain(|_, p| p.expires_at >= now);
-        self.codes.retain(|_, c| c.expires_at >= now);
-        self.access_tokens.retain(|_, t| t.expires_at >= now);
-        let expired: Vec<String> = self
-            .refresh_tokens
-            .iter()
-            .filter(|(_, t)| t.expires_at < now)
-            .map(|(k, _)| k.clone())
-            .collect();
-        for token in expired {
-            self.refresh_tokens.remove(&token);
-            if let Some(access) = self.refresh_to_access.remove(&token) {
-                self.access_tokens.remove(&access);
-            }
-        }
-    }
-}
+const INSERT_TOKEN: &str = "INSERT INTO oauth_tokens \
+    (token_sha256, kind, client_id, subject, resource, scopes, issued_at, expires_at, access_sha256) \
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
 
 // ---------------------------------------------------------------------------
 // エラー
@@ -1011,7 +1017,9 @@ pub struct OAuthServer {
     pub github: Arc<dyn GitHubLogin>,
     pub redirect_allowlist: RedirectAllowlist,
     fetcher: Arc<dyn ClientMetadataFetcher>,
-    store: Mutex<Store>,
+    db: Db,
+    /// CIMD は取り直せるのでメモリだけに置く。
+    cimd_cache: Mutex<HashMap<String, (i64, ClientRecord)>>,
 }
 
 impl OAuthServer {
@@ -1021,6 +1029,7 @@ impl OAuthServer {
         github: Arc<dyn GitHubLogin>,
         fetcher: Arc<dyn ClientMetadataFetcher>,
         redirect_allowlist: RedirectAllowlist,
+        db: Db,
     ) -> Self {
         let issuer = issuer.trim_end_matches('/').to_string();
         let resource_url = format!("{issuer}{}", crate::relay::PREFIX);
@@ -1031,7 +1040,8 @@ impl OAuthServer {
             github,
             redirect_allowlist,
             fetcher,
-            store: Mutex::new(Store::default()),
+            db,
+            cimd_cache: Mutex::default(),
         }
     }
 
@@ -1043,8 +1053,21 @@ impl OAuthServer {
         )
     }
 
-    fn store(&self) -> std::sync::MutexGuard<'_, Store> {
-        self.store.lock().unwrap_or_else(|e| e.into_inner())
+    fn cimd_cache(&self) -> std::sync::MutexGuard<'_, HashMap<String, (i64, ClientRecord)>> {
+        self.cimd_cache.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 期限切れを消す。期限切れの refresh は対の access も消す。
+    fn purge(&self, tx: &Connection, now: i64) -> rusqlite::Result<()> {
+        self.cimd_cache().retain(|_, (exp, _)| *exp > now);
+        tx.execute("DELETE FROM oauth_pending WHERE expires_at < ?1", [now])?;
+        tx.execute("DELETE FROM oauth_codes WHERE expires_at < ?1", [now])?;
+        tx.execute(
+            "DELETE FROM oauth_tokens WHERE expires_at < ?1 OR token_sha256 IN \
+             (SELECT access_sha256 FROM oauth_tokens WHERE kind = 'refresh' AND expires_at < ?1)",
+            [now],
+        )?;
+        Ok(())
     }
 
     /// subject は GitHub の数値 id。login は改名で再利用されうるので照合に使わない。
@@ -1096,49 +1119,66 @@ impl OAuthServer {
         })
     }
 
-    pub async fn get_client(&self, client_id: &str) -> Option<ClientRecord> {
+    pub async fn get_client(&self, client_id: &str) -> Result<Option<ClientRecord>, DbError> {
         let now = now();
-        {
-            let store = self.store();
-            if let Some(found) = store.clients.get(client_id) {
-                return Some(found.clone());
-            }
-            if !is_cimd_client_id(client_id) {
-                return None;
-            }
-            if let Some((exp, client)) = store.cimd_cache.get(client_id) {
-                if *exp > now {
-                    return Some(client.clone());
-                }
+        let stored = self.db.read(|c| {
+            c.query_row(
+                "SELECT record, secret_sha256 FROM oauth_clients WHERE client_id = ?1",
+                [client_id],
+                |r| {
+                    let mut client: ClientRecord = from_json(&r.get::<_, String>(0)?)?;
+                    client.secret_sha256 = r.get(1)?;
+                    Ok(client)
+                },
+            )
+            .optional()
+        })?;
+        if stored.is_some() {
+            return Ok(stored);
+        }
+        if !is_cimd_client_id(client_id) {
+            return Ok(None);
+        }
+        if let Some((exp, client)) = self.cimd_cache().get(client_id) {
+            if *exp > now {
+                return Ok(Some(client.clone()));
             }
         }
         let document = match self.fetcher.fetch(client_id).await {
             Ok(doc) => doc,
             Err(_) => {
                 tracing::info!("cimd fetch failed {client_id}");
-                return None;
+                return Ok(None);
             }
         };
         let Some(client) = client_from_cimd(client_id, &document, &self.redirect_allowlist) else {
             tracing::info!("cimd document rejected {client_id}");
-            return None;
+            return Ok(None);
         };
-        self.store()
-            .cimd_cache
+        self.cimd_cache()
             .insert(client_id.to_string(), (now + CIMD_TTL, client.clone()));
-        Some(client)
+        Ok(Some(client))
     }
 
-    pub fn register_client(&self, client: ClientRecord) {
-        let mut store = self.store();
-        while store.clients.len() >= MAX_CLIENTS {
-            let Some(oldest) = store.client_order.pop_front() else {
-                break;
-            };
-            store.clients.remove(&oldest);
-        }
-        store.client_order.push_back(client.client_id.clone());
-        store.clients.insert(client.client_id.clone(), client);
+    pub fn register_client(&self, client: ClientRecord) -> Result<(), DbError> {
+        let record = to_json(&ClientRecord {
+            client_secret: None,
+            ..client.clone()
+        })?;
+        self.db.write(|tx| {
+            // 入れたあとも MAX_CLIENTS 件に収まるよう、古い順に捨てる
+            tx.execute(
+                "DELETE FROM oauth_clients WHERE client_id IN (SELECT client_id FROM oauth_clients \
+                 ORDER BY registered_at, rowid LIMIT max(0, (SELECT COUNT(*) FROM oauth_clients) - ?1))",
+                [MAX_CLIENTS as i64 - 1],
+            )?;
+            tx.execute(
+                "INSERT INTO oauth_clients (client_id, secret_sha256, record, registered_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![client.client_id, client.secret_sha256, record, now()],
+            )?;
+            Ok(())
+        })
     }
 
     fn normalize_resource_key(url: &str) -> String {
@@ -1169,25 +1209,31 @@ impl OAuthServer {
         &self,
         client: &ClientRecord,
         params: AuthorizationParams,
-    ) -> Result<String, AuthorizeError> {
-        self.bound_resource(params.resource.as_deref())?;
+    ) -> Result<Result<String, AuthorizeError>, DbError> {
+        if let Err(e) = self.bound_resource(params.resource.as_deref()) {
+            return Ok(Err(e));
+        }
         if !self.github.configured() {
-            return Ok(format!("{}{GITHUB_SETUP_PATH}", self.issuer));
+            return Ok(Ok(format!("{}{GITHUB_SETUP_PATH}", self.issuer)));
         }
         let state = token_urlsafe();
         let now = now();
-        let mut store = self.store();
-        store.purge(now);
-        store.pending.insert(
-            state.clone(),
-            Pending {
-                client_id: client.client_id.clone(),
-                params,
-                expires_at: now + PENDING_TTL,
-            },
-        );
-        drop(store);
-        Ok(self.github.authorization_url(&state))
+        let params = to_json(&params)?;
+        self.db.write(|tx| -> rusqlite::Result<()> {
+            self.purge(tx, now)?;
+            tx.execute(
+                "INSERT INTO oauth_pending (state_sha256, client_id, params, expires_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    sha256_hex(&state),
+                    client.client_id,
+                    params,
+                    now + PENDING_TTL
+                ],
+            )?;
+            Ok(())
+        })?;
+        Ok(Ok(self.github.authorization_url(&state)))
     }
 
     pub async fn complete_github_callback(
@@ -1195,148 +1241,211 @@ impl OAuthServer {
         code: Option<&str>,
         state: Option<&str>,
         error: Option<&str>,
-    ) -> CallbackOutcome {
-        let pending = state.and_then(|s| self.store().pending.remove(s));
+    ) -> Result<CallbackOutcome, DbError> {
+        let pending = match state {
+            Some(state) => self.db.write(|tx| {
+                tx.query_row(
+                    "DELETE FROM oauth_pending WHERE state_sha256 = ?1 \
+                     RETURNING client_id, params, expires_at",
+                    [sha256_hex(state)],
+                    |r| {
+                        Ok(Pending {
+                            client_id: r.get(0)?,
+                            params: from_json(&r.get::<_, String>(1)?)?,
+                            expires_at: r.get(2)?,
+                        })
+                    },
+                )
+                .optional()
+            })?,
+            None => None,
+        };
         let Some(pending) = pending.filter(|p| p.expires_at >= now()) else {
-            return CallbackOutcome::Text(
+            return Ok(CallbackOutcome::Text(
                 400,
                 "認可の手続きが見つからない。\n接続をやり直す。\n".into(),
-            );
+            ));
         };
         let code = match (error, code) {
             (None, Some(code)) if !code.is_empty() => code,
             _ => {
-                return CallbackOutcome::Text(
+                return Ok(CallbackOutcome::Text(
                     400,
                     "GitHub の認可が完了していない。\n接続をやり直す。\n".into(),
-                )
+                ))
             }
         };
         let (user_id, login) = match self.github.login_for_code(code).await {
             Ok(found) => found,
             Err(_) => {
-                return CallbackOutcome::Text(
+                return Ok(CallbackOutcome::Text(
                     502,
                     "GitHub からアカウントを取れなかった。\n接続をやり直す。\n".into(),
-                )
+                ))
             }
         };
         if !self.allows(&user_id) {
             tracing::info!("github login denied {login} (id {user_id})");
-            return CallbackOutcome::Text(
+            return Ok(CallbackOutcome::Text(
                 403,
                 format!(
                     "この GitHub アカウントは許可されていない。\nlogin: {login}\nid: {user_id}\n"
                 ),
-            );
+            ));
         }
         let resource = match self.bound_resource(pending.params.resource.as_deref()) {
             Ok(r) => r,
-            Err(e) => return CallbackOutcome::Text(400, format!("{}\n", e.description)),
+            Err(e) => return Ok(CallbackOutcome::Text(400, format!("{}\n", e.description))),
         };
         let issued = token_urlsafe();
         let now = now();
-        {
-            let mut store = self.store();
-            store.purge(now);
-            store.codes.insert(
-                issued.clone(),
-                AuthorizationCode {
-                    client_id: pending.client_id.clone(),
-                    scopes: pending.params.scopes.clone(),
-                    expires_at: now + CODE_TTL,
-                    code_challenge: pending.params.code_challenge.clone(),
-                    redirect_uri: pending.params.redirect_uri.clone(),
-                    redirect_uri_provided_explicitly: pending
-                        .params
-                        .redirect_uri_provided_explicitly,
+        let p = &pending.params;
+        let scopes = to_json(&p.scopes)?;
+        self.db.write(|tx| -> rusqlite::Result<()> {
+            self.purge(tx, now)?;
+            tx.execute(
+                "INSERT INTO oauth_codes (code_sha256, client_id, subject, resource, scopes, \
+                 code_challenge, redirect_uri, redirect_uri_provided_explicitly, expires_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    sha256_hex(&issued),
+                    pending.client_id,
+                    user_id,
                     resource,
-                    subject: user_id.clone(),
-                },
-            );
-        }
+                    scopes,
+                    p.code_challenge,
+                    p.redirect_uri,
+                    p.redirect_uri_provided_explicitly,
+                    now + CODE_TTL,
+                ],
+            )?;
+            Ok(())
+        })?;
         tracing::info!("github login allowed {login} (id {user_id})");
-        CallbackOutcome::Redirect(construct_redirect_uri(
-            &pending.params.redirect_uri,
+        Ok(CallbackOutcome::Redirect(construct_redirect_uri(
+            &p.redirect_uri,
             &[
                 ("code", Some(issued.as_str())),
-                ("state", pending.params.state.as_deref()),
+                ("state", p.state.as_deref()),
             ],
-        ))
+        )))
     }
 
-    /// クライアントが一致すれば取り出す（一度きり）。
+    /// クライアントが一致すれば取り出す（一度きり。1 文の DELETE ... RETURNING で取る）。
     pub fn load_authorization_code(
         &self,
         client: &ClientRecord,
         code: &str,
-    ) -> Option<AuthorizationCode> {
-        let mut store = self.store();
-        match store.codes.get(code) {
-            Some(found) if found.client_id == client.client_id => store.codes.remove(code),
-            _ => None,
-        }
+    ) -> Result<Option<AuthorizationCode>, DbError> {
+        let found = self.db.write(|tx| {
+            tx.query_row(
+                "DELETE FROM oauth_codes WHERE code_sha256 = ?1 AND client_id = ?2 \
+                 RETURNING scopes, expires_at, code_challenge, redirect_uri, \
+                 redirect_uri_provided_explicitly, resource, subject",
+                params![sha256_hex(code), client.client_id],
+                |r| {
+                    Ok(AuthorizationCode {
+                        scopes: from_json(&r.get::<_, String>(0)?)?,
+                        expires_at: r.get(1)?,
+                        code_challenge: r.get(2)?,
+                        redirect_uri: r.get(3)?,
+                        redirect_uri_provided_explicitly: r.get(4)?,
+                        resource: r.get(5)?,
+                        subject: r.get(6)?,
+                    })
+                },
+            )
+            .optional()
+        })?;
+        Ok(found)
     }
 
     pub fn exchange_authorization_code(
         &self,
         client: &ClientRecord,
         code: &AuthorizationCode,
-    ) -> Result<OAuthToken, TokenError> {
+    ) -> Result<Result<OAuthToken, TokenError>, DbError> {
         if code.subject.is_empty() || !self.allows(&code.subject) {
-            return Err(TokenError::new(
+            return Ok(Err(TokenError::new(
                 "invalid_grant",
                 "github login is not allowed",
-            ));
+            )));
         }
-        Ok(self.issue(
-            &client.client_id,
-            code.scopes.clone(),
-            &code.subject,
-            &code.resource,
-        ))
+        let token = self.db.write(|tx| {
+            self.issue(
+                tx,
+                &client.client_id,
+                code.scopes.clone(),
+                &code.subject,
+                &code.resource,
+            )
+        })?;
+        Ok(Ok(token))
     }
 
-    pub fn load_refresh_token(&self, client: &ClientRecord, token: &str) -> Option<IssuedToken> {
-        self.store()
-            .refresh_tokens
-            .get(token)
-            .filter(|t| t.client_id == client.client_id)
-            .cloned()
+    pub fn load_refresh_token(
+        &self,
+        client: &ClientRecord,
+        token: &str,
+    ) -> Result<Option<IssuedToken>, DbError> {
+        let found = self.db.read(|c| {
+            c.query_row(
+                "SELECT scopes, expires_at, resource, subject FROM oauth_tokens \
+                 WHERE token_sha256 = ?1 AND kind = 'refresh' AND client_id = ?2",
+                params![sha256_hex(token), client.client_id],
+                issued_token,
+            )
+            .optional()
+        })?;
+        Ok(found)
     }
 
+    /// 古い refresh（と対の access）を消して新しい組を入れるまでを 1 つのトランザクションで行う。
     pub fn exchange_refresh_token(
         &self,
         client: &ClientRecord,
         refresh_token: &str,
         scopes: Vec<String>,
-    ) -> Result<OAuthToken, TokenError> {
-        let current = {
-            let mut store = self.store();
-            let current = store.refresh_tokens.remove(refresh_token);
-            let Some(current) = current.filter(|c| c.client_id == client.client_id) else {
-                return Err(TokenError::new(
+    ) -> Result<Result<OAuthToken, TokenError>, DbError> {
+        let outcome = self.db.write(|tx| -> rusqlite::Result<_> {
+            let current = tx
+                .query_row(
+                    "DELETE FROM oauth_tokens \
+                     WHERE token_sha256 = ?1 AND kind = 'refresh' AND client_id = ?2 \
+                     RETURNING scopes, expires_at, resource, subject, access_sha256",
+                    params![sha256_hex(refresh_token), client.client_id],
+                    |r| Ok((issued_token(r)?, r.get::<_, Option<String>>(4)?)),
+                )
+                .optional()?;
+            let Some((current, old_access)) = current else {
+                return Ok(Err(TokenError::new(
                     "invalid_grant",
                     "refresh token does not exist",
-                ));
+                )));
             };
-            if let Some(old_access) = store.refresh_to_access.remove(refresh_token) {
-                store.access_tokens.remove(&old_access);
+            if let Some(old_access) = old_access {
+                tx.execute(
+                    "DELETE FROM oauth_tokens WHERE token_sha256 = ?1 AND kind = 'access'",
+                    [old_access],
+                )?;
             }
-            current
-        };
-        if current.subject.is_empty() || !self.allows(&current.subject) {
-            return Err(TokenError::new(
-                "invalid_grant",
-                "github login is not allowed",
-            ));
-        }
-        Ok(self.issue(
-            &client.client_id,
-            scopes,
-            &current.subject,
-            &current.resource,
-        ))
+            // 許可から外れていても、古い組は消したままにする
+            if current.subject.is_empty() || !self.allows(&current.subject) {
+                return Ok(Err(TokenError::new(
+                    "invalid_grant",
+                    "github login is not allowed",
+                )));
+            }
+            self.issue(
+                tx,
+                &client.client_id,
+                scopes,
+                &current.subject,
+                &current.resource,
+            )
+            .map(Ok)
+        })?;
+        Ok(outcome)
     }
 
     /// Bearer を照合する。期限・許可 id・resource（RFC 8707）を見る。
@@ -1345,18 +1454,21 @@ impl OAuthServer {
         &self,
         token: &str,
         expected_resource_url: &str,
-    ) -> Option<IssuedToken> {
-        let found = {
-            let mut store = self.store();
-            let found = store.access_tokens.get(token)?.clone();
-            if found.expires_at < now() {
-                store.access_tokens.remove(token);
-                return None;
-            }
-            found
+    ) -> Result<Option<IssuedToken>, DbError> {
+        let found = self.db.read(|c| {
+            c.query_row(
+                "SELECT scopes, expires_at, resource, subject FROM oauth_tokens \
+                 WHERE token_sha256 = ?1 AND kind = 'access' AND expires_at >= ?2",
+                params![sha256_hex(token), now()],
+                issued_token,
+            )
+            .optional()
+        })?;
+        let Some(found) = found else {
+            return Ok(None);
         };
         if found.subject.is_empty() || !self.allows(&found.subject) {
-            return None;
+            return Ok(None);
         }
         let same_resource = Self::normalize_resource_key(&found.resource)
             == Self::normalize_resource_key(expected_resource_url);
@@ -1366,48 +1478,60 @@ impl OAuthServer {
                 token_resource = %found.resource,
                 "bearer token resource does not match this MCP path"
             );
-            return None;
+            return Ok(None);
         }
-        Some(found)
+        Ok(Some(found))
     }
 
     fn issue(
         &self,
+        tx: &Connection,
         client_id: &str,
         scopes: Vec<String>,
         subject: &str,
         resource: &str,
-    ) -> OAuthToken {
+    ) -> rusqlite::Result<OAuthToken> {
         let now = now();
         let access_token = token_urlsafe();
         let refresh_token = token_urlsafe();
-        let base = IssuedToken {
-            client_id: client_id.to_string(),
-            scopes: scopes.clone(),
-            expires_at: now + ACCESS_TTL,
-            resource: resource.to_string(),
-            subject: subject.to_string(),
-        };
-        let refresh = IssuedToken {
-            expires_at: now + REFRESH_TTL,
-            ..base.clone()
-        };
-        {
-            let mut store = self.store();
-            store.purge(now);
-            store.access_tokens.insert(access_token.clone(), base);
-            store.refresh_tokens.insert(refresh_token.clone(), refresh);
-            store
-                .refresh_to_access
-                .insert(refresh_token.clone(), access_token.clone());
-        }
-        OAuthToken {
+        let access_sha256 = sha256_hex(&access_token);
+        let scopes_json = to_json(&scopes)?;
+        self.purge(tx, now)?;
+        tx.execute(
+            INSERT_TOKEN,
+            params![
+                access_sha256,
+                "access",
+                client_id,
+                subject,
+                resource,
+                scopes_json,
+                now,
+                now + ACCESS_TTL,
+                None::<String>,
+            ],
+        )?;
+        tx.execute(
+            INSERT_TOKEN,
+            params![
+                sha256_hex(&refresh_token),
+                "refresh",
+                client_id,
+                subject,
+                resource,
+                scopes_json,
+                now,
+                now + REFRESH_TTL,
+                access_sha256,
+            ],
+        )?;
+        Ok(OAuthToken {
             access_token,
             token_type: "Bearer",
             expires_in: ACCESS_TTL,
             scope: (!scopes.is_empty()).then(|| scopes.join(" ")),
             refresh_token,
-        }
+        })
     }
 
     /// /token のクライアント認証（SDK の ClientAuthenticator 相当）。
@@ -1415,59 +1539,70 @@ impl OAuthServer {
         &self,
         form: &HashMap<String, String>,
         authorization: Option<&str>,
-    ) -> Result<ClientRecord, String> {
+    ) -> Result<Result<ClientRecord, String>, DbError> {
         let Some(client_id) = form.get("client_id").filter(|s| !s.is_empty()) else {
-            return Err("Missing client_id".into());
+            return Ok(Err("Missing client_id".into()));
         };
-        let Some(client) = self.get_client(client_id).await else {
-            return Err("Invalid client_id".into());
-        };
-        let request_secret: Option<String> = match client.token_endpoint_auth_method.as_str() {
-            "client_secret_basic" => {
-                let header = authorization.unwrap_or("");
-                let Some(encoded) = header.strip_prefix("Basic ") else {
-                    return Err(
-                        "Missing or invalid Basic authentication in Authorization header".into(),
-                    );
-                };
-                let decoded = STANDARD
-                    .decode(encoded.trim())
-                    .ok()
-                    .and_then(|b| String::from_utf8(b).ok())
-                    .ok_or_else(|| "Invalid Basic authentication header".to_string())?;
-                let Some((basic_id, secret)) = decoded.split_once(':') else {
-                    return Err("Invalid Basic authentication header".into());
-                };
-                let basic_id = percent_unquote(basic_id);
-                let secret = percent_unquote(secret);
-                if basic_id != *client_id {
-                    return Err("Client ID mismatch in Basic auth".into());
-                }
-                Some(secret)
+        Ok(match self.get_client(client_id).await? {
+            Some(client) => {
+                verify_client_secret(&client, client_id, form, authorization).map(|()| client)
             }
-            "client_secret_post" => form.get("client_secret").cloned(),
-            "none" => None,
-            other => return Err(format!("Unsupported auth method: {other}")),
-        };
-        if client.token_endpoint_auth_method != "none" && client.client_secret.is_none() {
-            return Err(
-                "Client is registered for secret-based authentication but has no stored secret"
-                    .into(),
-            );
-        }
-        if let Some(stored) = &client.client_secret {
-            let Some(given) = request_secret.filter(|s| !s.is_empty()) else {
-                return Err("Client secret is required".into());
-            };
-            if !constant_time_eq(stored.as_bytes(), given.as_bytes()) {
-                return Err("Invalid client_secret".into());
-            }
-            if let Some(exp) = client.client_secret_expires_at {
-                if exp != 0 && exp < now() {
-                    return Err("Client secret has expired".into());
-                }
-            }
-        }
-        Ok(client)
+            None => Err("Invalid client_id".into()),
+        })
     }
+}
+
+/// 受け取った client_secret をハッシュにして、保存したハッシュと定数時間で比べる。
+fn verify_client_secret(
+    client: &ClientRecord,
+    client_id: &str,
+    form: &HashMap<String, String>,
+    authorization: Option<&str>,
+) -> Result<(), String> {
+    let request_secret: Option<String> = match client.token_endpoint_auth_method.as_str() {
+        "client_secret_basic" => {
+            let header = authorization.unwrap_or("");
+            let Some(encoded) = header.strip_prefix("Basic ") else {
+                return Err(
+                    "Missing or invalid Basic authentication in Authorization header".into(),
+                );
+            };
+            let decoded = STANDARD
+                .decode(encoded.trim())
+                .ok()
+                .and_then(|b| String::from_utf8(b).ok())
+                .ok_or_else(|| "Invalid Basic authentication header".to_string())?;
+            let Some((basic_id, secret)) = decoded.split_once(':') else {
+                return Err("Invalid Basic authentication header".into());
+            };
+            let basic_id = percent_unquote(basic_id);
+            let secret = percent_unquote(secret);
+            if basic_id != *client_id {
+                return Err("Client ID mismatch in Basic auth".into());
+            }
+            Some(secret)
+        }
+        "client_secret_post" => form.get("client_secret").cloned(),
+        "none" => None,
+        other => return Err(format!("Unsupported auth method: {other}")),
+    };
+    if client.token_endpoint_auth_method != "none" && client.secret_sha256.is_none() {
+        return Err(
+            "Client is registered for secret-based authentication but has no stored secret".into(),
+        );
+    }
+    if let Some(stored) = &client.secret_sha256 {
+        let Some(given) = request_secret.filter(|s| !s.is_empty()) else {
+            return Err("Client secret is required".into());
+        };
+        if !constant_time_eq(stored.as_bytes(), sha256_hex(&given).as_bytes()) {
+            return Err("Invalid client_secret".into());
+        }
+        if let Some(exp) = client.client_secret_expires_at {
+            if exp != 0 && exp < now() {
+                return Err("Client secret has expired".into());
+            }
+        }
+    }
+    Ok(())
 }

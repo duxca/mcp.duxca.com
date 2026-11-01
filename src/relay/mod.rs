@@ -3,7 +3,8 @@
 //! - MCP エンドポイントは `POST {PUBLIC_URL}/relay/v1` の 1 本。認証はゲートウェイの OAuth のみ。
 //! - 「部屋」は OAuth の subject（GitHub 数値 id）。同じアカウントのトークンなら同じ部屋を共有する。
 //! - エージェント名と起床用 webhook は呼び出し側の自己申告（`agent` / `to` / `register_agent`）。
-//! - ストアはメモリのみ。保存量・同時待機・同時 webhook・バッチには上限がある（`Limits` など）。
+//! - ストアは SQLite（再起動しても残る）。メッセージと添付は `RETENTION_DAYS` 日で消える。
+//!   保存量・同時待機・同時 webhook・バッチには上限がある（`Limits` など）。
 //! - 会話ログは tracing の info で出す（webhook の値と添付の中身は出さない）。
 
 mod docs;
@@ -15,6 +16,7 @@ mod store;
 mod tests;
 mod webhook;
 
+use crate::db::Db;
 use serde_json::{Map, Value};
 use std::sync::Arc;
 
@@ -48,6 +50,14 @@ impl RelayError {
     }
 }
 
+/// DB の失敗。中身はログにだけ出す。
+impl From<rusqlite::Error> for RelayError {
+    fn from(e: rusqlite::Error) -> Self {
+        tracing::error!(error = %e, "relay: storage failed");
+        Self::new(503, "the relay's storage failed; try again later")
+    }
+}
+
 pub struct Relay {
     pub store: Store,
     webhook: Webhook,
@@ -57,16 +67,17 @@ pub struct Relay {
 
 impl Relay {
     /// `max_total_storage_bytes` は全部屋の添付の上限。他の上限は `Limits` の既定値。
-    pub fn new(public_url: &str, max_total_storage_bytes: u64) -> Self {
+    pub fn new(public_url: &str, max_total_storage_bytes: u64, db: Db) -> Self {
         Self::with_limits(
             public_url,
             Limits::with_total_attachment_bytes(max_total_storage_bytes),
+            db,
         )
     }
 
-    pub fn with_limits(public_url: &str, limits: Limits) -> Self {
+    pub fn with_limits(public_url: &str, limits: Limits, db: Db) -> Self {
         Self {
-            store: Store::new(limits),
+            store: Store::new(limits, db),
             webhook: Webhook::new(),
             origin: public_url.trim_end_matches('/').to_string(),
         }

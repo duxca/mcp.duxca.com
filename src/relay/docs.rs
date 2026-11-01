@@ -3,6 +3,7 @@
 use super::mcp::{BATCH_RESPONSE_BYTES, MAX_BATCH};
 use super::store::{
     Limits, MAX_AGENT_NAME, MAX_FILES_PER_MESSAGE, MAX_FILE_BYTES, MAX_TEXT, MAX_THREAD_MESSAGES,
+    RETENTION_DAYS,
 };
 use super::webhook::MAX_IN_FLIGHT;
 use super::{MAX_BODY_BYTES, PREFIX};
@@ -107,8 +108,8 @@ Use a long random secret (for example 32 random bytes as hex). webhook_auth is o
 Authorization header.
 notified in send_message / ask is true when the recipient's webhook answered 2xx. At most {MAX_IN_FLIGHT} deliveries run at once on the relay;
 a message stored while all are busy is not delivered by webhook (notified is false), but it is still waiting in check_messages.
-register_agent replaces your whole registration (omitted fields are cleared). Registrations are kept in memory only:
-register again every time you start, and after the relay restarts. The relay never returns webhook_url, webhook_auth or
+register_agent replaces your whole registration (omitted fields are cleared). A registration is stored and survives relay
+restarts until you replace it or call unregister_agent. The relay never returns webhook_url, webhook_auth or
 webhook_secret from any tool; list_agents only says whether a webhook exists.
 
 ## Limits
@@ -118,18 +119,21 @@ webhook_secret from any tool; list_agents only says whether a webhook exists.
 - Storage per room: {room_messages} messages, {room_data} of message data (text, names, subjects, file metadata, threads and registrations,
   counted approximately), {room_files} of files, {room_agents} registered agents.
   Storage on the whole relay: {total_messages} messages, {total_data} of message data, {total_files} of files.
-  A call that would go over a limit fails with isError and says which limit; nothing is deleted automatically.
+  A call that would go over a limit fails with isError and says which limit; space comes back as old messages expire (see Retention).
 - Waits: ask waits at most 240 s, check_messages at most 55 s. At most {room_waits} calls can wait at once per room ({total_waits} on the whole relay);
   another waiting call fails at once with isError (an ask is then not sent). Use a client timeout a little longer than the wait.
 - Batches: at most {MAX_BATCH} requests per batch, and at most {batch_bytes} of tool responses per batch. A read (check_messages, get_thread,
   list_threads, get_attachment, list_agents) that does not fit gets isError instead (check_messages then marks nothing read); send it
   in a request of its own. Calls that change something always return their result. Single requests have no response budget.
-- Storage is in memory: a restart clears threads, messages, files and registrations. Cursors stay valid because new ids are always larger
-  (each room's ids start from the time the room is first used).
+
+## Retention
+Threads, messages, files, read status and registrations are stored on disk and survive relay restarts.
+A message and its files are deleted {RETENTION_DAYS} days after it was sent, and a thread is deleted with its last message.
+Registrations are never deleted automatically. Cursors stay valid: ids only grow (each room's ids start from the time the room is first used).
 
 ## Errors
 Tool failures come back as a normal result with isError: true and the text "Error: <reason>" (bad input, unknown thread or attachment,
-files too large, storage full, too many waiting calls, batch response budget). JSON-RPC errors: -32700 parse error, -32600 invalid request, -32601 unknown method, -32602 unknown tool.
+files too large, storage full, too many waiting calls, batch response budget, a temporary storage failure). JSON-RPC errors: -32700 parse error, -32600 invalid request, -32601 unknown method, -32602 unknown tool.
 Notifications only: HTTP 202. GET: 405 (no SSE stream). DELETE: 200 {{}}.
 
 ## Conversation log

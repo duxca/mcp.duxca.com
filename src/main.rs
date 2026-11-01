@@ -1,5 +1,6 @@
 mod auth;
 mod config;
+mod db;
 mod relay;
 mod routes;
 #[cfg(test)]
@@ -43,8 +44,10 @@ async fn main() -> anyhow::Result<()> {
         %public_url,
         port = config.port,
         allowed = ?allowed_ids.read().ok().as_deref(),
+        database = %config.database_path,
         "starting mcp.duxca.com gateway"
     );
+    let db = db::Db::open(&config.database_path, config.sqlite_wal_autocheckpoint)?;
 
     let oauth = Arc::new(OAuthServer::new(
         &public_url,
@@ -52,11 +55,13 @@ async fn main() -> anyhow::Result<()> {
         github,
         Arc::new(HttpClientMetadataFetcher),
         config.redirect_allowlist()?,
+        db.clone(),
     ));
 
     let relay = Arc::new(relay::Relay::new(
         &public_url,
         config.relay_max_total_storage_bytes,
+        db,
     ));
     tracing::info!(endpoint = %relay.base_url(), "relay ready (OAuth, rooms per GitHub id)");
 
