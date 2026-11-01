@@ -5,10 +5,9 @@ use crate::auth::{
     ClientRecord, IssuedToken, OAuthServer, TokenError, AUTHORIZATION_PATH, GITHUB_SETUP_PATH,
     REDIRECT_PATH, REGISTRATION_PATH, TOKEN_PATH,
 };
-use crate::backend::BackendRegistry;
 use crate::relay::Relay;
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, RawQuery, Request, State};
+use axum::extract::{DefaultBodyLimit, RawQuery, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
@@ -19,9 +18,6 @@ use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct AppState {
-    /// パス (`/name/version`) → バックエンド
-    pub backends: Arc<BackendRegistry>,
-    /// 登録順のサービスパス一覧
     pub oauth: Arc<OAuthServer>,
     /// `/relay/v1`（常時有効。OAuth の subject ごとに部屋を分ける）
     pub relay: Arc<Relay>,
@@ -30,9 +26,6 @@ pub struct AppState {
 pub fn router(state: AppState) -> Router {
     let relay = state.relay.clone();
     let app = Router::new()
-        // パスベース MCP: /{service}/{version}
-        .route("/{service}/{version}", post(mcp_post))
-        // 組み込みの relay（静的パスなので上の汎用パスより優先される）
         .route(
             crate::relay::PREFIX,
             any(relay_mcp).layer(DefaultBodyLimit::max(crate::relay::MAX_BODY_BYTES)),
@@ -42,8 +35,11 @@ pub fn router(state: AppState) -> Router {
             get(oauth_metadata),
         )
         .route(
-            "/.well-known/oauth-protected-resource/{service}/{version}",
-            get(resource_metadata_for_path),
+            &format!(
+                "/.well-known/oauth-protected-resource{}",
+                crate::relay::PREFIX
+            ),
+            get(resource_metadata),
         )
         // 全リソース一覧（拡張）。パス固有エンドポイントが本命。
         .route(
@@ -91,10 +87,6 @@ fn parse_form(raw: &[u8]) -> HashMap<String, String> {
     url::form_urlencoded::parse(raw).into_owned().collect()
 }
 
-fn service_path(service: &str, version: &str) -> String {
-    format!("/{service}/{version}")
-}
-
 // ---------------------------------------------------------------------------
 // メタデータ
 
@@ -114,26 +106,12 @@ async fn resource_metadata_index(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
-async fn resource_metadata_for_path(
-    State(state): State<AppState>,
-    Path((service, version)): Path<(String, String)>,
-) -> Response {
-    let path = service_path(&service, &version);
-    match state.oauth.protected_resource_metadata_for(&path) {
-        Some(meta) => (
-            [(header::CACHE_CONTROL, "public, max-age=3600")],
-            Json(meta),
-        )
-            .into_response(),
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(json!({
-                "error": "not_found",
-                "error_description": format!("no MCP service at {path}"),
-            })),
-        )
-            .into_response(),
-    }
+async fn resource_metadata(State(state): State<AppState>) -> Response {
+    (
+        [(header::CACHE_CONTROL, "public, max-age=3600")],
+        Json(state.oauth.protected_resource_metadata()),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -477,12 +455,12 @@ async fn register(State(state): State<AppState>, body: Bytes) -> Response {
 }
 
 // ---------------------------------------------------------------------------
-// POST /{service}/{version}
+// /relay/v1（POST JSON-RPC、GET 405、DELETE 200）
 
-fn unauthorized(oauth: &OAuthServer, service_path: &str) -> Response {
+fn unauthorized(oauth: &OAuthServer) -> Response {
     let www = format!(
         "Bearer error=\"invalid_token\", error_description=\"Authentication required\", resource_metadata=\"{}\"",
-        oauth.resource_metadata_url_for(service_path)
+        oauth.resource_metadata_url()
     );
     let mut response = (
         StatusCode::UNAUTHORIZED,
@@ -506,70 +484,19 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
     }
 }
 
-fn no_service(path: &str) -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        Json(json!({
-            "error": "not_found",
-            "error_description": format!("no MCP service at {path}"),
-        })),
-    )
-        .into_response()
-}
-
-/// Bearer を `path` のリソースに束ねられたトークンとして照合する。
-fn authenticate(
-    oauth: &OAuthServer,
-    path: &str,
-    headers: &HeaderMap,
-) -> Result<IssuedToken, Box<Response>> {
-    let Some(resource_url) = oauth.resource_url_for_path(path) else {
-        return Err(Box::new(no_service(path)));
-    };
+/// Bearer を relay に束ねられたトークンとして照合する。
+fn authenticate(oauth: &OAuthServer, headers: &HeaderMap) -> Result<IssuedToken, Box<Response>> {
     let Some(token) = bearer(headers) else {
-        return Err(Box::new(unauthorized(oauth, path)));
+        return Err(Box::new(unauthorized(oauth)));
     };
     oauth
-        .load_access_token(token, &resource_url)
-        .ok_or_else(|| Box::new(unauthorized(oauth, path)))
+        .load_access_token(token, &oauth.resource_url)
+        .ok_or_else(|| Box::new(unauthorized(oauth)))
 }
-
-async fn mcp_post(
-    State(state): State<AppState>,
-    Path((service, version)): Path<(String, String)>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let path = service_path(&service, &version);
-    let Some(backend) = state.backends.get(&path).cloned() else {
-        return no_service(&path);
-    };
-    let principal = match authenticate(&state.oauth, &path, &headers) {
-        Ok(principal) => principal,
-        Err(response) => return *response,
-    };
-    let payload: Value = match serde_json::from_slice(&body) {
-        Ok(v @ Value::Object(_)) => v,
-        _ => return (StatusCode::BAD_REQUEST, Json(json!({ "error": "json" }))).into_response(),
-    };
-    tracing::info!(
-        path = %path,
-        subject = %principal.subject,
-        method = payload.get("method").and_then(|v| v.as_str()).unwrap_or("?"),
-        "mcp"
-    );
-    match backend.handle(payload).await {
-        Some(reply) => Json(reply).into_response(),
-        None => StatusCode::ACCEPTED.into_response(),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// /relay/v1（POST JSON-RPC、GET 405、DELETE 200）
 
 async fn relay_mcp(State(state): State<AppState>, request: Request) -> Response {
     let path = crate::relay::PREFIX;
-    let principal = match authenticate(&state.oauth, path, request.headers()) {
+    let principal = match authenticate(&state.oauth, request.headers()) {
         Ok(principal) => principal,
         Err(response) => return *response,
     };

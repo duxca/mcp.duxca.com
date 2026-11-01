@@ -71,7 +71,7 @@ jobs:
           health=$(code https://mcp.duxca.com/health)
           relay=$(code https://mcp.duxca.com/relay/v1/health)
           echo "try $i: POST /adb/v1=$adb GET /health=$health GET /relay/v1/health=$relay"
-          if [ "$adb" = 401 ] && [ "$health" = 404 ] && [ "$relay" = 200 ]; then exit 0; fi
+          if [ "$adb" = 404 ] && [ "$health" = 404 ] && [ "$relay" = 200 ]; then exit 0; fi
           sleep 5
         done
         exit 1

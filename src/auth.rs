@@ -1004,12 +1004,8 @@ pub enum CallbackOutcome {
 
 pub struct OAuthServer {
     pub issuer: String,
-    /// 許可する保護リソース URL の集合（`{issuer}/{name}/{version}`）。
-    pub resource_urls: HashSet<String>,
-    /// 登録順。一覧に使う。末尾に組み込みの relay（`/relay/v1`）が入る。
-    pub resource_paths: Vec<String>,
-    /// `resource` 省略時の束ね先。stdio サービスが 1 本だけのときその URL（relay は数えない）。
-    default_resource_url: Option<String>,
+    /// 唯一の保護リソース（`{issuer}/relay/v1`）。`resource` 省略時もここに束ねる。
+    pub resource_url: String,
     /// 共有の参照。集合から外すと発行済みの bearer も次の照合で弾かれる。
     pub allowed_ids: Arc<RwLock<HashSet<String>>>,
     pub github: Arc<dyn GitHubLogin>,
@@ -1019,47 +1015,18 @@ pub struct OAuthServer {
 }
 
 impl OAuthServer {
-    /// `resource_paths` は `/claude/v1` のようなパス（先頭スラッシュ付き）。
-    /// relay の `/relay/v1` は組み込みで足す。
     pub fn new(
         issuer: &str,
         allowed_ids: Arc<RwLock<HashSet<String>>>,
         github: Arc<dyn GitHubLogin>,
         fetcher: Arc<dyn ClientMetadataFetcher>,
-        resource_paths: Vec<String>,
         redirect_allowlist: RedirectAllowlist,
     ) -> Self {
         let issuer = issuer.trim_end_matches('/').to_string();
-        assert!(
-            !resource_paths.is_empty(),
-            "at least one MCP resource path is required"
-        );
-        let mut resource_paths: Vec<String> = resource_paths
-            .into_iter()
-            .map(|p| {
-                if p.starts_with('/') {
-                    p
-                } else {
-                    format!("/{p}")
-                }
-            })
-            .collect();
-        let default_resource_url = match resource_paths.as_slice() {
-            [only] => Some(format!("{issuer}{only}")),
-            _ => None,
-        };
-        if !resource_paths.iter().any(|p| p == crate::relay::PREFIX) {
-            resource_paths.push(crate::relay::PREFIX.to_string());
-        }
-        let resource_urls: HashSet<String> = resource_paths
-            .iter()
-            .map(|p| format!("{issuer}{p}"))
-            .collect();
+        let resource_url = format!("{issuer}{}", crate::relay::PREFIX);
         Self {
             issuer,
-            resource_urls,
-            resource_paths,
-            default_resource_url,
+            resource_url,
             allowed_ids,
             github,
             redirect_allowlist,
@@ -1068,35 +1035,12 @@ impl OAuthServer {
         }
     }
 
-    pub fn resource_url_for_path(&self, path: &str) -> Option<String> {
-        let path = if path.starts_with('/') {
-            path.to_string()
-        } else {
-            format!("/{path}")
-        };
-        let url = format!("{}{path}", self.issuer);
-        if self.resource_urls.contains(&url) {
-            Some(url)
-        } else {
-            None
-        }
-    }
-
-    pub fn resource_metadata_url_for(&self, path: &str) -> String {
-        let path = if path.starts_with('/') {
-            path.to_string()
-        } else {
-            format!("/{path}")
-        };
-        format!("{}/.well-known/oauth-protected-resource{path}", self.issuer)
-    }
-
-    /// ルート well-known 用。全リソースを列挙する。
-    pub fn all_resource_urls(&self) -> Vec<String> {
-        self.resource_paths
-            .iter()
-            .map(|p| format!("{}{p}", self.issuer))
-            .collect()
+    pub fn resource_metadata_url(&self) -> String {
+        format!(
+            "{}/.well-known/oauth-protected-resource{}",
+            self.issuer,
+            crate::relay::PREFIX
+        )
     }
 
     fn store(&self) -> std::sync::MutexGuard<'_, Store> {
@@ -1135,19 +1079,18 @@ impl OAuthServer {
         })
     }
 
-    pub fn protected_resource_metadata_for(&self, path: &str) -> Option<Value> {
-        let resource = self.resource_url_for_path(path)?;
-        Some(serde_json::json!({
-            "resource": resource,
+    pub fn protected_resource_metadata(&self) -> Value {
+        serde_json::json!({
+            "resource": self.resource_url,
             "authorization_servers": [self.issuer],
             "bearer_methods_supported": ["header"],
-        }))
+        })
     }
 
     /// ルート `/.well-known/oauth-protected-resource` 用の拡張一覧。
     pub fn protected_resources_index(&self) -> Value {
         serde_json::json!({
-            "resources": self.all_resource_urls(),
+            "resources": [self.resource_url],
             "authorization_servers": [self.issuer],
             "bearer_methods_supported": ["header"],
         })
@@ -1205,31 +1148,19 @@ impl OAuthServer {
             .to_ascii_lowercase()
     }
 
-    fn lookup_resource(&self, requested: &str) -> Option<String> {
-        let key = Self::normalize_resource_key(requested);
-        self.resource_urls
-            .iter()
-            .find(|u| Self::normalize_resource_key(u) == key)
-            .cloned()
-    }
-
-    /// RFC 8707: 要求された resource を許可集合に束ねる。
-    /// stdio サービスが 1 つだけのときは省略可（その URL を既定にする）。
-    /// 複数あるときと relay に繋ぐときは `resource` 必須。
+    /// RFC 8707: 要求された resource を relay に束ねる。省略時も relay。
     fn bound_resource(&self, requested: Option<&str>) -> Result<String, AuthorizeError> {
         match requested {
-            None => self
-                .default_resource_url
-                .clone()
-                .ok_or_else(|| AuthorizeError {
+            Some(r)
+                if Self::normalize_resource_key(r)
+                    != Self::normalize_resource_key(&self.resource_url) =>
+            {
+                Err(AuthorizeError {
                     error: "invalid_target",
-                    description: "resource is required when multiple MCP services are configured"
-                        .into(),
-                }),
-            Some(r) => self.lookup_resource(r).ok_or_else(|| AuthorizeError {
-                error: "invalid_target",
-                description: "resource does not match a configured MCP service".into(),
-            }),
+                    description: "resource does not match a configured MCP service".into(),
+                })
+            }
+            _ => Ok(self.resource_url.clone()),
         }
     }
 

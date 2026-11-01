@@ -5,13 +5,6 @@
 # 任意で runtime.env / tunnel.token（秘密。あれば置き換える）がある。
 set -euo pipefail
 SRC="${1:?staging dir}"
-ADBMCP_REF=84533098932fb0a7c866e3f3b30a6da8d9311f90   # FlashZ/adb-mcp
-
-export DEBIAN_FRONTEND=noninteractive
-need=()
-command -v adb >/dev/null || need+=(adb)
-dpkg -s python3-venv >/dev/null 2>&1 || need+=(python3-venv)
-if ((${#need[@]})); then apt-get update -q && apt-get install -yq "${need[@]}"; fi
 
 id mcp-duxca >/dev/null 2>&1 || useradd --system --home-dir /var/lib/mcp-duxca-com --shell /usr/sbin/nologin mcp-duxca
 install -d -o mcp-duxca -g mcp-duxca -m 750 /var/lib/mcp-duxca-com
@@ -21,17 +14,6 @@ install -d -o root -g mcp-duxca -m 750 /etc/mcp-duxca-com
 # 変わったものだけ再起動する。
 # トンネルは ssh.duxca.com（= CI の SSH 自身の輸送路）も運ぶので、無駄に再起動すると CI が切断される。
 restart_gw=0 restart_tun=0
-
-# adbmcp（コミット固定）。ゲートウェイの子プロセスとして動くので、作り直したらゲートウェイごと再起動して入れ替える。
-stamp=/opt/mcp-duxca-com/adbmcp/.ref
-if [[ "$(cat "$stamp" 2>/dev/null)" != "$ADBMCP_REF" ]]; then
-  rm -rf /opt/mcp-duxca-com/adbmcp
-  python3 -m venv /opt/mcp-duxca-com/adbmcp
-  /opt/mcp-duxca-com/adbmcp/bin/pip install -q --upgrade pip
-  /opt/mcp-duxca-com/adbmcp/bin/pip install -q "https://github.com/FlashZ/adb-mcp/archive/${ADBMCP_REF}.tar.gz"
-  echo "$ADBMCP_REF" > "$stamp"
-  restart_gw=1
-fi
 
 # 上書き前に変更を検出する。宛先が無ければ cmp は失敗する = 変更ありとして扱う。
 changed() { ! cmp -s "$1" "$2"; }
@@ -73,6 +55,6 @@ fi
 sleep 3
 # 以下のローカル確認はトンネルを経由しないので、遅延再起動の影響を受けない。
 systemctl is-active mcp-duxca-com.service mcp-duxca-com-tunnel.service
-code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8000/adb/v1)
-echo "local POST /adb/v1 -> $code"
-[[ "$code" == 401 ]]
+code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/relay/v1/health)
+echo "local GET /relay/v1/health -> $code"
+[[ "$code" == 200 ]]

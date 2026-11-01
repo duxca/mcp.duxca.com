@@ -3,20 +3,19 @@
 Grok / Claude アプリから呼べる **MCP ゲートウェイ**（Rust / Axum）。
 
 参考実装は pascal 上の `~/Github/mcp-test`（Python / Starlette）。
-公開は Cloudflare Tunnel で `https://mcp.duxca.com` に載せる。バックエンドは `McpBackend` で差し替え可能。
+公開は Cloudflare Tunnel で `https://mcp.duxca.com` に載せる。MCP エンドポイントは組み込みの relay（`/relay/v1`）だけ。
 
-## 起動モード（唯一のサポート）
+## ローカル起動
 
-**シェルからフォアグラウンドで起動し、Ctrl+C で全部止める。** Daemon / systemd / nohup はサポートしない。
+**シェルからフォアグラウンドで起動し、Ctrl+C で全部止める。** 本番（duxca VM）は systemd で動かす（末尾の節）。
 
-- オフ単位はゲートウェイ全体（サービス単位の常駐オンオフはしない）
 - Cloudflare Tunnel も同じセッションで起動する
-- 止める = CLI を終了する（MCP 子プロセスも `kill_on_drop` で一緒に落ちる）
+- 止める = CLI を終了する
 
 ```sh
 cp .env.example .env   # または .secrets/runtime.env を用意
 ./scripts/run.sh
-# Ctrl+C → gateway + tunnel + MCP children を停止
+# Ctrl+C → gateway + tunnel を停止
 ```
 
 オプション:
@@ -45,34 +44,30 @@ cargo run   # Tunnel 無しのゲートウェイ単体でも可（PUBLIC_URL 必
                               │
                               ├─ OAuth 認可サーバ（動的登録 / CIMD / PKCE）※オリジン共通 1 本
                               ├─ GitHub OAuth で本人確認（数値 id allowlist）
-                              ├─ 自前 Bearer で POST /{service}/{version} を保護
-                              └─ 設定駆動の複数 McpBackend
-                                    ├─ StdioMcpBackend（サービスごと・親終了で kill_on_drop）
-                                    └─ （将来）HTTP MCP など差し替え
+                              ├─ 自前 Bearer で POST /relay/v1 を保護
+                              └─ relay（エージェント間メッセージ。メモリ内ストア）
 ```
 
 - 許可アカウントは GitHub **数値 id**（login は改名で再利用されうる）。既定: `2429307`（legokichi）。
 - トークンはメモリだけ。再起動で消える（mcp-test と同じ）。
-- MCP は JSON-RPC（`POST /{service}/{version}`）。サービス名・バージョンは環境変数で追加・差し替え。
+- MCP は JSON-RPC（`POST /relay/v1`）。OAuth の保護リソースは relay だけ。
 - OAuth（`/authorize` `/token` `/register` GitHub コールバック）はホスト共通のまま。GitHub Client Secret は増やさない。
 
 ## ルート
 
 | Method | Path | 説明 |
 |--------|------|------|
-| GET | `/` | 登録済み MCP パス一覧 |
-| GET | `/health` | 生存確認（`services` 含む） |
 | GET | `/.well-known/oauth-authorization-server` | OAuth AS メタデータ（`none` + CIMD） |
-| GET | `/.well-known/oauth-protected-resource` | 全リソース URL 一覧 |
-| GET | `/.well-known/oauth-protected-resource/{service}/{version}` | 保護リソースメタデータ（RFC 9728） |
+| GET | `/.well-known/oauth-protected-resource` | 保護リソース URL 一覧（relay だけ） |
+| GET | `/.well-known/oauth-protected-resource/relay/v1` | 保護リソースメタデータ（RFC 9728） |
 | POST | `/register` | 動的クライアント登録（RFC 7591） |
 | GET/POST | `/authorize` | 認可（→ GitHub） |
 | POST | `/token` | 認可コード / refresh → bearer |
 | GET | `/oauth/callback/github` | GitHub OAuth コールバック（river と同じ） |
 | GET | `/oauth/setup/github` | GitHub OAuth App 未設定時の案内（503） |
-| POST | `/{service}/{version}` | MCP JSON-RPC（有効な Bearer 必須） |
 
-旧パス `/mcp/v3` は廃止（サブドメイン `mcp.` と重複するため）。
+`/` と `/health` は無い（空の 404）。旧パス `/mcp/v3` は廃止（サブドメイン `mcp.` と重複するため）。
+stdio の MCP バックエンド（`POST /{service}/{version}`、`/adb/v1` など）は撤去した。いまは 404 を返す。
 
 加えて、組み込みの relay が常に `/relay/v1`（MCP）と `/relay/v1/{health,docs,llms.txt,docs.md}` に生える（次節）。
 
@@ -81,11 +76,9 @@ cargo run   # Tunnel 無しのゲートウェイ単体でも可（PUBLIC_URL 必
 [AISupplyGuy/muse-relay](https://github.com/AISupplyGuy/muse-relay) の移植を対称化したもの。Muse も Grok Bot も
 同じ MCP エンドポイント `POST /relay/v1` に繋ぎ、名乗った名前どうしでメッセージと添付をやりとりする。`src/relay/` にまとまっている。
 
-- **エンドポイントは 1 本、認証は OAuth のみ。** 静的キーは無い。`/relay/v1` は `MCP_SERVICES` とは別に OAuth の保護リソースとして組み込みで登録される
+- **エンドポイントは 1 本、認証は OAuth のみ。** 静的キーは無い。`/relay/v1` がこのゲートウェイ唯一の OAuth 保護リソース
   - コネクタ登録時の `resource` は `{PUBLIC_URL}/relay/v1`。メタデータは `/.well-known/oauth-protected-resource/relay/v1`
-  - 他サービス向けのトークンは relay で 401、relay 向けのトークンは他サービスで 401（`WWW-Authenticate` の形は既存 MCP と同じ）
-  - `resource` 省略時の既定は従来どおり「stdio サービスが 1 本ならそれ」。relay は数に入れないので、relay へ繋ぐクライアントは `resource` を送る必要がある
-  - `MCP_SERVICES` でサービス名 `relay` は使えない（予約）
+  - `resource` を省略した認可要求も relay に束ねる。relay 以外の `resource` は `invalid_target`
 - **部屋 = OAuth の subject（GitHub 数値 id）。** 同じアカウントのトークンなら同じ部屋。部屋をまたいだ参照はできない
 - **名乗りは自己申告。** 各ツールで自分を `agent`、相手を `to` で申告する。サーバは資格情報からロールを決めない（部屋の中は本人のエージェントだけなので名前を信頼する）
 - **起床 webhook も自己申告。** 受け手が `register_agent` で自分の `webhook_url` / `webhook_secret`（`webhook_url` を登録するなら必須）/ `webhook_auth` を登録し、その名前宛てのメッセージが保存されると POST される
@@ -144,32 +137,13 @@ PORT=8000
 
 ローカルだけなら `PUBLIC_URL=http://127.0.0.1:8000` で可（HTTPS 以外は localhost のみ）。
 
-## 複数 MCP サービス
-
-```sh
-# 例: /codex-sub/v1, /claude-sub/v1, /adb/v1（いずれも設定駆動）
-# 起動コマンドは pascal に各 MCP を入れたあとで指定する（パスはここで決めない）
-MCP_SERVICES=codex-sub/v1,claude-sub/v1,adb/v1
-MCP_CODEX_SUB_V1_COMMAND=
-MCP_CLAUDE_SUB_V1_COMMAND=
-MCP_ADB_V1_COMMAND=
-```
-
-- `MCP_SERVICES` … カンマ区切りの `name/version`
-- 各サービスに `MCP_<NAME>_<VERSION>_COMMAND`（必須）と任意の `_CWD`
-- 名前・バージョンの非英数字は `_` に置換して大文字化（`my-notes/v1` → `MCP_MY_NOTES_V1_COMMAND`）
-- サービス名: `[a-z0-9]` またはハイフン付き。バージョン: `v` + 数字（`v1`, `v2`, `v10` …）
-- `MCP_SERVICES` が空のときは `default/v1` を 1 本立て、`CLAUDE_MCP_COMMAND` / `CLAUDE_CWD` を使う
-- 認可時の `resource`（RFC 8707）はサービスが複数なら必須。1 本だけのときは省略可
-- サービスをオフにするには **CLI（`./scripts/run.sh`）を止める**。常駐プロセスは持たない。
-
 ## ローカル確認
 
 ```sh
-curl -s http://127.0.0.1:8000/health
+curl -s http://127.0.0.1:8000/relay/v1/health
 curl -s http://127.0.0.1:8000/.well-known/oauth-authorization-server
 # Bearer 無しは 401 + WWW-Authenticate
-curl -si -X POST http://127.0.0.1:8000/default/v1 \
+curl -si -X POST http://127.0.0.1:8000/relay/v1 \
   -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
@@ -184,11 +158,6 @@ curl -si -X POST http://127.0.0.1:8000/default/v1 \
 | `OAUTH_REDIRECT_ALLOWLIST` | カンマ区切りの redirect_uri 許可リスト。末尾 `/*` は 1 セグメントだけ、末尾 `/` は配下すべて、それ以外はパス完全一致。ポート無しのループバックはポートを問わない。未設定時は `src/auth.rs` の `DEFAULT_REDIRECT_ALLOWLIST`（ChatGPT / Claude / Grok / ループバック） |
 | `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | GitHub OAuth App |
 | `ALLOWED_GITHUB_IDS` | カンマ区切り数値 id |
-| `MCP_SERVICES` | カンマ区切り `name/version`（空なら `default/v1`） |
-| `MCP_<NAME>_<VER>_COMMAND` | サービスごとの起動コマンド |
-| `MCP_<NAME>_<VER>_CWD` | サービスごとの cwd（省略時は下記） |
-| `CLAUDE_MCP_COMMAND` | `MCP_SERVICES` 未設定時のフォールバック（既定 `claude mcp serve`） |
-| `CLAUDE_CWD` | 上記フォールバック / 個別 CWD 未設定時の cwd（省略時 `$HOME`） |
 | `RELAY_MAX_TOTAL_STORAGE_BYTES` | relay 添付の全部屋の合計上限（既定 67108864 = 64 MB、1 部屋はその半分）。relay の env はこれだけ |
 | `RUST_LOG` | ログの絞り込み（未設定なら `info`） |
 | `CLOUDFLARED_TOKEN_FILE` | Tunnel トークンファイル（`scripts/run.sh`） |
@@ -197,9 +166,7 @@ curl -si -X POST http://127.0.0.1:8000/default/v1 \
 ## これから
 
 1. ~~GitHub OAuth + bearer~~ ← 済
-2. ~~パスベース複数 MCP~~ ← 済（stdio ブリッジは骨格のまま）
-3. `StdioMcpBackend` の本格 stdio JSON-RPC ブリッジ
-4. duxca VPC（GCP）へ移設し、Tunnel コネクタをそこへ
+2. duxca VPC（GCP）へ移設し、Tunnel コネクタをそこへ
 
 ## 開発メモ
 
@@ -210,17 +177,14 @@ curl -si -X POST http://127.0.0.1:8000/default/v1 \
 - CIMD 取得は公開 IP だけに接続する。ローカル DNS が合成アドレスを返すときは Cloudflare DoH にフォールバックする。
 - ループバック redirect（`http://localhost/callback`）は RFC 8252 どおりポート違いを許す。
 - redirect_uri は `OAUTH_REDIRECT_ALLOWLIST` に載るものだけ受ける。`/register` は `invalid_client_metadata`、CIMD は文書ごと拒否、`/authorize` はリダイレクトせず 400 JSON。fragment・userinfo 付きは常に拒否。
-- 起動は `./scripts/run.sh` のみサポート。常時起動前提の運用はしない。
+- ローカルは `./scripts/run.sh`、本番は systemd（次節）。
 
-## duxca VM へのデプロイ（adb/v1 のみ）
+## duxca VM へのデプロイ
 
 `main` への push で `.github/workflows/deploy.yml` が走り、ビルドしたバイナリと `deploy/` を
 `duxca` VM（`duxca.com:4322`）に送って `deploy/install.sh` を sudo 実行する。
 
-- systemd: `mcp-duxca-com.service`（gateway, 127.0.0.1:8000, `MCP_SERVICES=adb/v1`, `ADB_MCP_ALLOW_SHELL=1`）と
+- systemd: `mcp-duxca-com.service`（gateway, 127.0.0.1:8000）と
   `mcp-duxca-com-tunnel.service`（cloudflared）。どちらも専用ユーザー `mcp-duxca` で動く。
-- adbmcp は FlashZ/adb-mcp をコミット固定で `/opt/mcp-duxca-com/adbmcp` の venv に入れる。
 - 秘密は GitHub Secrets: `MCP_GITHUB_CLIENT_ID`, `MCP_GITHUB_CLIENT_SECRET`, `MCP_TUNNEL_TOKEN`,
   `DUXCA_SSH_KEY`, `DUXCA_KNOWN_HOSTS`。VM 上では `/etc/mcp-duxca-com/`（root:mcp-duxca 640）。
-- 端末は Termux から `ssh -p 4322 -R 5555:127.0.0.1:5555 legokichi@duxca.com` で転送し、
-  MCP の `connect` ツールで `127.0.0.1:5555` に繋ぐ。

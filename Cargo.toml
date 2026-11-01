@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 resolver = "2"
 rust-version = "1.85"
-description = "MCP gateway for mcp.duxca.com (Axum + swappable backends)"
+description = "MCP gateway for mcp.duxca.com (Axum + OAuth + relay)"
 
 [dependencies]
 anyhow = "1"

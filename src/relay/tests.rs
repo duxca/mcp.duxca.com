@@ -168,18 +168,7 @@ async fn relay_needs_a_token_bound_to_relay() {
         unauthorized(&r);
     }
 
-    // default/v1（adb 相当）向けのトークンは relay に通らず、relay 向けは default/v1 に通らない
-    let (adb_token, _, _) =
-        issue_token_for(&h.app, "ok", &format!("{PUBLIC_URL}/default/v1")).await;
     let (relay_token, _, _) = issue_token_for(&h.app, "ok", &relay_resource()).await;
-    unauthorized(&send(&h.app, post(PREFIX, Some(&adb_token))).await);
-    unauthorized(&send(&h.app, post("/default/v1", Some(&relay_token))).await);
-    assert_eq!(
-        send(&h.app, post("/default/v1", Some(&adb_token)))
-            .await
-            .status,
-        StatusCode::OK
-    );
     let r = send(&h.app, post(PREFIX, Some(&relay_token))).await;
     assert_eq!(
         (r.status, r.json()),
