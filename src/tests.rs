@@ -2,7 +2,7 @@
 
 use crate::auth::{
     is_cimd_client_id, pkce_s256, token_urlsafe, ClientMetadataFetcher, GitHubLogin,
-    GitHubLoginError, OAuthServer, RedirectAllowlist,
+    GitHubLoginError, OAuthServer, RedirectAllowlist, REFRESH_GRACE_SECS,
 };
 use crate::db::Db;
 use crate::relay::Relay;
@@ -431,10 +431,7 @@ async fn allowed_github_login_can_call_tools_and_refresh() {
         mcp(&h.app, Some(&new_access), 3).await.status,
         StatusCode::OK
     );
-    assert_eq!(
-        mcp(&h.app, Some(&access), 4).await.status,
-        StatusCode::UNAUTHORIZED
-    );
+    assert_eq!(mcp(&h.app, Some(&access), 4).await.status, StatusCode::OK);
 
     let reused = post_form(
         &h.app,
@@ -1295,10 +1292,7 @@ async fn state_survives_a_restart_and_secrets_are_stored_hashed() {
     assert_eq!(refreshed.status, StatusCode::OK, "{}", refreshed.body);
     let replay = refresh_with(&h.app, &refresh, &client_id).await;
     assert_eq!(replay.json()["error"], "invalid_grant");
-    assert_eq!(
-        mcp(&h.app, Some(&access), 9).await.status,
-        StatusCode::UNAUTHORIZED
-    );
+    assert_eq!(mcp(&h.app, Some(&access), 9).await.status, StatusCode::OK);
     let new_refresh = refreshed.json()["refresh_token"]
         .as_str()
         .unwrap()
@@ -1367,10 +1361,7 @@ async fn refresh_rotation_is_one_transaction() {
         .as_str()
         .unwrap()
         .to_string();
-    assert_eq!(
-        mcp(&h.app, Some(&access), 2).await.status,
-        StatusCode::UNAUTHORIZED
-    );
+    assert_eq!(mcp(&h.app, Some(&access), 2).await.status, StatusCode::OK);
     assert_eq!(
         mcp(&h.app, Some(&new_access), 3).await.status,
         StatusCode::OK
@@ -1384,6 +1375,78 @@ async fn refresh_rotation_is_one_transaction() {
         refresh_with(&h.app, &new_refresh, &client_id).await.status,
         StatusCode::OK
     );
+}
+
+#[tokio::test]
+async fn rotated_access_keeps_working_only_for_the_grace() {
+    let h = harness();
+    let (access, refresh, client_id) = issue_token(&h.app).await;
+    let db = h.relay.store.db().clone();
+    let expires_at = |token: &str| -> i64 {
+        db.read(|c| {
+            c.query_row(
+                "SELECT expires_at FROM oauth_tokens WHERE token_sha256 = ?1",
+                [sha256_hex(token)],
+                |r| r.get(0),
+            )
+        })
+        .unwrap()
+    };
+    let set_expires_at = |token: &str, at: i64| {
+        db.read(|c| {
+            c.execute(
+                "UPDATE oauth_tokens SET expires_at = ?1 WHERE token_sha256 = ?2",
+                rusqlite::params![at, sha256_hex(token)],
+            )
+        })
+        .unwrap();
+    };
+
+    let rotated = refresh_with(&h.app, &refresh, &client_id).await;
+    assert_eq!(rotated.status, StatusCode::OK, "{}", rotated.body);
+    let new_access = rotated.json()["access_token"].as_str().unwrap().to_string();
+    let new_refresh = rotated.json()["refresh_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 古い access は猶予のあいだ通り、残りは REFRESH_GRACE_SECS までに縮む
+    assert_eq!(mcp(&h.app, Some(&access), 1).await.status, StatusCode::OK);
+    let now = crate::auth::now();
+    let capped = expires_at(&access);
+    assert!(
+        capped > now && capped <= now + REFRESH_GRACE_SECS,
+        "{capped} {now}"
+    );
+    assert_eq!(
+        mcp(&h.app, Some(&new_access), 2).await.status,
+        StatusCode::OK
+    );
+    let replay = refresh_with(&h.app, &refresh, &client_id).await;
+    assert_eq!(
+        (replay.status, replay.json()["error"].clone()),
+        (StatusCode::BAD_REQUEST, json!("invalid_grant"))
+    );
+
+    // 猶予が切れたら 401。新しい組には響かない
+    set_expires_at(&access, crate::auth::now() - 1);
+    assert_eq!(
+        mcp(&h.app, Some(&access), 3).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        mcp(&h.app, Some(&new_access), 4).await.status,
+        StatusCode::OK
+    );
+
+    // 猶予より先に切れる access は延ばさない
+    let sooner = crate::auth::now() + 10;
+    set_expires_at(&new_access, sooner);
+    assert_eq!(
+        refresh_with(&h.app, &new_refresh, &client_id).await.status,
+        StatusCode::OK
+    );
+    assert_eq!(expires_at(&new_access), sooner);
 }
 
 /// DB の失敗を 401 や invalid_grant にすると、クライアントは再認可へ進んでしまう。
