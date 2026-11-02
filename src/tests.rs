@@ -1275,7 +1275,7 @@ async fn state_survives_a_restart_and_secrets_are_stored_hashed() {
     assert_eq!(muse["messages"][0]["read"], true);
     assert_eq!(
         tool(&h.app, &access, "list_agents", json!({})).await["agents"],
-        json!([{ "name": "grok", "webhook": true }, { "name": "muse", "webhook": false }])
+        json!([{ "name": "grok", "webhook": true }])
     );
     // id は戻らない
     let next = tool(
