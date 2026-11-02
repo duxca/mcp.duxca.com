@@ -270,7 +270,9 @@ async fn agents_exchange_messages_symmetrically() {
         json!([])
     );
 
-    let agents = muse.ok("list_agents", json!({})).await;
+    let agents = muse
+        .ok("list_agents", json!({ "include_seen": true }))
+        .await;
     assert_eq!(
         agents,
         json!({ "agents": [{ "name": "grok", "webhook": false }, { "name": "muse", "webhook": false }] })
@@ -489,10 +491,12 @@ async fn rooms_are_separated_by_login() {
         (r["messages"].clone(), r["unread_total"].clone()),
         (json!([]), json!(0))
     );
-    assert_eq!(
-        theirs.ok("list_agents", json!({})).await,
-        json!({ "agents": [] })
-    );
+    for args in [json!({}), json!({ "include_seen": true })] {
+        assert_eq!(
+            theirs.ok("list_agents", args).await,
+            json!({ "agents": [] })
+        );
+    }
     assert_eq!(
         theirs.ok("list_threads", json!({})).await,
         json!({ "threads": [] })
@@ -832,6 +836,15 @@ async fn mcp_initialize_lists_symmetric_tools() {
     assert_eq!(required("mark_read"), json!(["agent"]));
     assert_eq!(required("list_threads"), json!([]));
     assert_eq!(required("list_agents"), json!([]));
+    let list_agents = tools.iter().find(|t| t["name"] == "list_agents").unwrap();
+    assert_eq!(
+        list_agents["inputSchema"]["properties"]["include_seen"]["type"],
+        "boolean"
+    );
+    assert_eq!(
+        list_agents["inputSchema"]["properties"]["include_seen"]["default"],
+        false
+    );
     // 方向つきの旧ツール名は残っていない
     assert!(!r.to_string().contains("send_to_muse"));
     assert!(!r.to_string().contains("check_muse_messages"));
@@ -1034,6 +1047,10 @@ async fn retired_paths_are_gone_and_docs_describe_the_new_design() {
             docs.contains("survives relay\nrestarts until you replace it or call unregister_agent")
         );
         assert!(docs.contains("A message and its files are deleted 7 days after it was sent"));
+        assert!(docs.contains("- list_agents {include_seen? (default false)}"));
+        assert!(
+            docs.contains("By default only the agents currently registered with register_agent")
+        );
         for limit in [
             "Storage per room: 10000 messages, 32 MB of message data",
             "32 MB of files, 100 registered agents",
@@ -1064,6 +1081,7 @@ async fn retired_paths_are_gone_and_docs_describe_the_new_design() {
             "/ask",
             "openapi",
             "download_url",
+            "registered agents plus every sender and recipient",
         ] {
             assert!(!docs.contains(gone), "{gone}");
         }
@@ -1282,9 +1300,14 @@ async fn webhooks_are_registered_by_the_recipient() {
         .await;
     assert_eq!(r["notified"], false);
     assert_eq!(captured.lock().unwrap().len(), 3);
-    // メッセージは残り、名前も一覧に残る
+    // 登録の一覧からは消え、メッセージに残る名前は include_seen で見える
     assert_eq!(
         muse.ok("list_agents", json!({})).await,
+        json!({ "agents": [] })
+    );
+    assert_eq!(
+        muse.ok("list_agents", json!({ "include_seen": true }))
+            .await,
         json!({ "agents": [{ "name": "grok", "webhook": false }, { "name": "muse", "webhook": false }] })
     );
 
@@ -1458,6 +1481,57 @@ async fn webhook_registration_is_validated_without_echoing_values() {
         .err("register_agent", json!({}))
         .await
         .contains("\"agent\" is required"));
+}
+
+#[tokio::test]
+async fn list_agents_shows_registrations_unless_seen_names_are_asked_for() {
+    let (_h, c) = setup().await;
+    c.ok(
+        "register_agent",
+        json!({ "agent": "grok", "webhook_url": "https://hook.example/wake", "webhook_secret": "s" }),
+    )
+    .await;
+    c.ok("register_agent", json!({ "agent": "muse" })).await;
+    c.ok("register_agent", json!({ "agent": "claude app" }))
+        .await;
+    // webhook のある grok には送らない（配送を起こさない）
+    for (from, to) in [
+        ("grok", "muse"),
+        ("claude app", "muse"),
+        ("drifter", "muse"),
+        ("muse", "ghost"),
+    ] {
+        c.ok(
+            "send_message",
+            json!({ "agent": from, "to": to, "text": "hi" }),
+        )
+        .await;
+    }
+    assert_eq!(
+        c.ok("unregister_agent", json!({ "agent": "claude app" }))
+            .await,
+        json!({ "unregistered": true })
+    );
+
+    let registered = json!({ "agents": [
+        { "name": "grok", "webhook": true },
+        { "name": "muse", "webhook": false },
+    ] });
+    assert_eq!(c.ok("list_agents", json!({})).await, registered);
+    assert_eq!(
+        c.ok("list_agents", json!({ "include_seen": false })).await,
+        registered
+    );
+    assert_eq!(
+        c.ok("list_agents", json!({ "include_seen": true })).await,
+        json!({ "agents": [
+            { "name": "claude app", "webhook": false },
+            { "name": "drifter", "webhook": false },
+            { "name": "ghost", "webhook": false },
+            { "name": "grok", "webhook": true },
+            { "name": "muse", "webhook": false },
+        ] })
+    );
 }
 
 // ---------------------------------------------------------------------------

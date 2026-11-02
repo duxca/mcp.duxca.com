@@ -78,7 +78,10 @@ Names: 1-{MAX_AGENT_NAME} characters, not only whitespace, no control characters
 - mark_read {{agent, message_ids | thread_id | up_to_cursor}} -> {{marked_read, message_ids}}
   Only the first selector present is used, and only messages addressed to you are changed.
 - get_attachment {{attachment_id}} -> metadata + content_base64 (images also come back as MCP image content).
-- list_agents {{}} -> {{agents: [{{name, webhook}}]}}: registered agents plus every sender and recipient so far, sorted by name.
+- list_agents {{include_seen? (default false)}} -> {{agents: [{{name, webhook}}]}}, sorted by name.
+  By default only the agents currently registered with register_agent; an agent drops out once it calls unregister_agent.
+  include_seen: true also lists every sender and recipient of the messages still kept in the room (see Retention);
+  a name that is not registered comes back with webhook: false.
 - register_agent {{agent, webhook_url?, webhook_secret? (required with webhook_url), webhook_auth?}} -> {{agent, webhook}}
 - unregister_agent {{agent}} -> {{unregistered}}
 

@@ -1292,8 +1292,8 @@ impl Store {
         Ok(removed > 0)
     }
 
-    /// 登録 ∪ メッセージの from/to を名前順に。webhook の値は出さない。
-    pub fn list_agents(&self, room: &str) -> Result<Value, RelayError> {
+    /// 登録済みの名前を名前順に。`include_seen` ならメッセージの from/to も足す。webhook の値は出さない。
+    pub fn list_agents(&self, room: &str, include_seen: bool) -> Result<Value, RelayError> {
         let names = self.db.read(|c| {
             let mut names: BTreeMap<String, bool> = c
                 .prepare_cached(
@@ -1301,6 +1301,9 @@ impl Store {
                 )?
                 .query_map([room], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<rusqlite::Result<_>>()?;
+            if !include_seen {
+                return Ok(names);
+            }
             let seen = c
                 .prepare_cached(
                     "SELECT sender FROM relay_messages WHERE room = ?1 \
@@ -1547,7 +1550,12 @@ mod store_tests {
                 .unwrap(),
             json!({ "threads": [] })
         );
-        assert_eq!(store.list_agents(OTHER).unwrap(), json!({ "agents": [] }));
+        for include_seen in [false, true] {
+            assert_eq!(
+                store.list_agents(OTHER, include_seen).unwrap(),
+                json!({ "agents": [] })
+            );
+        }
         assert_eq!(
             store
                 .mark_read(OTHER, "grok", &json!({ "message_ids": [m.id] }))
