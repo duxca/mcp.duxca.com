@@ -38,6 +38,9 @@ pub const GITHUB_TOKEN_URL: &str = "https://github.com/login/oauth/access_token"
 pub const GITHUB_USER_URL: &str = "https://api.github.com/user";
 
 pub const ACCESS_TTL: i64 = 60 * 60;
+/// refresh で入れ替えた古い access を消さずに通す秒数。入れ替えの直前に出たリクエストや、
+/// クライアントが新しい組へ差し替える途中のリクエストを 401 にしないため。
+pub const REFRESH_GRACE_SECS: i64 = 5 * 60;
 pub const REFRESH_TTL: i64 = 14 * 24 * 60 * 60;
 pub const CODE_TTL: i64 = 5 * 60;
 pub const PENDING_TTL: i64 = 10 * 60;
@@ -1400,7 +1403,8 @@ impl OAuthServer {
         Ok(found)
     }
 
-    /// 古い refresh（と対の access）を消して新しい組を入れるまでを 1 つのトランザクションで行う。
+    /// 古い refresh を消して新しい組を入れるまでを 1 つのトランザクションで行う。
+    /// 対の access は消さず、残りを `REFRESH_GRACE_SECS` までに縮める。
     pub fn exchange_refresh_token(
         &self,
         client: &ClientRecord,
@@ -1423,18 +1427,26 @@ impl OAuthServer {
                     "refresh token does not exist",
                 )));
             };
-            if let Some(old_access) = old_access {
-                tx.execute(
-                    "DELETE FROM oauth_tokens WHERE token_sha256 = ?1 AND kind = 'access'",
-                    [old_access],
-                )?;
-            }
-            // 許可から外れていても、古い組は消したままにする
+            // 許可から外れていたら、古い組は消したままにする
             if current.subject.is_empty() || !self.allows(&current.subject) {
+                if let Some(old_access) = old_access {
+                    tx.execute(
+                        "DELETE FROM oauth_tokens WHERE token_sha256 = ?1 AND kind = 'access'",
+                        [old_access],
+                    )?;
+                }
                 return Ok(Err(TokenError::new(
                     "invalid_grant",
                     "github login is not allowed",
                 )));
+            }
+            // 期限が来たら purge が消す
+            if let Some(old_access) = old_access {
+                tx.execute(
+                    "UPDATE oauth_tokens SET expires_at = MIN(expires_at, ?2) \
+                     WHERE token_sha256 = ?1 AND kind = 'access'",
+                    params![old_access, now() + REFRESH_GRACE_SECS],
+                )?;
             }
             self.issue(
                 tx,
