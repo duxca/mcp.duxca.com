@@ -2,7 +2,7 @@
 //! POST の JSON-RPC に application/json で答える。ツールは全て対称で、呼び出し側が `agent` を名乗る。
 
 use super::js;
-use super::store::{agent_name, iso_ms, now_ms, ListArgs};
+use super::store::{agent_description, agent_name, iso_ms, now_ms, ListArgs};
 use super::{Relay, RelayError};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -67,13 +67,14 @@ pub fn tools() -> Value {
         { "name": "get_attachment", "description": "Download one attachment by id (from a message's attachments list). Returns metadata plus content_base64; images are also returned as MCP image content.",
           "inputSchema": { "type": "object", "required": ["attachment_id"], "properties": { "attachment_id": { "type": "string" } } },
           "annotations": { "readOnlyHint": true } },
-        { "name": "list_agents", "description": "List the agents currently registered in this room (via register_agent), sorted, with webhook=true when that agent registered a webhook. An agent disappears once it calls unregister_agent. Set include_seen=true to also list every sender and recipient of the messages still kept in this room (those names get webhook=false unless registered).",
+        { "name": "list_agents", "description": "List the agents currently registered in this room (via register_agent), sorted, as {name, webhook, description}: webhook=true when that agent registered a webhook, description is the role self-introduction it registered (null if none). An agent disappears once it calls unregister_agent. Set include_seen=true to also list every sender and recipient of the messages still kept in this room (those names get webhook=false and description=null unless registered).",
           "inputSchema": { "type": "object", "properties": {
             "include_seen": { "type": "boolean", "default": false, "description": "Also list every sender and recipient of the messages still kept in this room." } } },
           "annotations": { "readOnlyHint": true } },
-        { "name": "register_agent", "description": "Register your agent name in this room, optionally with a webhook the relay POSTs to when a message is addressed to you. Replaces your previous registration entirely (omitted fields are cleared). The registration is kept, across relay restarts, until you replace or remove it. The webhook values can never be read back.",
+        { "name": "register_agent", "description": "Register your agent name in this room, optionally with a short public description of your role (shown to everyone by list_agents) and a webhook the relay POSTs to when a message is addressed to you. Replaces your previous registration entirely (omitted fields, including description, are cleared). The registration is kept, across relay restarts, until you replace or remove it. The webhook values can never be read back.",
           "inputSchema": { "type": "object", "required": ["agent"], "properties": {
             "agent": agent,
+            "description": { "type": "string", "description": "Optional public self-introduction of your role in this room (max 500 chars), returned by list_agents." },
             "webhook_url": { "type": "string", "description": "https URL (max 2048 chars) to POST {\"event\":\"relay.message.created\",\"message\":{...}} to." },
             "webhook_auth": { "type": "string", "description": "Sent verbatim as the Authorization header." },
             "webhook_secret": { "type": "string", "description": "Required with webhook_url. HMAC-SHA256 key for X-Relay-Signature; it is never sent itself." } } },
@@ -264,9 +265,16 @@ async fn call_tool(
         "list_agents" => Ok(store.list_agents(room, js::truthy(&arg("include_seen")))?),
         "register_agent" => {
             let agent = name_arg("agent")?;
+            let description = agent_description(&arg("description"))?;
             let target = relay.webhook_target(&a)?;
-            let webhook = store.register_agent(room, &agent, target)?;
-            tracing::info!(room, agent = ?agent, webhook, "relay: agent registered");
+            let webhook = store.register_agent(room, &agent, target, description.as_deref())?;
+            tracing::info!(
+                room,
+                agent = ?agent,
+                webhook,
+                description = description.is_some(),
+                "relay: agent registered"
+            );
             Ok(json!({ "agent": agent, "webhook": webhook }))
         }
         "unregister_agent" => {

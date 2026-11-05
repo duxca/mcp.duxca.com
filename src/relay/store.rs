@@ -39,6 +39,8 @@ pub const DEFAULT_MAX_TOTAL_STORAGE_BYTES: u64 = 64 * MB;
 pub const MAX_WAIT_SECONDS: f64 = 280.0;
 pub const MAX_THREAD_MESSAGES: usize = 500;
 pub const MAX_AGENT_NAME: usize = 64;
+/// register_agent の description（役割の自己紹介）。text と同じく UTF-16 で数える。
+pub const MAX_AGENT_DESCRIPTION: usize = 500;
 /// メッセージ（と添付）を残す日数。スレッドは最後のメッセージと一緒に消える。登録は消さない。
 pub const RETENTION_DAYS: i64 = 7;
 const RETENTION_MS: i64 = RETENTION_DAYS * 24 * 60 * 60 * 1000;
@@ -223,11 +225,23 @@ pub struct AttachmentContent {
     pub data: Bytes,
 }
 
-fn agent_bytes(name: &str, webhook: Option<&WebhookTarget>) -> u64 {
+fn agent_bytes(name: &str, webhook: Option<&WebhookTarget>, description: Option<&str>) -> u64 {
     let webhook = webhook.map_or(0, |w| {
         w.url.len() + w.auth.as_ref().map_or(0, String::len) + w.secret.len()
     });
-    AGENT_OVERHEAD + (name.len() + webhook) as u64
+    AGENT_OVERHEAD + (name.len() + webhook + description.map_or(0, str::len)) as u64
+}
+
+/// `register_agent` の `description`。省略（null）と空文字は「無し」。
+pub fn agent_description(v: &Value) -> Result<Option<String>, RelayError> {
+    match v {
+        Value::Null => Ok(None),
+        Value::String(s) if s.is_empty() => Ok(None),
+        Value::String(s) if utf16_len(s) <= MAX_AGENT_DESCRIPTION => Ok(Some(s.clone())),
+        _ => Err(RelayError::bad_request(format!(
+            "\"description\" must be a string of at most {MAX_AGENT_DESCRIPTION} characters"
+        ))),
+    }
 }
 
 /// 待機中の long-poll。部屋ごとに起床用の `Notify` を持ち、送信はその部屋の待機だけを起こす。
@@ -1232,14 +1246,16 @@ impl Store {
         Ok(json!({ "marked_read": ids.len(), "message_ids": ids }))
     }
 
-    /// 登録を丸ごと置き換える。webhook の有無を返す。webhook の値は平文で保存する（U4）が、どの API からも返さない。
+    /// 登録を丸ごと置き換える（description も含む）。webhook の有無を返す。webhook の値は平文で保存する（U4）が、
+    /// どの API からも返さない。description は公開で、list_agents が返す。
     pub fn register_agent(
         &self,
         room: &str,
         agent: &str,
         webhook: Option<WebhookTarget>,
+        description: Option<&str>,
     ) -> Result<bool, RelayError> {
-        let bytes = agent_bytes(agent, webhook.as_ref());
+        let bytes = agent_bytes(agent, webhook.as_ref(), description);
         self.db.write(|tx| -> Result<_, RelayError> {
             prune(tx, now_ms())?;
             let old: Option<i64> = tx
@@ -1271,12 +1287,13 @@ impl Store {
                 None => (None, None, None),
             };
             tx.prepare_cached(
-                "INSERT INTO relay_agents (room, name, webhook_url, webhook_auth, webhook_secret, data_bytes) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT (room, name) DO UPDATE SET \
+                "INSERT INTO relay_agents (room, name, webhook_url, webhook_auth, webhook_secret, description, data_bytes) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT (room, name) DO UPDATE SET \
                  webhook_url = excluded.webhook_url, webhook_auth = excluded.webhook_auth, \
-                 webhook_secret = excluded.webhook_secret, data_bytes = excluded.data_bytes",
+                 webhook_secret = excluded.webhook_secret, description = excluded.description, \
+                 data_bytes = excluded.data_bytes",
             )?
-            .execute(params![room, agent, url, auth, secret, bytes as i64])?;
+            .execute(params![room, agent, url, auth, secret, description, bytes as i64])?;
             Ok(webhook.is_some())
         })
     }
@@ -1293,13 +1310,14 @@ impl Store {
     }
 
     /// 登録済みの名前を名前順に。`include_seen` ならメッセージの from/to も足す。webhook の値は出さない。
+    /// description は登録したものをそのまま（未登録の名前と未設定は null）。
     pub fn list_agents(&self, room: &str, include_seen: bool) -> Result<Value, RelayError> {
         let names = self.db.read(|c| {
-            let mut names: BTreeMap<String, bool> = c
+            let mut names: BTreeMap<String, (bool, Option<String>)> = c
                 .prepare_cached(
-                    "SELECT name, webhook_url IS NOT NULL FROM relay_agents WHERE room = ?1",
+                    "SELECT name, webhook_url IS NOT NULL, description FROM relay_agents WHERE room = ?1",
                 )?
-                .query_map([room], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .query_map([room], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?
                 .collect::<rusqlite::Result<_>>()?;
             if !include_seen {
                 return Ok(names);
@@ -1312,13 +1330,15 @@ impl Store {
                 .query_map([room], |r| r.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             for name in seen {
-                names.entry(name).or_insert(false);
+                names.entry(name).or_insert((false, None));
             }
             Ok(names)
         })?;
         let agents: Vec<Value> = names
             .into_iter()
-            .map(|(name, webhook)| json!({ "name": name, "webhook": webhook }))
+            .map(|(name, (webhook, description))| {
+                json!({ "name": name, "webhook": webhook, "description": description })
+            })
             .collect();
         Ok(json!({ "agents": agents }))
     }
@@ -1514,7 +1534,7 @@ mod store_tests {
             )
             .unwrap();
         store
-            .register_agent(ROOM, "grok", Some(target("https://hook.example/a")))
+            .register_agent(ROOM, "grok", Some(target("https://hook.example/a")), None)
             .unwrap();
         let att = m.attachments[0].id.clone();
 
@@ -1808,20 +1828,37 @@ mod store_tests {
             },
             Db::open_in_memory(),
         );
-        assert!(!store.register_agent(ROOM, "a", None).unwrap());
+        assert!(!store.register_agent(ROOM, "a", None, None).unwrap());
         let only_name = store.usage(ROOM).0.data_bytes;
         assert_eq!(only_name, AGENT_OVERHEAD + 1);
         // 置き換えは差分だけ数える
         assert!(store
-            .register_agent(ROOM, "a", Some(target("https://hook.example/a")))
+            .register_agent(ROOM, "a", Some(target("https://hook.example/a")), None)
             .unwrap());
         let with_hook = store.usage(ROOM).0.data_bytes;
         assert_eq!(
             with_hook,
             only_name + ("https://hook.example/a".len() + 1) as u64
         );
-        store.register_agent(ROOM, "b", None).unwrap();
-        let err = store.register_agent(ROOM, "c", None).unwrap_err();
+        // description もバイト数で数え、外すと戻る
+        store
+            .register_agent(
+                ROOM,
+                "a",
+                Some(target("https://hook.example/a")),
+                Some("役割"),
+            )
+            .unwrap();
+        assert_eq!(
+            store.usage(ROOM).0.data_bytes,
+            with_hook + "役割".len() as u64
+        );
+        store
+            .register_agent(ROOM, "a", Some(target("https://hook.example/a")), None)
+            .unwrap();
+        assert_eq!(store.usage(ROOM).0.data_bytes, with_hook);
+        store.register_agent(ROOM, "b", None, None).unwrap();
+        let err = store.register_agent(ROOM, "c", None, None).unwrap_err();
         assert_eq!(err.status, 507);
         assert!(
             err.message.starts_with(
@@ -1831,9 +1868,9 @@ mod store_tests {
             err.message
         );
         // 登録済みの名前の置き換えは数に関係なくできる
-        store.register_agent(ROOM, "b", None).unwrap();
+        store.register_agent(ROOM, "b", None, None).unwrap();
         assert!(store.unregister_agent(ROOM, "a").unwrap());
-        store.register_agent(ROOM, "c", None).unwrap();
+        store.register_agent(ROOM, "c", None, None).unwrap();
         assert!(store.unregister_agent(ROOM, "b").unwrap());
         assert!(store.unregister_agent(ROOM, "c").unwrap());
         assert_eq!(store.usage(ROOM), (Usage::default(), Usage::default()));
@@ -1846,9 +1883,17 @@ mod store_tests {
             },
             Db::open_in_memory(),
         );
-        store.register_agent(ROOM, "short", None).unwrap();
+        store.register_agent(ROOM, "short", None, None).unwrap();
         let err = store
-            .register_agent(ROOM, "short", Some(target("https://hook.example/a")))
+            .register_agent(ROOM, "short", Some(target("https://hook.example/a")), None)
+            .unwrap_err();
+        assert!(err
+            .message
+            .starts_with("this room's message storage is full"));
+        assert_eq!(store.usage(ROOM).0.data_bytes, AGENT_OVERHEAD + 5);
+        // description で上限を超える登録も断られ、前の登録が残る
+        let err = store
+            .register_agent(ROOM, "short", None, Some("0123456789"))
             .unwrap_err();
         assert!(err
             .message
@@ -2005,7 +2050,7 @@ mod store_tests {
 
         // register_agent でも消える
         age(&kept.id, RETENTION_DAYS * day + 1_000);
-        store.register_agent(ROOM, "grok", None).unwrap();
+        store.register_agent(ROOM, "grok", None, None).unwrap();
         assert_eq!(
             store
                 .get_thread(ROOM, &json!(mixed.thread_id))

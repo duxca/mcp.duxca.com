@@ -1234,7 +1234,7 @@ async fn state_survives_a_restart_and_secrets_are_stored_hashed() {
         &h.app,
         &access,
         "register_agent",
-        json!({ "agent": "grok",
+        json!({ "agent": "grok", "description": "Wakes up on webhooks; handles builds.",
         "webhook_url": "https://hook.example/wake", "webhook_secret": webhook_secret }),
     )
     .await;
@@ -1275,7 +1275,7 @@ async fn state_survives_a_restart_and_secrets_are_stored_hashed() {
     assert_eq!(muse["messages"][0]["read"], true);
     assert_eq!(
         tool(&h.app, &access, "list_agents", json!({})).await["agents"],
-        json!([{ "name": "grok", "webhook": true }])
+        json!([{ "name": "grok", "webhook": true, "description": "Wakes up on webhooks; handles builds." }])
     );
     // id は戻らない
     let next = tool(
