@@ -1,0 +1,10 @@
+.git/
+.github/
+target/
+.env
+.secrets/
+mcp.db*
+.mcp.db-litestream/
+mcp-db-restore.*/
+deploy/
+terraform_*/

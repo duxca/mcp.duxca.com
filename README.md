@@ -7,31 +7,12 @@ Grok / Claude アプリから呼べる **MCP ゲートウェイ**（Rust / Axum�
 
 ## ローカル起動
 
-**シェルからフォアグラウンドで起動し、Ctrl+C で全部止める。** 本番（duxca VM）は systemd で動かす（末尾の節）。
-
-- Cloudflare Tunnel も同じセッションで起動する
-- 止める = CLI を終了する
+**シェルからフォアグラウンドで起動し、Ctrl+C で止める。** 本番（duxca VM）は systemd で動かす（末尾の節）。
 
 ```sh
-cp .env.example .env   # または .secrets/runtime.env を用意
-./scripts/run.sh
-# Ctrl+C → gateway + tunnel を停止
-```
-
-オプション:
-
-| 変数 / 使い方 | 意味 |
-|---------------|------|
-| `MCP_BIN=./target/debug/mcp-duxca-com` | ビルド済みバイナリを直接起動（未設定時は `cargo run`） |
-| `MCP_USE_RELEASE=1` | `target/release/mcp-duxca-com` があればそれを使う |
-| `CLOUDFLARED_TOKEN` / `TUNNEL_TOKEN` | Tunnel トークン（環境変数。値はログに出さない） |
-| `CLOUDFLARED_TOKEN_FILE` | トークンファイルパス。未設定時の探索順: `/home/box/.cloudflared/mcp-duxca-com.token` → `.secrets/tunnel.token` |
-
-トークンが無い／`cloudflared` が無い場合は **ゲートウェイのみ** で起動し（ローカル確認・テスト向け）、警告を出す。
-
-```sh
+cp .env.example .env
 cargo test
-cargo run   # Tunnel 無しのゲートウェイ単体でも可（PUBLIC_URL 必須）
+cargo run   # Tunnel 無しのゲートウェイ単体（PUBLIC_URL 必須）
 ```
 
 ## アーキテクチャ
@@ -40,7 +21,7 @@ cargo run   # Tunnel 無しのゲートウェイ単体でも可（PUBLIC_URL 必
 [Grok / Claude クラウド]
         │ HTTPS
         ▼
- Cloudflare Tunnel  ──►  mcp.duxca.com ゲートウェイ (Axum)   ← 同じシェル／Ctrl+C で両方停止
+ Cloudflare Tunnel  ──►  mcp.duxca.com ゲートウェイ (Axum)
                               │
                               ├─ OAuth 認可サーバ（動的登録 / CIMD / PKCE）※オリジン共通 1 本
                               ├─ GitHub OAuth で本人確認（数値 id allowlist）
@@ -166,8 +147,6 @@ curl -si -X POST http://127.0.0.1:8000/relay/v1 \
 | `DATABASE_PATH` | OAuth と relay を残す SQLite のファイル（既定 `mcp.db`、作業ディレクトリからの相対パス） |
 | `SQLITE_WAL_AUTOCHECKPOINT` | 未設定なら SQLite の既定。Litestream と組むときだけ 0 にする |
 | `RUST_LOG` | ログの絞り込み（未設定なら `info`） |
-| `CLOUDFLARED_TOKEN_FILE` | Tunnel トークンファイル（`scripts/run.sh`） |
-| `MCP_BIN` | ゲートウェイ実行ファイル（`scripts/run.sh`） |
 
 ## これから
 
@@ -183,7 +162,7 @@ curl -si -X POST http://127.0.0.1:8000/relay/v1 \
 - CIMD 取得は公開 IP だけに接続する。ローカル DNS が合成アドレスを返すときは Cloudflare DoH にフォールバックする。
 - ループバック redirect（`http://localhost/callback`）は RFC 8252 どおりポート違いを許す。
 - redirect_uri は `OAUTH_REDIRECT_ALLOWLIST` に載るものだけ受ける。`/register` は `invalid_client_metadata`、CIMD は文書ごと拒否、`/authorize` はリダイレクトせず 400 JSON。fragment・userinfo 付きは常に拒否。
-- ローカルは `./scripts/run.sh`、本番は systemd（次節）。
+- ローカルは `cargo run`、本番は systemd（次節）。
 
 ## duxca VM へのデプロイ
 

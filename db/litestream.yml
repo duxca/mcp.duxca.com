@@ -1,0 +1,11 @@
+# Litestream v0.5 系
+snapshot:
+  interval: 1h
+  retention: 720h
+
+dbs:
+  - path: mcp.db
+    replica:
+      type: gs
+      bucket: ${LITESTREAM_BUCKET}
+      path: mcp.db
