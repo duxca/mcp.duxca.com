@@ -275,7 +275,7 @@ async fn agents_exchange_messages_symmetrically() {
         .await;
     assert_eq!(
         agents,
-        json!({ "agents": [{ "name": "grok", "webhook": false }, { "name": "muse", "webhook": false }] })
+        json!({ "agents": [{ "name": "grok", "webhook": false, "description": null }, { "name": "muse", "webhook": false, "description": null }] })
     );
 
     let thread = grok
@@ -845,6 +845,25 @@ async fn mcp_initialize_lists_symmetric_tools() {
         list_agents["inputSchema"]["properties"]["include_seen"]["default"],
         false
     );
+    assert!(list_agents["description"]
+        .as_str()
+        .unwrap()
+        .contains("{name, webhook, description}"));
+    assert_eq!(required("register_agent"), json!(["agent"]));
+    let register = tools
+        .iter()
+        .find(|t| t["name"] == "register_agent")
+        .unwrap();
+    assert_eq!(
+        register["inputSchema"]["properties"]["description"]["type"],
+        "string"
+    );
+    let text = register["description"].as_str().unwrap();
+    assert!(text.contains("description of your role"), "{text}");
+    assert!(
+        text.contains("Replaces your previous registration entirely"),
+        "{text}"
+    );
     // 方向つきの旧ツール名は残っていない
     assert!(!r.to_string().contains("send_to_muse"));
     assert!(!r.to_string().contains("check_muse_messages"));
@@ -1047,7 +1066,12 @@ async fn retired_paths_are_gone_and_docs_describe_the_new_design() {
             docs.contains("survives relay\nrestarts until you replace it or call unregister_agent")
         );
         assert!(docs.contains("A message and its files are deleted 7 days after it was sent"));
-        assert!(docs.contains("- list_agents {include_seen? (default false)}"));
+        assert!(docs.contains(
+            "- list_agents {include_seen? (default false)} -> {agents: [{name, webhook, description}]}"
+        ));
+        assert!(
+            docs.contains("- register_agent {agent, description? (max 500 characters, public),")
+        );
         assert!(
             docs.contains("By default only the agents currently registered with register_agent")
         );
@@ -1179,7 +1203,7 @@ async fn webhooks_are_registered_by_the_recipient() {
     assert_eq!(r, json!({ "agent": "grok", "webhook": true }));
     assert_eq!(
         muse.ok("list_agents", json!({})).await,
-        json!({ "agents": [{ "name": "grok", "webhook": true }] })
+        json!({ "agents": [{ "name": "grok", "webhook": true, "description": null }] })
     );
 
     let sent = muse
@@ -1308,7 +1332,7 @@ async fn webhooks_are_registered_by_the_recipient() {
     assert_eq!(
         muse.ok("list_agents", json!({ "include_seen": true }))
             .await,
-        json!({ "agents": [{ "name": "grok", "webhook": false }, { "name": "muse", "webhook": false }] })
+        json!({ "agents": [{ "name": "grok", "webhook": false, "description": null }, { "name": "muse", "webhook": false, "description": null }] })
     );
 
     // 2xx 以外は notified:false
@@ -1475,7 +1499,7 @@ async fn webhook_registration_is_validated_without_echoing_values() {
     );
     assert_eq!(
         c.ok("list_agents", json!({})).await,
-        json!({ "agents": [{ "name": "grok", "webhook": false }, { "name": "muse", "webhook": true }] })
+        json!({ "agents": [{ "name": "grok", "webhook": false, "description": null }, { "name": "muse", "webhook": true, "description": null }] })
     );
     assert!(c
         .err("register_agent", json!({}))
@@ -1514,8 +1538,8 @@ async fn list_agents_shows_registrations_unless_seen_names_are_asked_for() {
     );
 
     let registered = json!({ "agents": [
-        { "name": "grok", "webhook": true },
-        { "name": "muse", "webhook": false },
+        { "name": "grok", "webhook": true, "description": null },
+        { "name": "muse", "webhook": false, "description": null },
     ] });
     assert_eq!(c.ok("list_agents", json!({})).await, registered);
     assert_eq!(
@@ -1525,11 +1549,11 @@ async fn list_agents_shows_registrations_unless_seen_names_are_asked_for() {
     assert_eq!(
         c.ok("list_agents", json!({ "include_seen": true })).await,
         json!({ "agents": [
-            { "name": "claude app", "webhook": false },
-            { "name": "drifter", "webhook": false },
-            { "name": "ghost", "webhook": false },
-            { "name": "grok", "webhook": true },
-            { "name": "muse", "webhook": false },
+            { "name": "claude app", "webhook": false, "description": null },
+            { "name": "drifter", "webhook": false, "description": null },
+            { "name": "ghost", "webhook": false, "description": null },
+            { "name": "grok", "webhook": true, "description": null },
+            { "name": "muse", "webhook": false, "description": null },
         ] })
     );
 }
@@ -1926,6 +1950,7 @@ async fn webhooks_are_sent_only_to_public_addresses() {
                     auth: None,
                     secret: "s".into(),
                 }),
+                None,
             )
             .unwrap();
         let r = c
@@ -1984,4 +2009,107 @@ async fn webhook_deliveries_are_limited_in_number() {
     assert_eq!(r["notified"], true);
     assert_eq!(captured.lock().unwrap().len(), 1);
     server.abort();
+}
+
+#[tokio::test]
+async fn agent_descriptions_are_listed_replaced_and_limited() {
+    let (_h, c) = setup().await;
+    let list = |v: Value| v["agents"].clone();
+    assert_eq!(
+        c.ok(
+            "register_agent",
+            json!({ "agent": "muse", "description": "Reviews PRs.\n日本語も可 😀" }),
+        )
+        .await,
+        json!({ "agent": "muse", "webhook": false })
+    );
+    assert_eq!(
+        list(c.ok("list_agents", json!({})).await),
+        json!([{ "name": "muse", "webhook": false, "description": "Reviews PRs.\n日本語も可 😀" }])
+    );
+
+    // 丸ごと置き換え: 省略すると消え、別の値なら置き換わる
+    c.ok("register_agent", json!({ "agent": "muse" })).await;
+    assert_eq!(
+        list(c.ok("list_agents", json!({})).await),
+        json!([{ "name": "muse", "webhook": false, "description": null }])
+    );
+    // 空文字も webhook の引数と同じく「無し」
+    c.ok(
+        "register_agent",
+        json!({ "agent": "muse", "description": "" }),
+    )
+    .await;
+    assert_eq!(
+        list(c.ok("list_agents", json!({})).await)[0]["description"],
+        Value::Null
+    );
+    c.ok(
+        "register_agent",
+        json!({ "agent": "muse", "description": "first" }),
+    )
+    .await;
+    c.ok(
+        "register_agent",
+        json!({ "agent": "muse", "description": "second", "webhook_url": "https://hook.example/m", "webhook_secret": "s" }),
+    )
+    .await;
+    assert_eq!(
+        list(c.ok("list_agents", json!({})).await),
+        json!([{ "name": "muse", "webhook": true, "description": "second" }])
+    );
+
+    // 500 文字まで（send_message の text と同じく UTF-16 コードユニットで数える）
+    let ascii = "a".repeat(500);
+    let emoji = "😀".repeat(250); // 500 UTF-16 単位、1000 バイト
+    for ok in [&ascii, &emoji] {
+        c.ok(
+            "register_agent",
+            json!({ "agent": "grok", "description": ok }),
+        )
+        .await;
+        assert_eq!(
+            list(c.ok("list_agents", json!({})).await)[0]["description"],
+            json!(ok)
+        );
+    }
+    for bad in [
+        json!("a".repeat(501)),
+        json!(format!("{emoji}a")),
+        json!(42),
+        json!(["role"]),
+        json!({ "role": "x" }),
+        json!(true),
+    ] {
+        let error = c
+            .err(
+                "register_agent",
+                json!({ "agent": "grok", "description": bad }),
+            )
+            .await;
+        assert!(
+            error.contains("\"description\" must be a string of at most 500 characters"),
+            "{bad}: {error}"
+        );
+    }
+    // 断られた登録は前の登録を変えない
+    assert_eq!(
+        list(c.ok("list_agents", json!({})).await)[0]["description"],
+        json!(emoji)
+    );
+
+    // include_seen: 登録済みは自分の description と webhook、見かけただけの名前は null
+    c.ok(
+        "send_message",
+        json!({ "agent": "drifter", "to": "muse", "text": "hi" }),
+    )
+    .await;
+    assert_eq!(
+        list(c.ok("list_agents", json!({ "include_seen": true })).await),
+        json!([
+            { "name": "drifter", "webhook": false, "description": null },
+            { "name": "grok", "webhook": false, "description": emoji },
+            { "name": "muse", "webhook": true, "description": "second" },
+        ])
+    );
 }

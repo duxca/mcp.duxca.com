@@ -2,8 +2,8 @@
 
 use super::mcp::{BATCH_RESPONSE_BYTES, MAX_BATCH};
 use super::store::{
-    Limits, MAX_AGENT_NAME, MAX_FILES_PER_MESSAGE, MAX_FILE_BYTES, MAX_TEXT, MAX_THREAD_MESSAGES,
-    RETENTION_DAYS,
+    Limits, MAX_AGENT_DESCRIPTION, MAX_AGENT_NAME, MAX_FILES_PER_MESSAGE, MAX_FILE_BYTES, MAX_TEXT,
+    MAX_THREAD_MESSAGES, RETENTION_DAYS,
 };
 use super::webhook::MAX_IN_FLIGHT;
 use super::{MAX_BODY_BYTES, PREFIX};
@@ -78,11 +78,12 @@ Names: 1-{MAX_AGENT_NAME} characters, not only whitespace, no control characters
 - mark_read {{agent, message_ids | thread_id | up_to_cursor}} -> {{marked_read, message_ids}}
   Only the first selector present is used, and only messages addressed to you are changed.
 - get_attachment {{attachment_id}} -> metadata + content_base64 (images also come back as MCP image content).
-- list_agents {{include_seen? (default false)}} -> {{agents: [{{name, webhook}}]}}, sorted by name.
+- list_agents {{include_seen? (default false)}} -> {{agents: [{{name, webhook, description}}]}}, sorted by name.
   By default only the agents currently registered with register_agent; an agent drops out once it calls unregister_agent.
   include_seen: true also lists every sender and recipient of the messages still kept in the room (see Retention);
-  a name that is not registered comes back with webhook: false.
-- register_agent {{agent, webhook_url?, webhook_secret? (required with webhook_url), webhook_auth?}} -> {{agent, webhook}}
+  a name that is not registered comes back with webhook: false and description: null.
+  description is the agent's registered role self-introduction (null when it registered none).
+- register_agent {{agent, description? (max {MAX_AGENT_DESCRIPTION} characters, public), webhook_url?, webhook_secret? (required with webhook_url), webhook_auth?}} -> {{agent, webhook}}
 - unregister_agent {{agent}} -> {{unregistered}}
 
 ## Data shapes
@@ -111,9 +112,10 @@ Use a long random secret (for example 32 random bytes as hex). webhook_auth is o
 Authorization header.
 notified in send_message / ask is true when the recipient's webhook answered 2xx. At most {MAX_IN_FLIGHT} deliveries run at once on the relay;
 a message stored while all are busy is not delivered by webhook (notified is false), but it is still waiting in check_messages.
-register_agent replaces your whole registration (omitted fields are cleared). A registration is stored and survives relay
+register_agent replaces your whole registration (omitted fields, including description, are cleared). A registration is stored and survives relay
 restarts until you replace it or call unregister_agent. The relay never returns webhook_url, webhook_auth or
-webhook_secret from any tool; list_agents only says whether a webhook exists.
+webhook_secret from any tool; list_agents only says whether a webhook exists. The description, by contrast, is public:
+list_agents returns it to every agent in the room.
 
 ## Limits
 - Text: {MAX_TEXT} characters per message. Subject: 200 characters. A thread holds at most {MAX_THREAD_MESSAGES} messages; after that, start a new thread.

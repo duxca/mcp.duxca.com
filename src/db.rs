@@ -8,7 +8,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 /// `user_version` は適用済みの数。足すときは末尾に追加する（適用済みの SQL は書き換えない）。
-const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_init.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("../migrations/0001_init.sql"),
+    include_str!("../migrations/0002_agent_description.sql"),
+];
 
 /// DB の失敗。HTTP では 503 にする（401 や invalid_grant にすると、クライアントに再認可を促してしまう）。
 #[derive(Debug, thiserror::Error)]
@@ -136,7 +139,10 @@ mod tests {
             assert_eq!(get("busy_timeout")?, "Integer(5000)");
             assert_eq!(get("auto_vacuum")?, "Integer(2)"); // INCREMENTAL
             assert_eq!(get("wal_autocheckpoint")?, "Integer(1000)"); // SQLite の既定
-            assert_eq!(get("user_version")?, "Integer(1)");
+            assert_eq!(
+                get("user_version")?,
+                format!("Integer({})", MIGRATIONS.len())
+            );
             Ok(())
         })
         .unwrap();
@@ -148,10 +154,59 @@ mod tests {
             .read(|c| c.pragma_query_value(None, "wal_autocheckpoint", |r| r.get(0)))
             .unwrap();
         assert_eq!(checkpoint, 0);
-        db.read(|c| c.pragma_update(None, "user_version", 2))
+        db.read(|c| c.pragma_update(None, "user_version", MIGRATIONS.len() as i64 + 1))
             .unwrap();
         drop(db);
         let err = Db::open(path, None).err().unwrap().to_string();
         assert!(err.contains("newer than this binary"), "{err}");
+    }
+
+    /// v1 のまま（本番の旧バイナリが作った形）の DB を今のコードで開くと v2 になり、行は残る。
+    #[test]
+    fn a_v1_database_migrates_forward_and_keeps_its_rows() {
+        assert_eq!(MIGRATIONS.len(), 2);
+        let path = TempPath::new("v1");
+        {
+            // 旧バイナリと同じ手順で 0001 だけを当てる
+            let mut conn = Connection::open(&path.0).unwrap();
+            conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")
+                .unwrap();
+            conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute_batch(MIGRATIONS[0]).unwrap();
+            tx.pragma_update(None, "user_version", 1).unwrap();
+            tx.execute(
+                "INSERT INTO relay_agents (room, name, webhook_url, webhook_auth, webhook_secret, data_bytes) \
+                 VALUES ('r', 'grok', 'https://hook.example/w', NULL, 's', 150)",
+                [],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let db = Db::open(&path.0, None).unwrap();
+        let (version, row): (i64, (String, String, Option<String>, i64)) = db
+            .read(|c| {
+                Ok((
+                    c.pragma_query_value(None, "user_version", |r| r.get(0))?,
+                    c.query_row(
+                        "SELECT name, webhook_url, description, data_bytes FROM relay_agents WHERE room = 'r'",
+                        [],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    )?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(version, 2);
+        assert_eq!(
+            row,
+            ("grok".into(), "https://hook.example/w".into(), None, 150)
+        );
+        drop(db);
+        // 開き直しても v2 のまま
+        let db = Db::open(&path.0, None).unwrap();
+        let version: i64 = db
+            .read(|c| c.pragma_query_value(None, "user_version", |r| r.get(0)))
+            .unwrap();
+        assert_eq!(version, 2);
     }
 }
