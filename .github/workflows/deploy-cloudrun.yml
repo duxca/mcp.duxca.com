@@ -17,7 +17,7 @@ on:
   workflow_dispatch:
     inputs:
       deploy_app:
-        description: "terraform_gcp_app も apply する（カットオーバーの窓の中だけ）"
+        description: "terraform_gcp_app と terraform_cf も apply する（カットオーバーの窓の中だけ）"
         type: boolean
         default: false
 
@@ -34,10 +34,18 @@ jobs:
       contents: read
       id-token: write
     steps:
-    - name: Check repository variables
+    - name: Check repository variables and secrets
+      env:
+        DEPLOY_APP: ${{ inputs.deploy_app }}
+        HAS_CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN != '' }}
       run: |
         if [ -z "${PROJECT_NUMBER}" ]; then
           echo "::error::Repository variable GCP_PROJECT_NUMBER is not set"
+          exit 1
+        fi
+        # app を apply してから cf で落ちないよう、最初に確かめる
+        if [ "${DEPLOY_APP}" = true ] && [ "${HAS_CLOUDFLARE_API_TOKEN}" != true ]; then
+          echo "::error::Secret CLOUDFLARE_API_TOKEN is not set"
           exit 1
         fi
     - uses: actions/checkout@v6
@@ -116,3 +124,38 @@ jobs:
           sleep 10
         done
         exit 1
+    # run.app の確認が通ってから DNS を替える（DESIGN.md §6.12 の手順 4→5）
+    - name: Terraform Apply Cloudflare
+      if: ${{ inputs.deploy_app }}
+      working-directory: ./terraform_cf
+      env:
+        CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      run: |
+        set -euo pipefail
+        timeout 5m terraform init
+        timeout 10m terraform plan -out=tfplan -var-file=prod.tfvars
+        timeout 20m terraform apply -auto-approve tfplan
+    # 証明書の発行は数分〜それ以上かかるので、時間切れは警告にとどめる
+    - name: Check public URL
+      if: ${{ inputs.deploy_app }}
+      run: |
+        set -uo pipefail
+        url="https://mcp.duxca.com"
+        code() { curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$@" || true; }
+        for i in $(seq 30); do
+          relay=$(code "${url}/relay/v1/health")
+          meta=$(code "${url}/.well-known/oauth-authorization-server")
+          # cf-ray があれば、まだ Cloudflare のプロキシ（トンネル）経由で返っている
+          cfray=$(curl -s -o /dev/null -w '%header{cf-ray}' --max-time 15 "${url}/relay/v1/health" || true)
+          echo "try $i: GET /relay/v1/health=$relay GET /.well-known/oauth-authorization-server=$meta cf-ray=${cfray:-none}"
+          if [ "$relay" = 200 ] && [ "$meta" = 200 ] && [ -z "$cfray" ]; then
+            echo "Public URL \`${url}\`: OK on try $i" >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          sleep 20
+        done
+        echo "::warning::${url} did not answer 200 from Cloud Run within 30 tries (certificate may still be issuing)"
+        {
+          echo "Public URL \`${url}\`: **not reachable on Cloud Run yet** (last: relay=$relay meta=$meta cf-ray=${cfray:-none})."
+          echo "Check: \`gcloud run domain-mappings describe --domain=mcp.duxca.com --region=asia-northeast1 --project=${PROJECT_ID}\`"
+        } >> "${GITHUB_STEP_SUMMARY}"
