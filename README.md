@@ -3,7 +3,7 @@
 Grok / Claude アプリから呼べる **MCP ゲートウェイ**（Rust / Axum）。
 
 参考実装は pascal 上の `~/Github/mcp-test`（Python / Starlette）。
-公開は Cloudflare Tunnel で `https://mcp.duxca.com` に載せる。MCP エンドポイントは組み込みの relay（`/relay/v1`）だけ。
+公開は Cloud Run で、`terraform_gcp_app` の Cloud Run domain mapping と `terraform_cf` の Cloudflare DNS record（DNS-only の CNAME）で `https://mcp.duxca.com` に載せる。MCP エンドポイントは組み込みの relay（`/relay/v1`）だけ。
 
 ## ローカル起動
 
