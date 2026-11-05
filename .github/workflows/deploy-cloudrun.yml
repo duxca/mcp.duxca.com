@@ -1,0 +1,118 @@
+name: Deploy to Cloud Run
+
+env:
+  PROJECT_ID: mcp-duxca-prod
+  # プロジェクトを作るまで番号が決まらないので、リポジトリ変数から取る
+  PROJECT_NUMBER: ${{ vars.GCP_PROJECT_NUMBER }}
+  POOL_ID: githubaction
+  PROVIDER_ID: github
+  SERVICE_ACCOUNT: github-action-mcp@mcp-duxca-prod.iam.gserviceaccount.com
+  IMAGE_REPOSITORY: asia-northeast1-docker.pkg.dev/mcp-duxca-prod/cloud-run-source-deploy/mcp-duxca-com
+  IMAGE_TAG: latest
+  CARGO_TERM_COLOR: always
+  TF_INPUT: "false"
+
+# 移行中（3b/3c）は手動起動だけ。VM へのデプロイは deploy.yml が push で続ける（DESIGN.md §6.10）
+on:
+  workflow_dispatch:
+    inputs:
+      deploy_app:
+        description: "terraform_gcp_app も apply する（カットオーバーの窓の中だけ）"
+        type: boolean
+        default: false
+
+concurrency:
+  group: deploy-cloudrun
+  cancel-in-progress: false
+
+jobs:
+
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+    - name: Check repository variables
+      run: |
+        if [ -z "${PROJECT_NUMBER}" ]; then
+          echo "::error::Repository variable GCP_PROJECT_NUMBER is not set"
+          exit 1
+        fi
+    - uses: actions/checkout@v6
+    - uses: dtolnay/rust-toolchain@1.96.0
+    - uses: Swatinem/rust-cache@v2
+    - run: cargo test --locked
+    - uses: google-github-actions/auth@v3
+      with:
+        workload_identity_provider: projects/${{ env.PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ env.POOL_ID }}/providers/${{ env.PROVIDER_ID }}
+        project_id: ${{ env.PROJECT_ID }}
+        service_account: ${{ env.SERVICE_ACCOUNT }}
+    - uses: google-github-actions/setup-gcloud@v3
+    - uses: hashicorp/setup-terraform@v4
+      with:
+        terraform_version: 1.15.5
+        terraform_wrapper: false
+    - name: Terraform Apply GCP Storage
+      working-directory: ./terraform_gcp_storage
+      run: |
+        set -euo pipefail
+        timeout 5m terraform init
+        timeout 10m terraform plan -out=tfplan -var-file=prod.tfvars
+        timeout 20m terraform apply -auto-approve tfplan
+    - run: gcloud auth configure-docker asia-northeast1-docker.pkg.dev
+    - uses: docker/setup-buildx-action@v4
+    - name: Build and push image
+      id: build
+      uses: docker/build-push-action@v7
+      with:
+        context: .
+        platforms: linux/amd64
+        push: true
+        tags: ${{ env.IMAGE_REPOSITORY }}:${{ env.IMAGE_TAG }}
+        cache-from: type=gha,scope=runtime-image
+        cache-to: type=gha,mode=max,scope=runtime-image
+    - name: Resolve pushed image digest
+      id: image
+      run: |
+        set -euo pipefail
+        image="${{ env.IMAGE_REPOSITORY }}@${{ steps.build.outputs.digest }}"
+        echo "image=${image}" >> "${GITHUB_OUTPUT}"
+        echo "Pushed ${image}"
+        echo "Pushed \`${image}\`" >> "${GITHUB_STEP_SUMMARY}"
+    - name: Verify Secret Manager version
+      if: ${{ inputs.deploy_app }}
+      run: |
+        set -euo pipefail
+        gcloud secrets versions access latest \
+          --project="${PROJECT_ID}" \
+          --secret=GITHUB_CLIENT_SECRET >/dev/null
+    - name: Terraform Apply GCP App
+      if: ${{ inputs.deploy_app }}
+      working-directory: ./terraform_gcp_app
+      env:
+        CONTAINER_IMAGE: ${{ steps.image.outputs.image }}
+      run: |
+        set -euo pipefail
+        timeout 5m terraform init
+        timeout 10m terraform plan -out=tfplan -var-file=prod.tfvars -var="container_image=${CONTAINER_IMAGE}"
+        timeout 20m terraform apply -auto-approve tfplan
+    - name: Check run.app URL
+      if: ${{ inputs.deploy_app }}
+      working-directory: ./terraform_gcp_app
+      run: |
+        set -euo pipefail
+        url="$(terraform output -raw cloud_run_url)"
+        echo "Cloud Run URL: \`${url}\`" >> "${GITHUB_STEP_SUMMARY}"
+        code() { curl -s -o /dev/null -w '%{http_code}' --max-time 30 "$@" || true; }
+        for i in $(seq 6); do
+          relay=$(code "${url}/relay/v1/health")
+          meta=$(code "${url}/.well-known/oauth-authorization-server")
+          health=$(code "${url}/health")
+          adb=$(code -X POST "${url}/adb/v1")
+          echo "try $i: GET /relay/v1/health=$relay GET /.well-known/oauth-authorization-server=$meta GET /health=$health POST /adb/v1=$adb"
+          if [ "$relay" = 200 ] && [ "$meta" = 200 ] && [ "$health" = 404 ] && [ "$adb" = 404 ]; then exit 0; fi
+          sleep 10
+        done
+        exit 1
