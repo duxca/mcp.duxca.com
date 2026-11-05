@@ -5,3 +5,8 @@
 *.swo
 .DS_Store
 /mcp.db*
+.terraform/
+*.tfstate
+*.tfstate.backup
+tfplan
+terraform.tfvars
