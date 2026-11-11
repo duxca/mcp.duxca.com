@@ -162,17 +162,21 @@ curl -si -X POST http://127.0.0.1:8000/relay/v1 \
 - CIMD 取得は公開 IP だけに接続する。ローカル DNS が合成アドレスを返すときは Cloudflare DoH にフォールバックする。
 - ループバック redirect（`http://localhost/callback`）は RFC 8252 どおりポート違いを許す。
 - redirect_uri は `OAUTH_REDIRECT_ALLOWLIST` に載るものだけ受ける。`/register` は `invalid_client_metadata`、CIMD は文書ごと拒否、`/authorize` はリダイレクトせず 400 JSON。fragment・userinfo 付きは常に拒否。
-- ローカルは `cargo run`、本番は systemd（次節）。
+- ローカルは `cargo run`、本番は Cloud Run（次節）。
 
-## duxca VM へのデプロイ
+## Cloud Run へのデプロイ
 
-`main` への push で `.github/workflows/deploy.yml` が走り、ビルドしたバイナリと `deploy/` を
-`duxca` VM（`duxca.com:4322`）に送って `deploy/install.sh` を sudo 実行する。
+`main` への push で `.github/workflows/deploy-cloudrun.yml` が走り、テスト後にイメージを
+ビルドして Cloud Run（プロジェクト `mcp-duxca-prod`、asia-northeast1）へデプロイする。
+手動起動（workflow_dispatch）もでき、`deploy_app=false` ならビルドと push だけで止まる。
 
-- systemd: `mcp-duxca-com.service`（gateway, 127.0.0.1:8000）と
-  `mcp-duxca-com-tunnel.service`（cloudflared）。どちらも専用ユーザー `mcp-duxca` で動く。
-- 秘密は GitHub Secrets: `MCP_GITHUB_CLIENT_ID`, `MCP_GITHUB_CLIENT_SECRET`, `MCP_TUNNEL_TOKEN`,
-  `DUXCA_SSH_KEY`, `DUXCA_KNOWN_HOSTS`。VM 上では `/etc/mcp-duxca-com/`（root:mcp-duxca 640）。
-- DB は `/var/lib/mcp-duxca-com/mcp.db`。`install.sh` はゲートウェイを再起動するときだけ、止めてから
-  `mcp.db`（と `-wal` / `-shm`）を `/var/lib/mcp-duxca-com/backup/<時刻>/` に写して起動する（新しい 3 世代を残す）。
-  スキーマは前進だけで、DB の版がバイナリより新しいと起動しない。バイナリを戻すときは DB もここから戻す。
+- 構成は terraform: `terraform_ci`（WIF とデプロイ用 SA）、`terraform_gcp_storage`
+  （Litestream 用バケット、Artifact Registry、Secret Manager）、`terraform_gcp_app`
+  （Cloud Run とドメインマッピング）、`terraform_cf`（DNS）。状態は
+  `gs://mcp-duxca-prod-terraform-state`。
+- DB は SQLite + Litestream で `gs://mcp-duxca-prod-litestream/mcp.db` に複製される。
+  起動時に復元し、実行中は WAL を送り続ける。
+- 秘密は GitHub Secrets の `CLOUDFLARE_API_TOKEN`（terraform_cf 用）と Secret Manager の
+  `GITHUB_CLIENT_SECRET` だけ。GitHub の client id は `terraform_gcp_app/prod.tfvars`。
+- duxca VM の旧ゲートウェイ（systemd）は停止・無効化済み。VM 上の DB
+  `/var/lib/mcp-duxca-com/mcp.db` は切り戻し用に残してある。
