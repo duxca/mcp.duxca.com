@@ -8,6 +8,22 @@ variable "github_repositories" {
   type        = list(string)
 }
 
+variable "github_repository_id" {
+  description = "Numeric GitHub repository ID allowed to impersonate the deployer (immutable, unlike the name)"
+  type        = string
+}
+
+variable "github_repository_owner_id" {
+  description = "Numeric GitHub repository owner ID allowed to impersonate the deployer"
+  type        = string
+}
+
+variable "deploy_workflow_path" {
+  description = "Workflow file allowed to impersonate the deployer, as it appears in the job_workflow_ref claim"
+  type        = string
+  default     = "duxca/mcp.duxca.com/.github/workflows/deploy-cloudrun.yml"
+}
+
 variable "workload_identity_pool_id" {
   description = "Workload Identity Pool ID for GitHub Actions"
   type        = string

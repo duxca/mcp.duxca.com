@@ -6,7 +6,10 @@ locals {
   deployer_service_account_email = "${var.deployer_service_account_id}@${var.project_id}.iam.gserviceaccount.com"
   deployer_member                = "serviceAccount:${local.deployer_service_account_email}"
   github_main_ref_principal      = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github_actions.name}/attribute.ref/refs/heads/main"
-  github_repository_condition    = join(" || ", [for repository in var.github_repositories : "attribute.repository == '${repository}'"])
+  # Name-based matching is forgeable after a rename/re-registration, so the
+  # condition keys on the immutable numeric IDs, and additionally requires
+  # the deploy workflow itself and a push / workflow_dispatch event (L-2).
+  github_repository_condition = "attribute.repository_id == '${var.github_repository_id}' && attribute.repository_owner_id == '${var.github_repository_owner_id}' && attribute.job_workflow_ref == '${var.deploy_workflow_path}@refs/heads/main' && (attribute.event_name == 'push' || attribute.event_name == 'workflow_dispatch')"
 
   # 新規プロジェクトでは無効。WIF のトークン交換（sts）と SA の借用（iamcredentials）にも要る
   ci_services = toset([
@@ -54,10 +57,14 @@ resource "google_iam_workload_identity_pool_provider" "github" {
   display_name                       = "GitHub"
 
   attribute_mapping = {
-    "google.subject"       = "assertion.sub"
-    "attribute.repository" = "assertion.repository"
-    "attribute.actor"      = "assertion.actor"
-    "attribute.ref"        = "assertion.ref"
+    "google.subject"                = "assertion.sub"
+    "attribute.repository"          = "assertion.repository"
+    "attribute.repository_id"       = "assertion.repository_id"
+    "attribute.repository_owner_id" = "assertion.repository_owner_id"
+    "attribute.actor"               = "assertion.actor"
+    "attribute.ref"                 = "assertion.ref"
+    "attribute.event_name"          = "assertion.event_name"
+    "attribute.job_workflow_ref"    = "assertion.job_workflow_ref"
   }
 
   attribute_condition = "(${local.github_repository_condition}) && attribute.ref == 'refs/heads/main'"

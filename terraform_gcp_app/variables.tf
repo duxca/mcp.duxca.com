@@ -25,6 +25,11 @@ variable "github_client_id" {
   type        = string
 }
 
+variable "oauth_redirect_allowlist" {
+  description = "OAuth redirect_uri allowlist (comma-separated). Replaces the code defaults when set."
+  type        = string
+}
+
 variable "github_client_secret_version" {
   description = "Secret Manager version for GITHUB_CLIENT_SECRET"
   type        = string
