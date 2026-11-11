@@ -232,14 +232,122 @@ fn authorize_path(client_id: &str, challenge: &str, resource: Option<&str>) -> S
     format!("/authorize?{}", encode(&pairs))
 }
 
-async fn github_state(app: &Router, client_id: &str, challenge: &str, resource: &str) -> String {
-    let started = get(app, &authorize_path(client_id, challenge, Some(resource))).await;
-    assert_eq!(started.status, StatusCode::FOUND, "{}", started.body);
-    let location = started.location();
-    assert!(location
-        .as_str()
-        .starts_with("https://github.com/login/oauth/authorize"));
-    query(&location)["state"].clone()
+/// `Set-Cookie` の `name=value`。
+fn set_cookie(reply: &Reply) -> Option<String> {
+    reply
+        .headers
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .map(|v| v.split(';').next().unwrap_or_default().to_string())
+        .next()
+}
+
+fn html_unescape(s: &str) -> String {
+    s.replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// 同意画面の hidden の値（出てくる順）。
+fn hidden_fields(html: &str) -> Vec<(String, String)> {
+    const START: &str = "<input type=\"hidden\" name=\"";
+    let mut out = Vec::new();
+    let mut rest = html;
+    while let Some(i) = rest.find(START) {
+        rest = &rest[i + START.len()..];
+        let end = rest.find('"').unwrap();
+        let name = html_unescape(&rest[..end]);
+        rest = &rest[end..];
+        rest = &rest[rest.find("value=\"").unwrap() + "value=\"".len()..];
+        let end = rest.find('"').unwrap();
+        out.push((name, html_unescape(&rest[..end])));
+        rest = &rest[end..];
+    }
+    out
+}
+
+fn assert_consent_page(page: &Reply) {
+    assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+    assert!(
+        page.body.contains("このアプリに接続を許可するか"),
+        "{}",
+        page.body
+    );
+    assert!(page.headers.get(header::LOCATION).is_none());
+}
+
+/// 同意画面で `action`（approve / deny）を押す。`cookie` が None なら画面の Set-Cookie を使う。
+async fn submit_consent(app: &Router, page: &Reply, action: &str, cookie: Option<&str>) -> Reply {
+    let cookie = cookie
+        .map(str::to_string)
+        .or_else(|| set_cookie(page))
+        .unwrap_or_default();
+    let mut pairs = hidden_fields(&page.body);
+    pairs.push(("consent_action".into(), action.into()));
+    let pairs: Vec<(&str, &str)> = pairs
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    send(
+        app,
+        Request::post("/authorize/consent")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(header::COOKIE, cookie)
+            .body(Body::from(encode(&pairs)))
+            .unwrap(),
+    )
+    .await
+}
+
+/// GitHub へ送られた認可。callback には同じブラウザ（Cookie）で戻る。
+pub(crate) struct Started {
+    state: String,
+    cookie: String,
+}
+
+/// `/authorize` から GitHub へ送られるところまで。同意画面が出たら許可する。
+async fn start(app: &Router, path: &str) -> Started {
+    let first = get(app, path).await;
+    let reply = if first.status == StatusCode::OK {
+        assert_consent_page(&first);
+        submit_consent(app, &first, "approve", None).await
+    } else {
+        first
+    };
+    assert_eq!(reply.status, StatusCode::FOUND, "{}", reply.body);
+    let location = reply.location();
+    assert!(
+        location
+            .as_str()
+            .starts_with("https://github.com/login/oauth/authorize"),
+        "{location}"
+    );
+    Started {
+        state: query(&location)["state"].clone(),
+        cookie: set_cookie(&reply).expect("the browser cookie"),
+    }
+}
+
+/// GitHub から `/oauth/callback/github` へ戻る。`login` はフェイク GitHub のコード。
+async fn callback(app: &Router, started: &Started, login: &str) -> Reply {
+    send(
+        app,
+        Request::get(format!(
+            "/oauth/callback/github?{}",
+            encode(&[("code", login), ("state", &started.state)])
+        ))
+        .header(header::COOKIE, &started.cookie)
+        .body(Body::empty())
+        .unwrap(),
+    )
+    .await
+}
+
+async fn github_state(app: &Router, client_id: &str, challenge: &str, resource: &str) -> Started {
+    start(app, &authorize_path(client_id, challenge, Some(resource))).await
 }
 
 async fn authorization_code(app: &Router, client_id: &str, challenge: &str) -> String {
@@ -254,15 +362,8 @@ async fn authorization_code_for(
     login: &str,
     resource: &str,
 ) -> String {
-    let state = github_state(app, client_id, challenge, resource).await;
-    let finished = get(
-        app,
-        &format!(
-            "/oauth/callback/github?{}",
-            encode(&[("code", login), ("state", &state)])
-        ),
-    )
-    .await;
+    let started = github_state(app, client_id, challenge, resource).await;
+    let finished = callback(app, &started, login).await;
     assert_eq!(finished.status, StatusCode::FOUND, "{}", finished.body);
     let location = finished.location();
     assert!(location.as_str().starts_with(REDIRECT_URI));
@@ -452,19 +553,15 @@ async fn other_github_login_gets_no_code() {
     let h = harness_with(&[("ok", "1", "someoneelse")], true, None);
     let client_id = register_client(&h.app).await;
     let (_verifier, challenge) = pkce();
-    let state = github_state(&h.app, &client_id, &challenge, &resource()).await;
-    let path = format!(
-        "/oauth/callback/github?{}",
-        encode(&[("code", "ok"), ("state", &state)])
-    );
-    let denied = get(&h.app, &path).await;
+    let started = github_state(&h.app, &client_id, &challenge, &resource()).await;
+    let denied = callback(&h.app, &started, "ok").await;
     assert_eq!(denied.status, StatusCode::FORBIDDEN);
     assert!(denied
         .body
         .contains("この GitHub アカウントは許可されていない。"));
     assert!(denied.body.contains("login: someoneelse"));
     assert!(denied.body.contains("id: 1"));
-    let replay = get(&h.app, &path).await;
+    let replay = callback(&h.app, &started, "ok").await;
     assert_eq!(replay.status, StatusCode::BAD_REQUEST);
 }
 
@@ -474,15 +571,8 @@ async fn reused_login_with_another_id_gets_no_code() {
     let h = harness_with(&[("ok", "99999999", "legokichi")], true, None);
     let client_id = register_client(&h.app).await;
     let (_verifier, challenge) = pkce();
-    let state = github_state(&h.app, &client_id, &challenge, &resource()).await;
-    let denied = get(
-        &h.app,
-        &format!(
-            "/oauth/callback/github?{}",
-            encode(&[("code", "ok"), ("state", &state)])
-        ),
-    )
-    .await;
+    let started = github_state(&h.app, &client_id, &challenge, &resource()).await;
+    let denied = callback(&h.app, &started, "ok").await;
     assert_eq!(denied.status, StatusCode::FORBIDDEN);
     assert!(denied.body.contains("id: 99999999"));
 }
@@ -500,7 +590,7 @@ async fn removing_a_login_rejects_an_existing_bearer() {
 
 #[tokio::test]
 async fn cimd_client_id_is_fetched_and_a_mismatch_is_rejected() {
-    let url = "https://client.example/oauth.json";
+    let url = "https://claude.ai/oauth/test-client.json";
     let h = harness_with(
         &[("ok", "2429307", "legokichi")],
         true,
@@ -509,18 +599,13 @@ async fn cimd_client_id_is_fetched_and_a_mismatch_is_rejected() {
         ),
     );
     let (_verifier, challenge) = pkce();
-    let started = get(&h.app, &authorize_path(url, &challenge, Some(&resource()))).await;
-    assert_eq!(started.status, StatusCode::FOUND, "{}", started.body);
-    assert!(started
-        .location()
-        .as_str()
-        .starts_with("https://github.com/login/oauth/authorize"));
+    start(&h.app, &authorize_path(url, &challenge, Some(&resource()))).await;
 
     let h = harness_with(
         &[],
         true,
         Some(
-            json!({ "client_id": "https://other.example/oauth.json", "redirect_uris": [REDIRECT_URI] }),
+            json!({ "client_id": "https://claude.ai/oauth/other.json", "redirect_uris": [REDIRECT_URI] }),
         ),
     );
     let rejected = get(&h.app, &authorize_path(url, &challenge, None)).await;
@@ -705,17 +790,8 @@ async fn loopback_redirect_accepts_any_port_for_cimd_clients() {
             ("state", "st"),
         ])
     );
-    let started = get(&h.app, &path).await;
-    assert_eq!(started.status, StatusCode::FOUND, "{}", started.body);
-    let state = query(&started.location())["state"].clone();
-    let finished = get(
-        &h.app,
-        &format!(
-            "/oauth/callback/github?{}",
-            encode(&[("code", "ok"), ("state", &state)])
-        ),
-    )
-    .await;
+    let started = start(&h.app, &path).await;
+    let finished = callback(&h.app, &started, "ok").await;
     assert_eq!(finished.status, StatusCode::FOUND, "{}", finished.body);
     assert!(finished.location().as_str().starts_with(redirect));
     let code = query(&finished.location())["code"].clone();
@@ -835,17 +911,8 @@ async fn relay_is_a_built_in_resource_and_leaves_the_gateway_alone() {
     // resource を省略しても relay に束ねる
     let client_id = register_client(&h.app).await;
     let (verifier, challenge) = pkce();
-    let started = get(&h.app, &authorize_path(&client_id, &challenge, None)).await;
-    assert_eq!(started.status, StatusCode::FOUND, "{}", started.body);
-    let state = query(&started.location())["state"].clone();
-    let finished = get(
-        &h.app,
-        &format!(
-            "/oauth/callback/github?{}",
-            encode(&[("code", "ok"), ("state", &state)])
-        ),
-    )
-    .await;
+    let started = start(&h.app, &authorize_path(&client_id, &challenge, None)).await;
+    let finished = callback(&h.app, &started, "ok").await;
     let code = query(&finished.location())["code"].clone();
     let token = post_form(
         &h.app,
@@ -1031,16 +1098,11 @@ async fn registration_accepts_chatgpt_and_authorize_starts_github_login() {
     assert_eq!(reply.status, StatusCode::CREATED, "{}", reply.body);
     let client_id = reply.json()["client_id"].as_str().unwrap().to_string();
     let (_verifier, challenge) = pkce();
-    let started = get(
+    start(
         &h.app,
         &authorize_with_redirect(&client_id, &challenge, Some(redirect)),
     )
     .await;
-    assert_eq!(started.status, StatusCode::FOUND, "{}", started.body);
-    assert!(started
-        .location()
-        .as_str()
-        .starts_with("https://github.com/login/oauth/authorize"));
 }
 
 #[tokio::test]
@@ -1058,27 +1120,17 @@ async fn registration_accepts_loopback_on_any_port() {
         "http://localhost:53682/callback",
         "http://[::1]:8080/callback",
     ] {
-        let started = get(
+        start(
             &h.app,
             &authorize_with_redirect(&client_id, &challenge, Some(redirect)),
         )
         .await;
-        assert_eq!(
-            started.status,
-            StatusCode::FOUND,
-            "{redirect}: {}",
-            started.body
-        );
-        assert!(started
-            .location()
-            .as_str()
-            .starts_with("https://github.com/login/oauth/authorize"));
     }
 }
 
 #[tokio::test]
 async fn cimd_with_redirect_uris_outside_the_allowlist_is_rejected() {
-    let url = "https://client.example/oauth.json";
+    let url = "https://claude.ai/oauth/test-client.json";
     let (_verifier, challenge) = pkce();
     for redirect_uris in [
         json!(["https://evil.example/cb"]),
@@ -1243,7 +1295,9 @@ async fn state_survives_a_restart_and_secrets_are_stored_hashed() {
     let client_secret = confidential["client_secret"].as_str().unwrap().to_string();
     let (_, challenge) = pkce();
     let code = authorization_code(&h.app, &client_id, &challenge).await;
-    let state = github_state(&h.app, &client_id, &challenge, &resource()).await;
+    let state = github_state(&h.app, &client_id, &challenge, &resource())
+        .await
+        .state;
     drop(h);
 
     let h = file_harness(&path);
@@ -1519,4 +1573,849 @@ async fn client_registrations_are_capped_by_evicting_the_oldest() {
         .read(|c| c.query_row("SELECT COUNT(*) FROM oauth_clients", [], |r| r.get(0)))
         .unwrap();
     assert_eq!(count as usize, crate::auth::MAX_CLIENTS);
+}
+
+// ---------------------------------------------------------------------------
+// セキュリティレビュー（2026-11-11）
+
+async fn register_json(app: &Router, body: &Value) -> Reply {
+    send(
+        app,
+        Request::post("/register")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+    )
+    .await
+}
+
+fn count(h: &Harness, sql: &str) -> i64 {
+    h.relay
+        .store
+        .db()
+        .read(|c| c.query_row(sql, [], |r| r.get(0)))
+        .unwrap()
+}
+
+fn exec(h: &Harness, sql: &str, params: impl rusqlite::Params) {
+    h.relay.store.db().read(|c| c.execute(sql, params)).unwrap();
+}
+
+/// H-1: 初めての (client_id, redirect_uri) は同意画面を出し、許可されたログインまで済んだら次から省く。
+#[tokio::test]
+async fn consent_is_asked_once_per_client_and_redirect() {
+    let h = harness();
+    let registered = register_json(
+        &h.app,
+        &json!({ "redirect_uris": [REDIRECT_URI], "token_endpoint_auth_method": "none",
+                 "client_name": "<b>Claude</b> & \"co\"" }),
+    )
+    .await;
+    let client_id = registered.json()["client_id"].as_str().unwrap().to_string();
+    let (_verifier, challenge) = pkce();
+    let path = authorize_path(&client_id, &challenge, Some(&resource()));
+
+    let page = get(&h.app, &path).await;
+    assert_consent_page(&page);
+    assert_eq!(page.headers[header::X_FRAME_OPTIONS], "DENY");
+    let csp = page.headers[header::CONTENT_SECURITY_POLICY]
+        .to_str()
+        .unwrap();
+    assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+    assert_eq!(page.headers[header::CACHE_CONTROL], "no-store");
+    // 自己申告の名前はエスケープし、client_id と戻り先のオリジンも見せる
+    assert!(page
+        .body
+        .contains("&lt;b&gt;Claude&lt;/b&gt; &amp; &quot;co&quot;"));
+    assert!(!page.body.contains("<b>Claude</b>"));
+    assert!(page.body.contains("自己申告"));
+    assert!(page.body.contains(&client_id));
+    assert!(page.body.contains("http://127.0.0.1:9"));
+    let cookie = page.headers[header::SET_COOKIE].to_str().unwrap();
+    assert!(cookie.starts_with("__Host-mcp_authz="), "{cookie}");
+    for attr in ["Path=/", "HttpOnly", "SameSite=Lax", "Secure"] {
+        assert!(cookie.contains(attr), "{attr} not in {cookie}");
+    }
+    // Cookie の値そのものは画面に出さない（CSRF トークンはそこから作った別の値）
+    let value = set_cookie(&page).unwrap();
+    let value = value.split_once('=').unwrap().1;
+    assert!(!page.body.contains(value));
+
+    // 承認しただけ（GitHub から戻る前）では覚えない
+    let started = start(&h.app, &path).await;
+    assert_consent_page(&get(&h.app, &path).await);
+    let finished = callback(&h.app, &started, "ok").await;
+    assert_eq!(finished.status, StatusCode::FOUND, "{}", finished.body);
+    assert!(finished.location().as_str().starts_with(REDIRECT_URI));
+
+    // 次からは同意画面を出さずに GitHub へ送り、そのブラウザの Cookie を付ける
+    let again = get(&h.app, &path).await;
+    assert_eq!(again.status, StatusCode::FOUND, "{}", again.body);
+    assert!(again
+        .location()
+        .as_str()
+        .starts_with("https://github.com/login/oauth/authorize"));
+    assert!(set_cookie(&again).is_some());
+
+    // 別のクライアントは改めて聞く
+    let other = register_client(&h.app).await;
+    assert_consent_page(&get(&h.app, &authorize_path(&other, &challenge, None)).await);
+
+    // 承認した id が許可から外れたら、覚えた承認も使わない
+    h.allowed.write().unwrap().clear();
+    assert_consent_page(&get(&h.app, &path).await);
+}
+
+#[tokio::test]
+async fn consent_is_not_remembered_for_a_login_that_is_not_allowed() {
+    let h = harness_with(
+        &[
+            ("ok", "2429307", "legokichi"),
+            ("other", "1", "someoneelse"),
+        ],
+        true,
+        None,
+    );
+    let client_id = register_client(&h.app).await;
+    let (_verifier, challenge) = pkce();
+    let path = authorize_path(&client_id, &challenge, None);
+    // 攻撃者が自分のブラウザで承認し、自分の GitHub でログインしても覚えない
+    let started = start(&h.app, &path).await;
+    assert_eq!(
+        callback(&h.app, &started, "other").await.status,
+        StatusCode::FORBIDDEN
+    );
+    assert_consent_page(&get(&h.app, &path).await);
+    assert_eq!(count(&h, "SELECT COUNT(*) FROM oauth_consents"), 0);
+}
+
+#[tokio::test]
+async fn loopback_consent_ignores_the_port() {
+    let h = harness();
+    let reply = register_redirects(&h.app, &["http://localhost/callback"]).await;
+    let client_id = reply.json()["client_id"].as_str().unwrap().to_string();
+    let (_verifier, challenge) = pkce();
+    let path = |port: u16| {
+        authorize_with_redirect(
+            &client_id,
+            &challenge,
+            Some(&format!("http://localhost:{port}/callback")),
+        )
+    };
+    let started = start(&h.app, &path(53682)).await;
+    assert_eq!(
+        callback(&h.app, &started, "ok").await.status,
+        StatusCode::FOUND
+    );
+    let again = get(&h.app, &path(40000)).await;
+    assert_eq!(again.status, StatusCode::FOUND, "{}", again.body);
+    // パスが違えば別の戻り先
+    let other =
+        authorize_with_redirect(&client_id, &challenge, Some("http://localhost:40000/other"));
+    assert_eq!(get(&h.app, &other).await.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn consent_needs_the_same_browser_and_can_be_denied() {
+    let h = harness();
+    let client_id = register_client(&h.app).await;
+    let (_verifier, challenge) = pkce();
+    let path = authorize_path(&client_id, &challenge, None);
+    let page = get(&h.app, &path).await;
+    assert_consent_page(&page);
+
+    // Cookie が無い・別のブラウザの Cookie では、許可も拒否も受けない
+    let elsewhere = set_cookie(&get(&h.app, &path).await).unwrap();
+    for cookie in ["", elsewhere.as_str()] {
+        for action in ["approve", "deny"] {
+            let r = submit_consent(&h.app, &page, action, Some(cookie)).await;
+            assert_eq!(r.status, StatusCode::FORBIDDEN, "{cookie} {action}");
+            assert!(r.headers.get(header::LOCATION).is_none());
+        }
+    }
+    let r = get(&h.app, "/authorize/consent").await;
+    assert_eq!(r.status, StatusCode::METHOD_NOT_ALLOWED);
+
+    // hidden の値を書き換えても検証し直す（許可外の戻り先へは送らない）
+    let cookie = set_cookie(&page).unwrap();
+    let mut pairs: Vec<(String, String)> = hidden_fields(&page.body)
+        .into_iter()
+        .map(|(k, v)| {
+            if k == "redirect_uri" {
+                (k, "https://evil.example/cb".into())
+            } else {
+                (k, v)
+            }
+        })
+        .collect();
+    pairs.push(("consent_action".into(), "approve".into()));
+    let pairs: Vec<(&str, &str)> = pairs
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let tampered = send(
+        &h.app,
+        Request::post("/authorize/consent")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(header::COOKIE, &cookie)
+            .body(Body::from(encode(&pairs)))
+            .unwrap(),
+    )
+    .await;
+    assert_json_error_without_redirect(&tampered);
+
+    // 拒否はクライアントへ access_denied を返し、何も覚えない
+    let denied = submit_consent(&h.app, &page, "deny", None).await;
+    assert_eq!(denied.status, StatusCode::FOUND, "{}", denied.body);
+    let location = denied.location();
+    assert!(location.as_str().starts_with(REDIRECT_URI));
+    let q = query(&location);
+    assert_eq!(q["error"], "access_denied");
+    assert_eq!(q["state"], "client-state");
+    assert_eq!(count(&h, "SELECT COUNT(*) FROM oauth_pending"), 0);
+    assert_consent_page(&get(&h.app, &path).await);
+}
+
+/// H-1: GitHub の URL（state）だけを他人のブラウザで踏ませても、認可を始めたブラウザでなければ通らない。
+#[tokio::test]
+async fn callback_needs_the_browser_that_started_the_authorization() {
+    let h = harness();
+    let client_id = register_client(&h.app).await;
+    let (_verifier, challenge) = pkce();
+    let started = github_state(&h.app, &client_id, &challenge, &resource()).await;
+    let bare = get(
+        &h.app,
+        &format!(
+            "/oauth/callback/github?{}",
+            encode(&[("code", "ok"), ("state", &started.state)])
+        ),
+    )
+    .await;
+    assert_eq!(bare.status, StatusCode::BAD_REQUEST);
+    assert!(bare.body.contains("このブラウザで始めたものではない"));
+    // 一度外れた state はもう使えない
+    assert_eq!(
+        callback(&h.app, &started, "ok").await.status,
+        StatusCode::BAD_REQUEST
+    );
+
+    let started = github_state(&h.app, &client_id, &challenge, &resource()).await;
+    let other = Started {
+        state: started.state.clone(),
+        cookie: format!("__Host-mcp_authz={}", token_urlsafe()),
+    };
+    assert_eq!(
+        callback(&h.app, &other, "ok").await.status,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(count(&h, "SELECT COUNT(*) FROM oauth_codes"), 0);
+}
+
+/// H-2: 未認証の OAuth エンドポイントは小さなボディしか受けない。
+#[tokio::test]
+async fn oauth_endpoints_take_small_bodies_only() {
+    let h = harness();
+    let big = "x".repeat(crate::auth::MAX_OAUTH_BODY_BYTES + 1);
+    for path in [
+        "/register",
+        "/token",
+        "/authorize",
+        "/authorize/consent",
+        "/revoke",
+    ] {
+        let r = send(
+            &h.app,
+            Request::post(path)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(big.clone()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE, "{path}");
+    }
+}
+
+/// H-2: 登録の各項目に件数・長さの上限があり、jwks は保存しない。
+#[tokio::test]
+async fn registration_fields_are_limited_and_jwks_is_not_kept() {
+    let h = harness();
+    let base = json!({ "redirect_uris": [REDIRECT_URI], "token_endpoint_auth_method": "none" });
+    let with = |key: &str, value: Value| {
+        let mut body = base.clone();
+        body[key] = value;
+        body
+    };
+    let long_loopback = format!("http://127.0.0.1/{}", "a".repeat(2048));
+    for body in [
+        with("redirect_uris", json!(vec![REDIRECT_URI; 11])),
+        with("redirect_uris", json!([long_loopback])),
+        with("client_name", json!("a".repeat(201))),
+        with("scope", json!("s".repeat(1025))),
+        with("contacts", json!(vec!["a@example.com"; 11])),
+        with("contacts", json!(["a".repeat(321)])),
+        with("grant_types", json!(vec!["authorization_code"; 11])),
+        with("software_id", json!("a".repeat(201))),
+        with(
+            "client_uri",
+            json!(format!("https://example.com/{}", "a".repeat(2048))),
+        ),
+    ] {
+        let r = register_json(&h.app, &body).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+        assert_eq!(r.json()["error"], "invalid_client_metadata");
+    }
+    // 上限ちょうどは通る（名前は文字数で数える）
+    let mut ok = with("client_name", json!("あ".repeat(200)));
+    ok["redirect_uris"] = json!(vec![REDIRECT_URI; 10]);
+    ok["jwks"] = json!({ "keys": [{ "kty": "RSA", "n": "x".repeat(1000), "e": "AQAB" }] });
+    let r = register_json(&h.app, &ok).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
+    assert!(r.json().get("jwks").is_none());
+    assert_eq!(
+        count(
+            &h,
+            "SELECT COUNT(*) FROM oauth_clients WHERE record LIKE '%jwks%' OR record LIKE '%kty%'"
+        ),
+        0
+    );
+}
+
+/// H-2: state・code_challenge・scope・resource の長さを見る。長すぎる state は応答にも載せない。
+#[tokio::test]
+async fn authorize_rejects_oversized_values_and_malformed_challenges() {
+    let h = harness();
+    let client_id = register_client(&h.app).await;
+    let (_verifier, challenge) = pkce();
+    let long_state = "s".repeat(crate::auth::MAX_STATE_BYTES + 1);
+    let padded = format!("{}=", &challenge[..42]);
+    let long_resource = format!("{}/{}", resource(), "./".repeat(1100));
+    let long_scope = "x".repeat(1025);
+    let cases: Vec<Vec<(&str, &str)>> = vec![
+        vec![("state", long_state.as_str())],
+        vec![("code_challenge", "short")],
+        vec![("code_challenge", padded.as_str())],
+        vec![("resource", long_resource.as_str())],
+        vec![("scope", long_scope.as_str())],
+    ];
+    for overrides in cases {
+        let mut pairs = vec![
+            ("response_type", "code"),
+            ("client_id", client_id.as_str()),
+            ("redirect_uri", REDIRECT_URI),
+            ("code_challenge", challenge.as_str()),
+            ("code_challenge_method", "S256"),
+            ("state", "client-state"),
+        ];
+        for (k, v) in &overrides {
+            pairs.retain(|(key, _)| key != k);
+            pairs.push((k, v));
+        }
+        let r = get(&h.app, &format!("/authorize?{}", encode(&pairs))).await;
+        assert_eq!(r.status, StatusCode::FOUND, "{overrides:?}: {}", r.body);
+        let q = query(&r.location());
+        assert_eq!(q["error"], "invalid_request", "{overrides:?}");
+        assert_eq!(
+            q.get("state").map(String::as_str),
+            (overrides[0].0 != "state").then_some("client-state"),
+            "{overrides:?}"
+        );
+    }
+    assert_eq!(count(&h, "SELECT COUNT(*) FROM oauth_pending"), 0);
+}
+
+/// H-2: 認可の途中の行は MAX_PENDING 件まで（古い順に捨てる）。
+#[tokio::test]
+async fn pending_authorizations_are_capped() {
+    let h = harness();
+    let client_id = register_client(&h.app).await;
+    let client = h.oauth.get_client(&client_id).await.unwrap().unwrap();
+    let (_verifier, challenge) = pkce();
+    let params = crate::auth::AuthorizationParams {
+        state: None,
+        scopes: Vec::new(),
+        code_challenge: challenge,
+        redirect_uri: REDIRECT_URI.into(),
+        redirect_uri_provided_explicitly: true,
+        resource: None,
+    };
+    for _ in 0..crate::auth::MAX_PENDING + 5 {
+        assert!(h
+            .oauth
+            .authorize(&client, params.clone(), &token_urlsafe())
+            .unwrap()
+            .is_ok());
+    }
+    assert_eq!(
+        count(&h, "SELECT COUNT(*) FROM oauth_pending") as usize,
+        crate::auth::MAX_PENDING
+    );
+}
+
+/// H-2: 登録を大量に送られても、使われている（トークンのある）クライアントは追い出さない。
+#[tokio::test]
+async fn clients_in_use_survive_a_registration_flood() {
+    let h = harness();
+    let (access, refresh, in_use) = issue_token(&h.app).await;
+    let none = json!({ "redirect_uris": [REDIRECT_URI], "token_endpoint_auth_method": "none" });
+    let mut ids = Vec::new();
+    for _ in 0..crate::auth::MAX_CLIENTS + 10 {
+        let client =
+            crate::auth::client_from_registration(&none, &RedirectAllowlist::default()).unwrap();
+        ids.push(client.client_id.clone());
+        assert!(h.oauth.register_client(client).unwrap());
+    }
+    assert!(h.oauth.get_client(&in_use).await.unwrap().is_some());
+    assert!(h.oauth.get_client(&ids[0]).await.unwrap().is_none());
+    assert_eq!(
+        count(&h, "SELECT COUNT(*) FROM oauth_clients") as usize,
+        crate::auth::MAX_CLIENTS
+    );
+    assert_eq!(mcp(&h.app, Some(&access), 1).await.status, StatusCode::OK);
+    assert_eq!(
+        refresh_with(&h.app, &refresh, &in_use).await.status,
+        StatusCode::OK
+    );
+
+    // 全部が使われていれば、入れずに断る
+    exec(
+        &h,
+        "INSERT INTO oauth_tokens (token_sha256, kind, client_id, subject, resource, scopes, issued_at, expires_at) \
+         SELECT 'fake-' || client_id, 'access', client_id, '2429307', 'r', '[]', 0, ?1 FROM oauth_clients \
+         WHERE client_id != ?2",
+        rusqlite::params![crate::auth::now() + 3600, in_use],
+    );
+    let client =
+        crate::auth::client_from_registration(&none, &RedirectAllowlist::default()).unwrap();
+    assert!(!h.oauth.register_client(client).unwrap());
+    let r = register_json(&h.app, &none).await;
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{}", r.body);
+    assert_eq!(r.json()["error"], "temporarily_unavailable");
+}
+
+/// H-2: 登録の合計バイト数にも上限がある。
+#[tokio::test]
+async fn client_records_are_capped_in_total_bytes() {
+    let h = harness();
+    let uris: Vec<String> = (0..10)
+        .map(|i| format!("http://127.0.0.1/{i}/{}", "a".repeat(2000)))
+        .collect();
+    let big = json!({ "redirect_uris": uris, "token_endpoint_auth_method": "none" });
+    for _ in 0..300 {
+        let client =
+            crate::auth::client_from_registration(&big, &RedirectAllowlist::default()).unwrap();
+        assert!(h.oauth.register_client(client).unwrap());
+    }
+    let bytes = count(
+        &h,
+        "SELECT SUM(length(CAST(record AS BLOB))) FROM oauth_clients",
+    );
+    assert!(
+        bytes as usize <= crate::auth::MAX_CLIENT_RECORD_BYTES,
+        "{bytes}"
+    );
+    assert!(count(&h, "SELECT COUNT(*) FROM oauth_clients") < 300);
+}
+
+/// H-2: 動的登録は全体で 1 分あたりの件数を絞る。
+#[tokio::test]
+async fn registrations_are_rate_limited() {
+    let h = harness();
+    let body = json!({ "redirect_uris": [REDIRECT_URI], "token_endpoint_auth_method": "none" });
+    let limit = crate::auth::REGISTRATIONS_PER_MINUTE as usize;
+    // 分の境目をまたいでも、2 窓分を送れば必ず断られる
+    let mut created = 0;
+    let mut refused = None;
+    for _ in 0..2 * limit + 2 {
+        let r = register_json(&h.app, &body).await;
+        if r.status == StatusCode::CREATED {
+            created += 1;
+        } else {
+            refused = Some(r);
+            break;
+        }
+    }
+    let refused = refused.expect("registrations were never refused");
+    assert!(created >= limit, "{created}");
+    assert_eq!(refused.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(refused.headers[header::RETRY_AFTER], "60");
+    assert_eq!(refused.json()["error"], "temporarily_unavailable");
+}
+
+/// URL に合わせた CIMD を返し、取りに来た回数を数える。
+struct EchoFetcher {
+    calls: std::sync::atomic::AtomicUsize,
+    in_flight: std::sync::atomic::AtomicUsize,
+    max_in_flight: std::sync::atomic::AtomicUsize,
+    delay: std::time::Duration,
+}
+
+impl EchoFetcher {
+    fn new(delay_ms: u64) -> Arc<Self> {
+        Arc::new(Self {
+            calls: Default::default(),
+            in_flight: Default::default(),
+            max_in_flight: Default::default(),
+            delay: std::time::Duration::from_millis(delay_ms),
+        })
+    }
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl ClientMetadataFetcher for EchoFetcher {
+    async fn fetch(&self, url: &str) -> anyhow::Result<Value> {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.calls.fetch_add(1, SeqCst);
+        let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+        self.max_in_flight.fetch_max(now, SeqCst);
+        tokio::time::sleep(self.delay).await;
+        self.in_flight.fetch_sub(1, SeqCst);
+        Ok(
+            json!({ "client_id": url, "redirect_uris": [REDIRECT_URI], "token_endpoint_auth_method": "none" }),
+        )
+    }
+}
+
+fn oauth_with(fetcher: Arc<EchoFetcher>) -> OAuthServer {
+    OAuthServer::new(
+        PUBLIC_URL,
+        Arc::new(RwLock::new(HashSet::new())),
+        Arc::new(FakeGitHub {
+            logins: HashMap::new(),
+            configured: true,
+        }),
+        fetcher,
+        RedirectAllowlist::default(),
+        Db::open_in_memory(),
+    )
+}
+
+/// M-1: CIMD は allowlist のホストからだけ取る（既定は redirect allowlist のホスト）。
+#[tokio::test]
+async fn cimd_is_fetched_only_from_allowed_hosts() {
+    let fetcher = EchoFetcher::new(0);
+    let oauth = oauth_with(fetcher.clone());
+    assert!(oauth
+        .get_client("https://attacker.example/c.json")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(fetcher.calls(), 0);
+    for allowed in [
+        "https://claude.ai/oauth/x.json",
+        "https://chatgpt.com/oauth/x.json",
+    ] {
+        assert!(
+            oauth.get_client(allowed).await.unwrap().is_some(),
+            "{allowed}"
+        );
+    }
+    assert_eq!(fetcher.calls(), 2);
+
+    let fetcher = EchoFetcher::new(0);
+    let oauth =
+        oauth_with(fetcher.clone()).with_cimd_hosts(HashSet::from(["client.example".to_string()]));
+    assert!(oauth
+        .get_client("https://client.example/c.json")
+        .await
+        .unwrap()
+        .is_some());
+    assert!(oauth
+        .get_client("https://claude.ai/oauth/x.json")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(fetcher.calls(), 1);
+}
+
+/// M-1: CIMD のキャッシュは件数に上限があり、最後に使ったのが古いものから捨てる。
+#[tokio::test]
+async fn cimd_cache_is_a_bounded_lru() {
+    let fetcher = EchoFetcher::new(0);
+    let oauth = oauth_with(fetcher.clone());
+    let url = |i: usize| format!("https://claude.ai/oauth/{i}.json");
+    let n = crate::auth::CIMD_CACHE_CAPACITY;
+    for i in 0..n {
+        oauth.get_client(&url(i)).await.unwrap().unwrap();
+    }
+    // 0 を使い直してから 1 件足すと、1 が捨てられる
+    oauth.get_client(&url(0)).await.unwrap().unwrap();
+    assert_eq!(fetcher.calls(), n);
+    oauth.get_client(&url(n)).await.unwrap().unwrap();
+    oauth.get_client(&url(0)).await.unwrap().unwrap();
+    assert_eq!(fetcher.calls(), n + 1);
+    oauth.get_client(&url(1)).await.unwrap().unwrap();
+    assert_eq!(fetcher.calls(), n + 2);
+}
+
+/// M-1: CIMD を同時に取りに行く数を絞る。
+#[tokio::test]
+async fn cimd_fetches_are_limited_in_number() {
+    let fetcher = EchoFetcher::new(50);
+    let oauth = Arc::new(oauth_with(fetcher.clone()));
+    let mut set = tokio::task::JoinSet::new();
+    for i in 0..10 {
+        let oauth = oauth.clone();
+        set.spawn(async move {
+            oauth
+                .get_client(&format!("https://claude.ai/oauth/{i}.json"))
+                .await
+                .unwrap()
+                .is_some()
+        });
+    }
+    while let Some(found) = set.join_next().await {
+        assert!(found.unwrap());
+    }
+    let max = fetcher
+        .max_in_flight
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        max <= crate::auth::CIMD_MAX_CONCURRENT_FETCHES && max > 1,
+        "{max}"
+    );
+}
+
+/// M-1: CIMD の項目にも登録と同じ上限を置く。
+#[test]
+fn cimd_documents_are_limited_like_registrations() {
+    use crate::auth::client_from_cimd;
+    let url = "https://claude.ai/oauth/x.json";
+    let allowlist = RedirectAllowlist::default();
+    let doc = |key: &str, value: Value| {
+        let mut d = json!({ "client_id": url, "redirect_uris": [REDIRECT_URI] });
+        d[key] = value;
+        d
+    };
+    assert!(client_from_cimd(url, &doc("client_name", json!("Claude")), &allowlist).is_some());
+    // 文字列でない名前は今までどおり無視する
+    let ignored = client_from_cimd(url, &doc("client_name", json!(1)), &allowlist).unwrap();
+    assert!(ignored.client_name.is_none());
+    for bad in [
+        doc("redirect_uris", json!(vec![REDIRECT_URI; 11])),
+        doc("client_name", json!("a".repeat(201))),
+        doc("scope", json!("s".repeat(1025))),
+        doc("grant_types", json!(vec!["authorization_code"; 11])),
+    ] {
+        assert!(client_from_cimd(url, &bad, &allowlist).is_none(), "{bad}");
+    }
+}
+
+/// L-3: 使ったコードがもう一度来たら、そのコードから発行したトークンを失効させる。
+#[tokio::test]
+async fn a_reused_code_revokes_the_tokens_issued_from_it() {
+    let h = harness();
+    let client_id = register_client(&h.app).await;
+    let (verifier, challenge) = pkce();
+    let code = authorization_code(&h.app, &client_id, &challenge).await;
+    let payload = [
+        ("grant_type", "authorization_code"),
+        ("code", code.as_str()),
+        ("redirect_uri", REDIRECT_URI),
+        ("client_id", client_id.as_str()),
+        ("code_verifier", verifier.as_str()),
+    ];
+    let first = post_form(&h.app, "/token", &payload).await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.body);
+    let access = first.json()["access_token"].as_str().unwrap().to_string();
+    let refresh = first.json()["refresh_token"].as_str().unwrap().to_string();
+    // 同じクライアントの別の認可は巻き込まない
+    let (other_verifier, other_challenge) = pkce();
+    let other_code = authorization_code(&h.app, &client_id, &other_challenge).await;
+    let other = post_form(
+        &h.app,
+        "/token",
+        &[
+            ("grant_type", "authorization_code"),
+            ("code", &other_code),
+            ("redirect_uri", REDIRECT_URI),
+            ("client_id", &client_id),
+            ("code_verifier", &other_verifier),
+        ],
+    )
+    .await;
+    let other_access = other.json()["access_token"].as_str().unwrap().to_string();
+
+    let second = post_form(&h.app, "/token", &payload).await;
+    assert_eq!(second.json()["error"], "invalid_grant");
+    assert_eq!(
+        mcp(&h.app, Some(&access), 1).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        refresh_with(&h.app, &refresh, &client_id).await.json()["error"],
+        "invalid_grant"
+    );
+    assert_eq!(
+        mcp(&h.app, Some(&other_access), 2).await.status,
+        StatusCode::OK
+    );
+}
+
+/// L-3: 入れ替え済みの refresh が猶予の後にもう一度来たら、そのクライアントのトークンを全部失効させる。
+#[tokio::test]
+async fn a_refresh_reused_after_the_grace_revokes_the_clients_tokens() {
+    let h = harness();
+    let (access, refresh, client_id) = issue_token(&h.app).await;
+    let (other_access, _, _) = issue_token(&h.app).await;
+    let rotated = refresh_with(&h.app, &refresh, &client_id).await;
+    assert_eq!(rotated.status, StatusCode::OK, "{}", rotated.body);
+    let new_access = rotated.json()["access_token"].as_str().unwrap().to_string();
+    let new_refresh = rotated.json()["refresh_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 猶予のうちの再送は、断るだけで失効させない
+    let early = refresh_with(&h.app, &refresh, &client_id).await;
+    assert_eq!(early.json()["error"], "invalid_grant");
+    assert_eq!(
+        mcp(&h.app, Some(&new_access), 1).await.status,
+        StatusCode::OK
+    );
+
+    exec(
+        &h,
+        "UPDATE oauth_tokens SET used_at = ?1 WHERE token_sha256 = ?2",
+        rusqlite::params![
+            crate::auth::now() - REFRESH_GRACE_SECS - 1,
+            sha256_hex(&refresh)
+        ],
+    );
+    let reused = refresh_with(&h.app, &refresh, &client_id).await;
+    assert_eq!(reused.status, StatusCode::BAD_REQUEST);
+    assert_eq!(reused.json()["error"], "invalid_grant");
+    assert!(reused.json()["error_description"]
+        .as_str()
+        .unwrap()
+        .contains("already used"));
+    for token in [&access, &new_access] {
+        assert_eq!(
+            mcp(&h.app, Some(token), 2).await.status,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        refresh_with(&h.app, &new_refresh, &client_id).await.json()["error"],
+        "invalid_grant"
+    );
+    // 別のクライアントには響かない
+    assert_eq!(
+        mcp(&h.app, Some(&other_access), 3).await.status,
+        StatusCode::OK
+    );
+}
+
+/// L-3: refresh で延ばせるのは認可から GRANT_MAX_LIFETIME まで。
+#[tokio::test]
+async fn grants_have_an_absolute_lifetime() {
+    let h = harness();
+    let (_access, refresh, client_id) = issue_token(&h.app).await;
+    let now = crate::auth::now();
+    exec(
+        &h,
+        "UPDATE oauth_tokens SET granted_at = ?1",
+        [now - crate::auth::GRANT_MAX_LIFETIME + 100],
+    );
+    let rotated = refresh_with(&h.app, &refresh, &client_id).await;
+    assert_eq!(rotated.status, StatusCode::OK, "{}", rotated.body);
+    let expires_in = rotated.json()["expires_in"].as_i64().unwrap();
+    assert!(expires_in <= 100, "{expires_in}");
+    let new_refresh = rotated.json()["refresh_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let refresh_expires: i64 = h
+        .relay
+        .store
+        .db()
+        .read(|c| {
+            c.query_row(
+                "SELECT expires_at FROM oauth_tokens WHERE token_sha256 = ?1",
+                [sha256_hex(&new_refresh)],
+                |r| r.get(0),
+            )
+        })
+        .unwrap();
+    assert!(refresh_expires <= now + 100, "{refresh_expires} {now}");
+}
+
+/// L-3: RFC 7009 の失効。発行先のクライアントからだけ、認可の系列ごと失効させる。
+#[tokio::test]
+async fn revocation_endpoint_revokes_the_grant() {
+    let h = harness();
+    let metadata = get(&h.app, "/.well-known/oauth-authorization-server")
+        .await
+        .json();
+    assert_eq!(
+        metadata["revocation_endpoint"],
+        format!("{PUBLIC_URL}/revoke")
+    );
+    let (access, refresh, client_id) = issue_token(&h.app).await;
+    let (_, _, other_client) = issue_token(&h.app).await;
+
+    // 他のクライアントからは失効させられない（応答は同じ 200）
+    let r = post_form(
+        &h.app,
+        "/revoke",
+        &[("token", &refresh), ("client_id", &other_client)],
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(mcp(&h.app, Some(&access), 1).await.status, StatusCode::OK);
+
+    for (form, status) in [
+        (vec![("token", refresh.as_str())], StatusCode::UNAUTHORIZED),
+        (
+            vec![("client_id", client_id.as_str())],
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            vec![("token", "unknown"), ("client_id", client_id.as_str())],
+            StatusCode::OK,
+        ),
+    ] {
+        assert_eq!(post_form(&h.app, "/revoke", &form).await.status, status);
+    }
+
+    let r = post_form(
+        &h.app,
+        "/revoke",
+        &[
+            ("token", &refresh),
+            ("token_type_hint", "refresh_token"),
+            ("client_id", &client_id),
+        ],
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(r.headers[header::CACHE_CONTROL], "no-store");
+    assert_eq!(
+        mcp(&h.app, Some(&access), 2).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        refresh_with(&h.app, &refresh, &client_id).await.json()["error"],
+        "invalid_grant"
+    );
+}
+
+/// L-4: 外から来た値は構造化フィールドで出し、改行で偽のログ行を作らせない。
+#[tokio::test]
+async fn untrusted_values_cannot_forge_log_lines() {
+    let logs = crate::relay::tests::capture_logs();
+    let fetcher = EchoFetcher::new(0);
+    let oauth = oauth_with(fetcher);
+    let injected = "https://attacker.example/x\nFORGED LOG LINE level=ERROR";
+    assert!(crate::auth::is_cimd_client_id(injected));
+    assert!(oauth.get_client(injected).await.unwrap().is_none());
+    let out = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert!(out.contains("cimd host is not allowed"), "{out}");
+    assert!(out.contains("\\nFORGED LOG LINE"), "{out}");
+    assert!(
+        !out.lines().any(|l| l.starts_with("FORGED")),
+        "forged line in:\n{out}"
+    );
 }

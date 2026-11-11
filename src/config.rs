@@ -21,6 +21,11 @@ pub struct Config {
     #[serde(default)]
     pub oauth_redirect_allowlist: Option<String>,
 
+    /// カンマ区切りの、CIMD（URL の client_id）を取りに行ってよいホスト名。
+    /// 未設定なら redirect allowlist のループバック以外のホスト。
+    #[serde(default)]
+    pub oauth_cimd_host_allowlist: Option<String>,
+
     #[serde(default)]
     pub github_client_id: String,
 
@@ -101,6 +106,19 @@ impl Config {
         }
     }
 
+    pub fn cimd_host_allowlist(&self) -> Option<HashSet<String>> {
+        let raw = self
+            .oauth_cimd_host_allowlist
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())?;
+        Some(
+            raw.split(',')
+                .map(|h| h.trim().to_ascii_lowercase())
+                .filter(|h| !h.is_empty())
+                .collect(),
+        )
+    }
+
     pub fn normalize_public_url(&self) -> anyhow::Result<String> {
         let value = self.public_url.trim().trim_end_matches('/').to_string();
         let Some((scheme, rest)) = value.split_once("://") else {
@@ -155,6 +173,13 @@ mod service_config_tests {
         assert!(custom.allows("https://client.example/cb"));
         assert!(custom.allows("https://other.example/app/x/y"));
         assert!(!custom.allows("https://claude.ai/api/mcp/auth_callback"));
+
+        assert_eq!(config_from(&[]).cimd_host_allowlist(), None);
+        assert_eq!(
+            config_from(&[("OAUTH_CIMD_HOST_ALLOWLIST", " Claude.ai, ,chatgpt.com ")])
+                .cimd_host_allowlist(),
+            Some(HashSet::from(["claude.ai".into(), "chatgpt.com".into()]))
+        );
 
         for bad in ["not a url", "https://x.example/a*", ",,"] {
             assert!(

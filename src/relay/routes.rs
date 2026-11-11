@@ -65,8 +65,13 @@ fn parse_error() -> Response {
     )
 }
 
-/// 認証済みの `{PREFIX}` へのリクエスト。`room` は OAuth の subject。
-pub async fn serve(relay: Arc<Relay>, room: String, request: Request) -> Response {
+/// 認証済みの `{PREFIX}` へのリクエスト。`room` は OAuth の subject、`client_id` はトークンの発行先。
+pub async fn serve(
+    relay: Arc<Relay>,
+    room: String,
+    client_id: String,
+    request: Request,
+) -> Response {
     match *request.method() {
         Method::GET => {
             let mut response =
@@ -102,7 +107,7 @@ pub async fn serve(relay: Arc<Relay>, room: String, request: Request) -> Respons
     };
     // 生のボディは long-poll の間まで抱えない
     drop(bytes);
-    match mcp::handle(relay, room.into(), body).await {
+    match mcp::handle(relay, room.into(), client_id.into(), body).await {
         Some(reply) => json_response(200, &reply),
         None => StatusCode::ACCEPTED.into_response(),
     }

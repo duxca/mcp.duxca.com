@@ -227,6 +227,32 @@ pub struct AttachmentContent {
     pub data: Bytes,
 }
 
+/// 登録を置き換え・解除してよいか。別の OAuth クライアントの登録で、そのクライアントが今もこの部屋
+/// （subject）向けの期限内のトークンを持っていれば断る。持ち主が失効・期限切れになれば引き継げる。
+/// 持ち主の無い登録（v2 までのもの）は誰でも置き換えられ、置き換えたクライアントのものになる。
+fn check_owner(
+    tx: &Connection,
+    room: &str,
+    agent: &str,
+    owner: Option<&str>,
+    client_id: &str,
+) -> Result<(), RelayError> {
+    match owner {
+        Some(owner)
+            if owner != client_id && crate::auth::client_holds_live_token(tx, owner, room)? =>
+        {
+            Err(RelayError::new(
+                403,
+                format!(
+                    "agent \"{agent}\" was registered by another OAuth client (connector); only that client can replace \
+                     or unregister it while its authorization is valid"
+                ),
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
 fn agent_bytes(name: &str, webhook: Option<&WebhookTarget>, description: Option<&str>) -> u64 {
     let webhook = webhook.map_or(0, |w| {
         w.url.len() + w.auth.as_ref().map_or(0, String::len) + w.secret.len()
@@ -873,7 +899,7 @@ impl Store {
             };
             let target = tx
                 .prepare_cached(
-                    "SELECT webhook_url, webhook_auth, webhook_secret FROM relay_agents \
+                    "SELECT webhook_url, webhook_auth, webhook_secret, webhook_include_text FROM relay_agents \
                      WHERE room = ?1 AND name = ?2 AND webhook_url IS NOT NULL",
                 )?
                 .query_row(params![room, to], |r| {
@@ -881,6 +907,7 @@ impl Store {
                         url: r.get(0)?,
                         auth: r.get(1)?,
                         secret: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                        include_text: r.get(3)?,
                     })
                 })
                 .optional()?;
@@ -1250,20 +1277,29 @@ impl Store {
 
     /// 登録を丸ごと置き換える（description も含む）。webhook の有無を返す。webhook の値は平文で保存する（U4）が、
     /// どの API からも返さない。description は公開で、list_agents が返す。
+    /// 登録は `client_id`（OAuth クライアント）のものになり、他のクライアントからは置き換えられない（`check_owner`）。
     pub fn register_agent(
         &self,
         room: &str,
         agent: &str,
+        client_id: &str,
         webhook: Option<WebhookTarget>,
         description: Option<&str>,
     ) -> Result<bool, RelayError> {
         let bytes = agent_bytes(agent, webhook.as_ref(), description);
+        let include_text = webhook.as_ref().is_none_or(|w| w.include_text);
         self.db.write(|tx| -> Result<_, RelayError> {
             prune(tx, now_ms())?;
-            let old: Option<i64> = tx
-                .prepare_cached("SELECT data_bytes FROM relay_agents WHERE room = ?1 AND name = ?2")?
-                .query_row(params![room, agent], |r| r.get(0))
+            let old: Option<(i64, Option<String>)> = tx
+                .prepare_cached(
+                    "SELECT data_bytes, client_id FROM relay_agents WHERE room = ?1 AND name = ?2",
+                )?
+                .query_row(params![room, agent], |r| Ok((r.get(0)?, r.get(1)?)))
                 .optional()?;
+            if let Some((_, owner)) = &old {
+                check_owner(tx, room, agent, owner.as_deref(), client_id)?;
+            }
+            let old = old.map(|(bytes, _)| bytes);
             if old.is_none() {
                 let count: i64 = tx
                     .prepare_cached("SELECT COUNT(*) FROM relay_agents WHERE room = ?1")?
@@ -1289,26 +1325,51 @@ impl Store {
                 None => (None, None, None),
             };
             tx.prepare_cached(
-                "INSERT INTO relay_agents (room, name, webhook_url, webhook_auth, webhook_secret, description, data_bytes) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT (room, name) DO UPDATE SET \
+                "INSERT INTO relay_agents (room, name, webhook_url, webhook_auth, webhook_secret, description, \
+                 data_bytes, client_id, webhook_include_text) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT (room, name) DO UPDATE SET \
                  webhook_url = excluded.webhook_url, webhook_auth = excluded.webhook_auth, \
                  webhook_secret = excluded.webhook_secret, description = excluded.description, \
-                 data_bytes = excluded.data_bytes",
+                 data_bytes = excluded.data_bytes, client_id = excluded.client_id, \
+                 webhook_include_text = excluded.webhook_include_text",
             )?
-            .execute(params![room, agent, url, auth, secret, description, bytes as i64])?;
+            .execute(params![
+                room,
+                agent,
+                url,
+                auth,
+                secret,
+                description,
+                bytes as i64,
+                client_id,
+                include_text
+            ])?;
             Ok(webhook.is_some())
         })
     }
 
-    /// 登録を消す（メッセージは残る）。消えたかどうかを返す。
-    pub fn unregister_agent(&self, room: &str, agent: &str) -> Result<bool, RelayError> {
-        let removed = self.db.write(|tx| {
+    /// 登録を消す（メッセージは残る）。消えたかどうかを返す。他のクライアントの登録は消せない（`check_owner`）。
+    pub fn unregister_agent(
+        &self,
+        room: &str,
+        agent: &str,
+        client_id: &str,
+    ) -> Result<bool, RelayError> {
+        self.db.write(|tx| -> Result<bool, RelayError> {
+            let owner: Option<Option<String>> = tx
+                .prepare_cached("SELECT client_id FROM relay_agents WHERE room = ?1 AND name = ?2")?
+                .query_row(params![room, agent], |r| r.get(0))
+                .optional()?;
+            let Some(owner) = owner else {
+                return Ok(false);
+            };
+            check_owner(tx, room, agent, owner.as_deref(), client_id)?;
             tx.execute(
                 "DELETE FROM relay_agents WHERE room = ?1 AND name = ?2",
                 params![room, agent],
-            )
-        })?;
-        Ok(removed > 0)
+            )?;
+            Ok(true)
+        })
     }
 
     /// 登録済みの名前を名前順に。`include_seen` ならメッセージの from/to も足す。webhook の値は出さない。
@@ -1397,6 +1458,7 @@ mod store_tests {
 
     const ROOM: &str = "2429307";
     const OTHER: &str = "1001";
+    const CLIENT: &str = "client-a";
 
     fn args(v: Value) -> Map<String, Value> {
         v.as_object().cloned().unwrap()
@@ -1407,6 +1469,7 @@ mod store_tests {
             url: url.into(),
             auth: None,
             secret: "s".into(),
+            include_text: true,
         }
     }
 
@@ -1536,7 +1599,13 @@ mod store_tests {
             )
             .unwrap();
         store
-            .register_agent(ROOM, "grok", Some(target("https://hook.example/a")), None)
+            .register_agent(
+                ROOM,
+                "grok",
+                CLIENT,
+                Some(target("https://hook.example/a")),
+                None,
+            )
             .unwrap();
         let att = m.attachments[0].id.clone();
 
@@ -1604,8 +1673,8 @@ mod store_tests {
             .send_message(ROOM, "muse", "grok", &args(json!({ "text": "x" })))
             .unwrap();
         assert_eq!(hook.unwrap().url, "https://hook.example/a");
-        assert!(!store.unregister_agent(OTHER, "grok").unwrap());
-        assert!(store.unregister_agent(ROOM, "grok").unwrap());
+        assert!(!store.unregister_agent(OTHER, "grok", CLIENT).unwrap());
+        assert!(store.unregister_agent(ROOM, "grok", CLIENT).unwrap());
         let (_, hook) = store
             .send_message(ROOM, "muse", "grok", &args(json!({ "text": "x" })))
             .unwrap();
@@ -1830,12 +1899,18 @@ mod store_tests {
             },
             Db::open_in_memory(),
         );
-        assert!(!store.register_agent(ROOM, "a", None, None).unwrap());
+        assert!(!store.register_agent(ROOM, "a", CLIENT, None, None).unwrap());
         let only_name = store.usage(ROOM).0.data_bytes;
         assert_eq!(only_name, AGENT_OVERHEAD + 1);
         // 置き換えは差分だけ数える
         assert!(store
-            .register_agent(ROOM, "a", Some(target("https://hook.example/a")), None)
+            .register_agent(
+                ROOM,
+                "a",
+                CLIENT,
+                Some(target("https://hook.example/a")),
+                None
+            )
             .unwrap());
         let with_hook = store.usage(ROOM).0.data_bytes;
         assert_eq!(
@@ -1847,6 +1922,7 @@ mod store_tests {
             .register_agent(
                 ROOM,
                 "a",
+                CLIENT,
                 Some(target("https://hook.example/a")),
                 Some("役割"),
             )
@@ -1856,11 +1932,19 @@ mod store_tests {
             with_hook + "役割".len() as u64
         );
         store
-            .register_agent(ROOM, "a", Some(target("https://hook.example/a")), None)
+            .register_agent(
+                ROOM,
+                "a",
+                CLIENT,
+                Some(target("https://hook.example/a")),
+                None,
+            )
             .unwrap();
         assert_eq!(store.usage(ROOM).0.data_bytes, with_hook);
-        store.register_agent(ROOM, "b", None, None).unwrap();
-        let err = store.register_agent(ROOM, "c", None, None).unwrap_err();
+        store.register_agent(ROOM, "b", CLIENT, None, None).unwrap();
+        let err = store
+            .register_agent(ROOM, "c", CLIENT, None, None)
+            .unwrap_err();
         assert_eq!(err.status, 507);
         assert!(
             err.message.starts_with(
@@ -1870,11 +1954,11 @@ mod store_tests {
             err.message
         );
         // 登録済みの名前の置き換えは数に関係なくできる
-        store.register_agent(ROOM, "b", None, None).unwrap();
-        assert!(store.unregister_agent(ROOM, "a").unwrap());
-        store.register_agent(ROOM, "c", None, None).unwrap();
-        assert!(store.unregister_agent(ROOM, "b").unwrap());
-        assert!(store.unregister_agent(ROOM, "c").unwrap());
+        store.register_agent(ROOM, "b", CLIENT, None, None).unwrap();
+        assert!(store.unregister_agent(ROOM, "a", CLIENT).unwrap());
+        store.register_agent(ROOM, "c", CLIENT, None, None).unwrap();
+        assert!(store.unregister_agent(ROOM, "b", CLIENT).unwrap());
+        assert!(store.unregister_agent(ROOM, "c", CLIENT).unwrap());
         assert_eq!(store.usage(ROOM), (Usage::default(), Usage::default()));
 
         // 登録も保存量の上限に入る
@@ -1885,9 +1969,17 @@ mod store_tests {
             },
             Db::open_in_memory(),
         );
-        store.register_agent(ROOM, "short", None, None).unwrap();
+        store
+            .register_agent(ROOM, "short", CLIENT, None, None)
+            .unwrap();
         let err = store
-            .register_agent(ROOM, "short", Some(target("https://hook.example/a")), None)
+            .register_agent(
+                ROOM,
+                "short",
+                CLIENT,
+                Some(target("https://hook.example/a")),
+                None,
+            )
             .unwrap_err();
         assert!(err
             .message
@@ -1895,7 +1987,7 @@ mod store_tests {
         assert_eq!(store.usage(ROOM).0.data_bytes, AGENT_OVERHEAD + 5);
         // description で上限を超える登録も断られ、前の登録が残る
         let err = store
-            .register_agent(ROOM, "short", None, Some("0123456789"))
+            .register_agent(ROOM, "short", CLIENT, None, Some("0123456789"))
             .unwrap_err();
         assert!(err
             .message
@@ -2052,7 +2144,9 @@ mod store_tests {
 
         // register_agent でも消える
         age(&kept.id, RETENTION_DAYS * day + 1_000);
-        store.register_agent(ROOM, "grok", None, None).unwrap();
+        store
+            .register_agent(ROOM, "grok", CLIENT, None, None)
+            .unwrap();
         assert_eq!(
             store
                 .get_thread(ROOM, &json!(mixed.thread_id))

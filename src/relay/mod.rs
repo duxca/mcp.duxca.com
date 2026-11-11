@@ -5,7 +5,8 @@
 //! - エージェント名と起床用 webhook は呼び出し側の自己申告（`agent` / `to` / `register_agent`）。
 //! - ストアは SQLite（再起動しても残る）。メッセージと添付は `RETENTION_DAYS` 日で消える。
 //!   保存量・同時待機・同時 webhook・バッチには上限がある（`Limits` など）。
-//! - 会話ログは tracing の info で出す（webhook の値と添付の中身は出さない）。
+//! - 会話ログは tracing の info で出す。本文・添付（中身とファイル名）・webhook の値は出さず、
+//!   本文は長さとハッシュだけにする。
 
 mod docs;
 mod js;
@@ -13,7 +14,7 @@ mod mcp;
 mod routes;
 mod store;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 mod webhook;
 
 use crate::db::Db;
@@ -26,6 +27,16 @@ pub use store::{Limits, Store, DEFAULT_MAX_TOTAL_STORAGE_BYTES};
 use webhook::{Webhook, WebhookTarget};
 
 pub const PREFIX: &str = "/relay/v1";
+
+/// 会話ログに出す本文の SHA-256（hex の先頭 16 文字）。
+fn text_hash(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(text.as_bytes())
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
 /// リクエストボディ上限。添付 3 MB（base64 で約 4 MB）+ 本文に余裕を持たせる。
 pub const MAX_BODY_BYTES: usize = 6 * 1024 * 1024;
 const MAX_WEBHOOK_URL: usize = 2048;
@@ -101,16 +112,18 @@ impl Relay {
         let files: Vec<String> = message
             .attachments
             .iter()
-            .map(|a| format!("{} ({}, {} bytes)", a.filename, a.content_type, a.size))
+            .map(|a| format!("{}, {} bytes", a.content_type, a.size))
             .collect();
-        // 名前と本文は利用者の入力なので Debug 形式（改行などをエスケープ）で 1 行に収める
+        // 本文と添付のファイル名はログに残さない（ログの保持はメッセージの保持より長い）。
+        // 突き合わせ用に長さとハッシュの先頭だけを出す。名前は Debug 形式（改行などをエスケープ）
         tracing::info!(
             room,
             message_id = %message.id,
             thread_id = %message.thread_id,
             from = ?message.from,
             to = ?message.to,
-            text = ?message.text,
+            text_chars = message.text.chars().count(),
+            text_sha256 = %text_hash(&message.text),
             attachments = files.len(),
             files = ?files,
             "relay: message stored"
@@ -185,6 +198,15 @@ impl Relay {
         let url = text("webhook_url")?;
         let auth = header("webhook_auth")?;
         let secret = header("webhook_secret")?;
+        let include_text = match a.get("webhook_include_text").unwrap_or(&Value::Null) {
+            Value::Null => true,
+            Value::Bool(b) => *b,
+            _ => {
+                return Err(RelayError::bad_request(
+                    "\"webhook_include_text\" must be a boolean",
+                ))
+            }
+        };
         let Some(url) = url else {
             return Ok(None);
         };
@@ -207,7 +229,12 @@ impl Relay {
                 "\"webhook_secret\" is required with \"webhook_url\": every delivery is signed with it (X-Relay-Signature)",
             ));
         };
-        Ok(Some(WebhookTarget { url, auth, secret }))
+        Ok(Some(WebhookTarget {
+            url,
+            auth,
+            secret,
+            include_text,
+        }))
     }
 }
 

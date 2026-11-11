@@ -1561,7 +1561,7 @@ async fn list_agents_shows_registrations_unless_seen_names_are_asked_for() {
 // ---------------------------------------------------------------------------
 // 会話ログ
 
-type LogBuffer = Arc<Mutex<Vec<u8>>>;
+pub(crate) type LogBuffer = Arc<Mutex<Vec<u8>>>;
 
 thread_local! {
     static LOG_CAPTURE: std::cell::RefCell<Option<LogBuffer>> = const { std::cell::RefCell::new(None) };
@@ -1587,7 +1587,7 @@ impl std::io::Write for ThreadLogWriter {
 /// 全テスト共通のグローバル subscriber（TRACE まで）を 1 回だけ入れ、このスレッドの出力を集める。
 /// `set_default` の scoped subscriber が 1 つだけだと、並行する別テストのスレッドで先に登録された
 /// callsite の interest が never に固定されて取りこぼすので使わない。
-fn capture_logs() -> LogBuffer {
+pub(crate) fn capture_logs() -> LogBuffer {
     static INSTALL: std::sync::Once = std::sync::Once::new();
     INSTALL.call_once(|| {
         let subscriber = tracing_subscriber::fmt()
@@ -1605,7 +1605,7 @@ fn capture_logs() -> LogBuffer {
 }
 
 #[tokio::test]
-async fn conversation_log_has_the_text_but_no_secrets_or_file_bytes() {
+async fn conversation_log_has_no_text_file_names_secrets_or_file_bytes() {
     let logs = capture_logs();
 
     let (url, captured, server) = webhook_receiver().await;
@@ -1667,9 +1667,13 @@ async fn conversation_log_has_the_text_but_no_secrets_or_file_bytes() {
         ),
         "from=\"muse\"".into(),
         "to=\"grok\"".into(),
-        "text=\"log me please\\nsecond line\"".into(),
+        "text_chars=25".into(),
+        format!(
+            "text_sha256={}",
+            &sha256_hex(b"log me please\nsecond line")[..16]
+        ),
         "attachments=1".into(),
-        format!("notes.txt (text/plain, {} bytes)", file.len()),
+        format!("text/plain, {} bytes", file.len()),
     ] {
         assert!(stored.contains(&expected), "{expected} not in {stored}");
     }
@@ -1696,6 +1700,10 @@ async fn conversation_log_has_the_text_but_no_secrets_or_file_bytes() {
         url.as_str(),
         encoded.as_str(),
         file_text.as_str(),
+        "log me please",
+        "second line",
+        "short ask",
+        "notes.txt",
     ] {
         assert!(!out.contains(leaked), "log leaked {leaked}:\n{out}");
     }
@@ -1935,6 +1943,18 @@ async fn webhooks_are_sent_only_to_public_addresses() {
     }
 
     // 登録の検証を経ずに入った IP リテラルも送る直前に断る
+    let owner: String = h
+        .relay
+        .store
+        .db()
+        .read(|c| {
+            c.query_row(
+                "SELECT client_id FROM relay_agents WHERE room = ?1 AND name = 'grok'",
+                [ROOM],
+                |r| r.get(0),
+            )
+        })
+        .unwrap();
     for url in [
         format!("https://127.0.0.1:{port}/hook"),
         format!("https://[::ffff:127.0.0.1]:{port}/hook"),
@@ -1945,10 +1965,12 @@ async fn webhooks_are_sent_only_to_public_addresses() {
             .register_agent(
                 ROOM,
                 "grok",
+                &owner,
                 Some(super::webhook::WebhookTarget {
                     url: url.clone(),
                     auth: None,
                     secret: "s".into(),
+                    include_text: true,
                 }),
                 None,
             )
@@ -2112,4 +2134,160 @@ async fn agent_descriptions_are_listed_replaced_and_limited() {
             { "name": "muse", "webhook": true, "description": "second" },
         ])
     );
+}
+
+// ---------------------------------------------------------------------------
+// 登録の持ち主（セキュリティレビュー L-6）
+
+fn agent_owner(h: &Harness, name: &str) -> Option<String> {
+    h.relay
+        .store
+        .db()
+        .read(|c| {
+            c.query_row(
+                "SELECT client_id FROM relay_agents WHERE room = ?1 AND name = ?2",
+                [ROOM, name],
+                |r| r.get(0),
+            )
+        })
+        .unwrap()
+}
+
+/// 名前の登録は、登録した OAuth クライアントのもの。持ち主の認可が生きている間は、同じ部屋の
+/// 別のクライアントから置き換えも解除もできない。
+#[tokio::test]
+async fn registrations_belong_to_the_client_that_made_them() {
+    let (h, owner) = setup().await;
+    let other = client_for(&h, "ok").await;
+    owner
+        .ok(
+            "register_agent",
+            json!({ "agent": "grok", "description": "mine" }),
+        )
+        .await;
+    for (tool, args) in [
+        (
+            "register_agent",
+            json!({ "agent": "grok", "webhook_url": "https://hook.example/steal", "webhook_secret": DUMMY_SECRET }),
+        ),
+        ("unregister_agent", json!({ "agent": "grok" })),
+    ] {
+        let err = other.err(tool, args).await;
+        assert!(err.contains("another OAuth client"), "{tool}: {err}");
+    }
+    owner
+        .ok(
+            "register_agent",
+            json!({ "agent": "grok", "description": "still mine" }),
+        )
+        .await;
+    assert_eq!(
+        other.ok("list_agents", json!({})).await["agents"],
+        json!([{ "name": "grok", "webhook": false, "description": "still mine" }])
+    );
+    other.ok("register_agent", json!({ "agent": "muse" })).await;
+
+    // 持ち主の認可が切れたら（失効・期限切れ）、別のクライアントが引き継げる
+    let owner_client = agent_owner(&h, "grok").unwrap();
+    h.relay
+        .store
+        .db()
+        .read(|c| {
+            c.execute(
+                "DELETE FROM oauth_tokens WHERE client_id = ?1",
+                [&owner_client],
+            )
+        })
+        .unwrap();
+    other.ok("register_agent", json!({ "agent": "grok" })).await;
+    assert_ne!(agent_owner(&h, "grok").unwrap(), owner_client);
+
+    // v2 までの持ち主の無い登録は、次に登録したクライアントのものになる
+    h.relay
+        .store
+        .db()
+        .read(|c| {
+            c.execute(
+                "UPDATE relay_agents SET client_id = NULL WHERE name = 'muse'",
+                [],
+            )
+        })
+        .unwrap();
+    let third = client_for(&h, "ok").await;
+    third.ok("register_agent", json!({ "agent": "muse" })).await;
+    let err = other
+        .err("unregister_agent", json!({ "agent": "muse" }))
+        .await;
+    assert!(err.contains("another OAuth client"), "{err}");
+    assert_eq!(
+        third
+            .ok("unregister_agent", json!({ "agent": "muse" }))
+            .await["unregistered"],
+        true
+    );
+}
+
+/// webhook_include_text: false なら、webhook の本文に text と添付を載せない。
+#[tokio::test]
+async fn webhooks_can_leave_the_text_out() {
+    let (url, captured, server) = webhook_receiver().await;
+    let (_h, c) = setup_with(
+        Relay::new(PUBLIC_URL, 1024 * 1024, Db::open_in_memory()).allowing_loopback_http_webhooks(),
+    )
+    .await;
+    let hook = format!("{url}/hook");
+    let err = c
+        .err(
+            "register_agent",
+            json!({ "agent": "grok", "webhook_url": hook, "webhook_secret": DUMMY_SECRET, "webhook_include_text": "no" }),
+        )
+        .await;
+    assert!(err.contains("webhook_include_text"), "{err}");
+    c.ok(
+        "register_agent",
+        json!({ "agent": "grok", "webhook_url": hook, "webhook_secret": DUMMY_SECRET, "webhook_include_text": false }),
+    )
+    .await;
+    let sent = c
+        .ok(
+            "send_message",
+            json!({ "agent": "muse", "to": "grok", "text": "secret plans",
+                    "attachments": [attachment("plan.txt", "text/plain", b"x")] }),
+        )
+        .await;
+    assert_eq!(sent["notified"], true);
+    let (_, headers, body) = captured.lock().unwrap()[0].clone();
+    let ts = header_of(&headers, "x-relay-timestamp").unwrap();
+    assert_eq!(
+        header_of(&headers, "x-relay-signature").unwrap(),
+        format!("sha256={}", signature(DUMMY_SECRET, &ts, &body))
+    );
+    let payload: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(payload["message"]["id"], sent["message"]["id"]);
+    assert_eq!(
+        payload["message"]["thread_id"],
+        sent["message"]["thread_id"]
+    );
+    assert_eq!(payload["message"]["from"], "muse");
+    assert!(payload["message"].get("text").is_none(), "{body}");
+    assert!(payload["message"].get("attachments").is_none(), "{body}");
+    assert!(!body.contains("secret plans") && !body.contains("plan.txt"));
+    let inbox = c.ok("check_messages", json!({ "agent": "grok" })).await;
+    assert_eq!(texts(&inbox), ["secret plans"]);
+
+    // 省略すれば今までどおり本文も載せる
+    c.ok(
+        "register_agent",
+        json!({ "agent": "grok", "webhook_url": hook, "webhook_secret": DUMMY_SECRET }),
+    )
+    .await;
+    c.ok(
+        "send_message",
+        json!({ "agent": "muse", "to": "grok", "text": "plain" }),
+    )
+    .await;
+    let (_, _, body) = captured.lock().unwrap()[1].clone();
+    let payload: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(payload["message"]["text"], "plain");
+    server.abort();
 }

@@ -21,7 +21,7 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(
-            // RUST_LOG 未設定でも relay の会話ログ（info）が journald に出るように
+            // RUST_LOG 未設定でも relay の会話ログ（info。本文は出さない）が出るように
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
@@ -49,14 +49,18 @@ async fn main() -> anyhow::Result<()> {
     );
     let db = db::Db::open(&config.database_path, config.sqlite_wal_autocheckpoint)?;
 
-    let oauth = Arc::new(OAuthServer::new(
+    let mut oauth = OAuthServer::new(
         &public_url,
         allowed_ids,
         github,
         Arc::new(HttpClientMetadataFetcher),
         config.redirect_allowlist()?,
         db.clone(),
-    ));
+    );
+    if let Some(hosts) = config.cimd_host_allowlist() {
+        oauth = oauth.with_cimd_hosts(hosts);
+    }
+    let oauth = Arc::new(oauth);
 
     let relay = Arc::new(relay::Relay::new(
         &public_url,
