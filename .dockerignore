@@ -8,3 +8,5 @@ mcp.db*
 mcp-db-restore.*/
 deploy/
 terraform_*/
+# google-github-actions/auth が作る資格情報（ビルドコンテキストと GHA キャッシュに入れない）
+gha-creds-*.json
