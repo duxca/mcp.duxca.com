@@ -53,9 +53,8 @@ jobs:
           exit 1
         fi
     - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+    # dtolnay/rust-toolchain はブランチ自体にバージョンが焼き込まれているので、SHA 固定でも 1.96.0 になる。toolchain input は無い（付けると警告になる）
     - uses: dtolnay/rust-toolchain@d86e0fa8f147d6539442c26a61ebba8becc19489 # 1.96.0
-      with:
-        toolchain: "1.96.0"
     - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
     - run: cargo test --locked
     - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
