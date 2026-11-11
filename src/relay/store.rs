@@ -17,7 +17,7 @@ use axum::body::Bytes;
 use base64::alphabet;
 use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
 use base64::Engine;
-use rand::RngCore;
+use rand::TryRng;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -178,7 +178,9 @@ pub fn iso_ms(ms: i64) -> String {
 
 fn random_hex(len: usize) -> String {
     let mut bytes = vec![0u8; len];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("OS RNG");
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
