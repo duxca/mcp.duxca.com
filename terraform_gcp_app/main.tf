@@ -35,6 +35,11 @@ resource "google_cloud_run_service" "mcp" {
         }
 
         env {
+          name  = "OAUTH_REDIRECT_ALLOWLIST"
+          value = var.oauth_redirect_allowlist
+        }
+
+        env {
           name = "GITHUB_CLIENT_SECRET"
           value_from {
             secret_key_ref {
