@@ -8,7 +8,7 @@ use super::store::MessageView;
 use crate::auth::is_global_ip;
 use hmac::{Hmac, KeyInit, Mac};
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::Sha256;
 use std::fmt;
 use std::future::Future;
@@ -33,12 +33,27 @@ pub struct WebhookTarget {
     pub auth: Option<String>,
     /// 署名用の秘密（登録時に必須）
     pub secret: String,
+    /// false なら本文に text と添付を載せない（id と名前だけ）
+    pub include_text: bool,
 }
 
 impl fmt::Debug for WebhookTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("WebhookTarget { .. }")
     }
+}
+
+/// webhook に載せるメッセージ。`include_text` が false なら text と添付を外す
+/// （受け手は check_messages で取りに来る）。
+fn payload(message: &MessageView, include_text: bool) -> Value {
+    let mut value = serde_json::to_value(message).unwrap_or_default();
+    if !include_text {
+        if let Some(fields) = value.as_object_mut() {
+            fields.remove("text");
+            fields.remove("attachments");
+        }
+    }
+    value
 }
 
 /// `HMAC-SHA256(secret, "{timestamp}.{body}")` の hex。
@@ -173,7 +188,8 @@ impl Webhook {
         if !host_is_public(&url, self.allow_loopback_http) {
             return BLOCKED.into();
         }
-        let body = json!({ "event": EVENT, "message": message }).to_string();
+        let body =
+            json!({ "event": EVENT, "message": payload(message, target.include_text) }).to_string();
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -226,6 +242,7 @@ mod webhook_tests {
             url: "https://hook.example/secret-path".into(),
             auth: Some("Bearer dummy-auth".into()),
             secret: "dummy-secret".into(),
+            include_text: true,
         };
         assert_eq!(format!("{t:?}"), "WebhookTarget { .. }");
     }
@@ -292,6 +309,7 @@ mod webhook_tests {
             url: "https://hook.example/x".into(),
             auth: None,
             secret: "s".into(),
+            include_text: true,
         };
         let message = MessageView {
             id: "1".into(),

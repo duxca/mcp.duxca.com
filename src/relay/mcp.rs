@@ -71,15 +71,16 @@ pub fn tools() -> Value {
           "inputSchema": { "type": "object", "properties": {
             "include_seen": { "type": "boolean", "default": false, "description": "Also list every sender and recipient of the messages still kept in this room." } } },
           "annotations": { "readOnlyHint": true } },
-        { "name": "register_agent", "description": "Register your agent name in this room, optionally with a short public description of your role (shown to everyone by list_agents) and a webhook the relay POSTs to when a message is addressed to you. Replaces your previous registration entirely (omitted fields, including description, are cleared). The registration is kept, across relay restarts, until you replace or remove it. The webhook values can never be read back.",
+        { "name": "register_agent", "description": "Register your agent name in this room, optionally with a short public description of your role (shown to everyone by list_agents) and a webhook the relay POSTs to when a message is addressed to you. Replaces your previous registration entirely (omitted fields, including description, are cleared). The registration is kept, across relay restarts, until you replace or remove it. The webhook values can never be read back. A name belongs to the OAuth client (connector) that registered it: while that client's authorization is valid, other clients cannot replace or unregister it.",
           "inputSchema": { "type": "object", "required": ["agent"], "properties": {
             "agent": agent,
             "description": { "type": "string", "description": "Optional public self-introduction of your role in this room (max 500 chars), returned by list_agents." },
             "webhook_url": { "type": "string", "description": "https URL (max 2048 chars) to POST {\"event\":\"relay.message.created\",\"message\":{...}} to." },
             "webhook_auth": { "type": "string", "description": "Sent verbatim as the Authorization header." },
-            "webhook_secret": { "type": "string", "description": "Required with webhook_url. HMAC-SHA256 key for X-Relay-Signature; it is never sent itself." } } },
+            "webhook_secret": { "type": "string", "description": "Required with webhook_url. HMAC-SHA256 key for X-Relay-Signature; it is never sent itself." },
+            "webhook_include_text": { "type": "boolean", "default": true, "description": "false sends only the message ids and names (no text, no attachment metadata); fetch the message with check_messages." } } },
           "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true } },
-        { "name": "unregister_agent", "description": "Remove your registration (and webhook) from this room. Messages are kept.",
+        { "name": "unregister_agent", "description": "Remove your registration (and webhook) from this room. Messages are kept. Only the OAuth client (connector) that registered the name can remove it while its authorization is valid.",
           "inputSchema": { "type": "object", "required": ["agent"], "properties": { "agent": agent } },
           "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": true } },
     ])
@@ -124,9 +125,11 @@ fn check_wait(v: &Value) -> Value {
 }
 
 /// `a` は持ち主ごと受け取り、待機の前に手放す（使わない大きな引数を long-poll の間まで抱えない）。
+/// `client_id` は呼び出したトークンの OAuth クライアント（登録の持ち主にする）。
 async fn call_tool(
     relay: &Arc<Relay>,
     room: &str,
+    client_id: &str,
     name: &str,
     a: Map<String, Value>,
 ) -> Result<Value, ToolError> {
@@ -234,7 +237,6 @@ async fn call_tool(
             tracing::info!(
                 room,
                 attachment_id = %att.meta.id,
-                filename = ?att.meta.filename,
                 size = att.meta.size,
                 "relay: attachment fetched"
             );
@@ -267,7 +269,8 @@ async fn call_tool(
             let agent = name_arg("agent")?;
             let description = agent_description(&arg("description"))?;
             let target = relay.webhook_target(&a)?;
-            let webhook = store.register_agent(room, &agent, target, description.as_deref())?;
+            let webhook =
+                store.register_agent(room, &agent, client_id, target, description.as_deref())?;
             tracing::info!(
                 room,
                 agent = ?agent,
@@ -279,7 +282,7 @@ async fn call_tool(
         }
         "unregister_agent" => {
             let agent = name_arg("agent")?;
-            let removed = store.unregister_agent(room, &agent)?;
+            let removed = store.unregister_agent(room, &agent, client_id)?;
             tracing::info!(room, agent = ?agent, removed, "relay: agent unregistered");
             Ok(json!({ "unregistered": removed }))
         }
@@ -336,6 +339,7 @@ fn tool_result(name: &str, out: Value) -> Value {
 async fn tools_call(
     relay: &Arc<Relay>,
     room: &str,
+    client_id: &str,
     id: Value,
     mut params: Map<String, Value>,
     budget: Option<&Mutex<usize>>,
@@ -356,7 +360,7 @@ async fn tools_call(
         .get("agent")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let mut out = match call_tool(relay, room, &name, args).await {
+    let mut out = match call_tool(relay, room, client_id, &name, args).await {
         Ok(out) => out,
         Err(ToolError::Unknown(message)) => return rpc_error(id, -32602, message),
         Err(ToolError::Failed(e)) => return rpc_result(id, tool_error(&e.message)),
@@ -408,6 +412,7 @@ fn tool_error(message: &str) -> Value {
 async fn handle_one(
     relay: &Arc<Relay>,
     room: &str,
+    client_id: &str,
     mut msg: Value,
     budget: Option<&Mutex<usize>>,
 ) -> Option<Value> {
@@ -445,7 +450,7 @@ async fn handle_one(
         }
         "ping" => rpc_result(id, json!({})),
         "tools/list" => rpc_result(id, json!({ "tools": tools() })),
-        "tools/call" => tools_call(relay, room, id, params, budget).await,
+        "tools/call" => tools_call(relay, room, client_id, id, params, budget).await,
         "resources/list" => rpc_result(id, json!({ "resources": [] })),
         "prompts/list" => rpc_result(id, json!({ "prompts": [] })),
         _ => rpc_error(id, -32601, format!("Method not found: {method}")),
@@ -453,9 +458,14 @@ async fn handle_one(
 }
 
 /// 単一オブジェクトかバッチ配列を `room` の中で処理する。返す応答が無ければ None（HTTP 202）。
-pub async fn handle(relay: Arc<Relay>, room: Arc<str>, body: Value) -> Option<Value> {
+pub async fn handle(
+    relay: Arc<Relay>,
+    room: Arc<str>,
+    client_id: Arc<str>,
+    body: Value,
+) -> Option<Value> {
     let Value::Array(items) = body else {
-        return handle_one(&relay, &room, body, None).await;
+        return handle_one(&relay, &room, &client_id, body, None).await;
     };
     if items.len() > MAX_BATCH {
         return Some(rpc_error(
@@ -473,8 +483,12 @@ pub async fn handle(relay: Arc<Relay>, room: Arc<str>, body: Value) -> Option<Va
     for (i, item) in items.into_iter().enumerate() {
         let relay = relay.clone();
         let room = room.clone();
+        let client_id = client_id.clone();
         let budget = budget.clone();
-        set.spawn(async move { (i, handle_one(&relay, &room, item, Some(&budget)).await) });
+        set.spawn(async move {
+            let reply = handle_one(&relay, &room, &client_id, item, Some(&budget)).await;
+            (i, reply)
+        });
     }
     let mut out = Vec::new();
     while let Some(joined) = set.join_next().await {

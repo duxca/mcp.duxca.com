@@ -11,6 +11,7 @@ use std::time::Duration;
 const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_agent_description.sql"),
+    include_str!("../migrations/0003_security_review.sql"),
 ];
 
 /// DB の失敗。HTTP では 503 にする（401 や invalid_grant にすると、クライアントに再認可を促してしまう）。
@@ -161,10 +162,10 @@ mod tests {
         assert!(err.contains("newer than this binary"), "{err}");
     }
 
-    /// v1 のまま（本番の旧バイナリが作った形）の DB を今のコードで開くと v2 になり、行は残る。
+    /// v1 のまま（本番の旧バイナリが作った形）の DB を今のコードで開くと最新になり、行は残る。
     #[test]
     fn a_v1_database_migrates_forward_and_keeps_its_rows() {
-        assert_eq!(MIGRATIONS.len(), 2);
+        assert_eq!(MIGRATIONS.len(), 3);
         let path = TempPath::new("v1");
         {
             // 旧バイナリと同じ手順で 0001 だけを当てる
@@ -184,29 +185,84 @@ mod tests {
             tx.commit().unwrap();
         }
         let db = Db::open(&path.0, None).unwrap();
-        let (version, row): (i64, (String, String, Option<String>, i64)) = db
+        type Row = (String, String, Option<String>, i64, Option<String>, i64);
+        let (version, row): (i64, Row) = db
             .read(|c| {
                 Ok((
                     c.pragma_query_value(None, "user_version", |r| r.get(0))?,
                     c.query_row(
-                        "SELECT name, webhook_url, description, data_bytes FROM relay_agents WHERE room = 'r'",
+                        "SELECT name, webhook_url, description, data_bytes, client_id, webhook_include_text \
+                         FROM relay_agents WHERE room = 'r'",
                         [],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
                     )?,
                 ))
             })
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         assert_eq!(
             row,
-            ("grok".into(), "https://hook.example/w".into(), None, 150)
+            (
+                "grok".into(),
+                "https://hook.example/w".into(),
+                None,
+                150,
+                None,
+                1
+            )
         );
         drop(db);
-        // 開き直しても v2 のまま
+        // 開き直しても v3 のまま
         let db = Db::open(&path.0, None).unwrap();
         let version: i64 = db
             .read(|c| c.pragma_query_value(None, "user_version", |r| r.get(0)))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
+    }
+
+    /// v2 で発行済みのトークンは、v3 で系列（grant_id）と開始時刻を補われ、そのまま使える。
+    #[test]
+    fn v2_tokens_get_a_grant_on_migration() {
+        let path = TempPath::new("v2");
+        {
+            let mut conn = Connection::open(&path.0).unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute_batch(MIGRATIONS[0]).unwrap();
+            tx.execute_batch(MIGRATIONS[1]).unwrap();
+            tx.pragma_update(None, "user_version", 2).unwrap();
+            let insert = "INSERT INTO oauth_tokens (token_sha256, kind, client_id, subject, resource, \
+                          scopes, issued_at, expires_at, access_sha256) VALUES (?1, ?2, 'c', 's', 'r', '[]', ?3, ?4, ?5)";
+            tx.execute(
+                insert,
+                rusqlite::params!["a1", "access", 100, 4000, None::<String>],
+            )
+            .unwrap();
+            tx.execute(insert, rusqlite::params!["r1", "refresh", 100, 9000, "a1"])
+                .unwrap();
+            // refresh で入れ替えた古い access（対の refresh はもう無い）
+            tx.execute(
+                insert,
+                rusqlite::params!["a0", "access", 50, 400, None::<String>],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let db = Db::open(&path.0, None).unwrap();
+        type Token = (String, Option<String>, Option<i64>, Option<i64>);
+        let rows: Vec<Token> = db
+            .read(|c| {
+                c.prepare("SELECT token_sha256, grant_id, granted_at, used_at FROM oauth_tokens ORDER BY token_sha256")?
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                    .collect()
+            })
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("a0".into(), Some("a0".into()), Some(50), None),
+                ("a1".into(), Some("r1".into()), Some(100), None),
+                ("r1".into(), Some("r1".into()), Some(100), None),
+            ]
+        );
     }
 }
