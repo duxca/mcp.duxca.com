@@ -12,12 +12,15 @@ env:
   CARGO_TERM_COLOR: always
   TF_INPUT: "false"
 
-# 移行中（3b/3c）は手動起動だけ。VM へのデプロイは deploy.yml が push で続ける（DESIGN.md §6.10）
+# 移行完了（Phase 3d）: main への push で Cloud Run へ自動デプロイする。
+# 手動起動では deploy_app=false のままにするとビルドと push だけで止められる。
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       deploy_app:
-        description: "terraform_gcp_app と terraform_cf も apply する（カットオーバーの窓の中だけ）"
+        description: "terraform_gcp_app と terraform_cf も apply する"
         type: boolean
         default: false
 
@@ -29,6 +32,8 @@ jobs:
 
   deploy:
     runs-on: ubuntu-24.04
+    env:
+      DEPLOY_APP: ${{ github.event_name == 'push' || inputs.deploy_app }}
     timeout-minutes: 45
     permissions:
       contents: read
@@ -36,7 +41,6 @@ jobs:
     steps:
     - name: Check repository variables and secrets
       env:
-        DEPLOY_APP: ${{ inputs.deploy_app }}
         HAS_CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN != '' }}
       run: |
         if [ -z "${PROJECT_NUMBER}" ]; then
@@ -90,14 +94,14 @@ jobs:
         echo "Pushed ${image}"
         echo "Pushed \`${image}\`" >> "${GITHUB_STEP_SUMMARY}"
     - name: Verify Secret Manager version
-      if: ${{ inputs.deploy_app }}
+      if: ${{ env.DEPLOY_APP == 'true' }}
       run: |
         set -euo pipefail
         gcloud secrets versions access latest \
           --project="${PROJECT_ID}" \
           --secret=GITHUB_CLIENT_SECRET >/dev/null
     - name: Terraform Apply GCP App
-      if: ${{ inputs.deploy_app }}
+      if: ${{ env.DEPLOY_APP == 'true' }}
       working-directory: ./terraform_gcp_app
       env:
         CONTAINER_IMAGE: ${{ steps.image.outputs.image }}
@@ -107,7 +111,7 @@ jobs:
         timeout 10m terraform plan -out=tfplan -var-file=prod.tfvars -var="container_image=${CONTAINER_IMAGE}"
         timeout 20m terraform apply -auto-approve tfplan
     - name: Check run.app URL
-      if: ${{ inputs.deploy_app }}
+      if: ${{ env.DEPLOY_APP == 'true' }}
       working-directory: ./terraform_gcp_app
       run: |
         set -euo pipefail
@@ -126,7 +130,7 @@ jobs:
         exit 1
     # run.app の確認が通ってから DNS を替える（DESIGN.md §6.12 の手順 4→5）
     - name: Terraform Apply Cloudflare
-      if: ${{ inputs.deploy_app }}
+      if: ${{ env.DEPLOY_APP == 'true' }}
       working-directory: ./terraform_cf
       env:
         CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -137,7 +141,7 @@ jobs:
         timeout 20m terraform apply -auto-approve tfplan
     # 証明書の発行は数分〜それ以上かかるので、時間切れは警告にとどめる
     - name: Check public URL
-      if: ${{ inputs.deploy_app }}
+      if: ${{ env.DEPLOY_APP == 'true' }}
       run: |
         set -uo pipefail
         url="https://mcp.duxca.com"
