@@ -6,7 +6,7 @@
 
 use super::store::MessageView;
 use crate::auth::is_global_ip;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use serde_json::json;
 use sha2::Sha256;

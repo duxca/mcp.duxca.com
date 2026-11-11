@@ -24,7 +24,7 @@ RUN \
 
 FROM debian:trixie-slim
 WORKDIR /app
-# litestream（Go）が GCS への TLS に使う。アプリ側は reqwest の rustls-tls（webpki-roots）なので要らない
+# litestream（Go）の GCS 向け TLS と、アプリの reqwest（rustls-platform-verifier が OS の証明書ストアを読む）の両方が使う
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=litestream /usr/local/bin/litestream /app/litestream
 COPY db/litestream.yml /app/litestream.yml

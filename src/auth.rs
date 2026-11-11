@@ -13,7 +13,7 @@ use crate::db::{Db, DbError};
 use async_trait::async_trait;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
-use rand::RngCore;
+use rand::TryRng;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -60,13 +60,17 @@ pub fn now() -> i64 {
 /// `secrets.token_urlsafe(32)` 相当。
 pub fn token_urlsafe() -> String {
     let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("OS RNG");
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
 fn token_hex() -> String {
     let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("OS RNG");
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
