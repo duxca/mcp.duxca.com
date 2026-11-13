@@ -1,7 +1,4 @@
-provider "google" {
-  project = var.project_id
-  region  = var.region
-}
+# 土台側の API 有効化（旧 terraform_gcp_storage/main.tf から移管）
 
 resource "google_project_service" "cloud_run_api" {
   service = "run.googleapis.com"

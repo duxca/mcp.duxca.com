@@ -52,3 +52,26 @@ variable "app_service_account_email" {
   description = "Cloud Run runtime service account email"
   type        = string
 }
+
+variable "region" {
+  description = "Region for the foundation resources"
+  type        = string
+  default     = "asia-northeast1"
+}
+
+variable "bucket_name" {
+  description = "Litestream GCS bucket name"
+  type        = string
+}
+
+variable "litestream_bucket_force_destroy" {
+  description = "Allow destroying the Litestream bucket with its objects"
+  type        = bool
+  default     = false
+}
+
+variable "docker_registry" {
+  description = "Artifact Registry repository name"
+  type        = string
+  default     = "cloud-run-source-deploy"
+}

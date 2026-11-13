@@ -8,3 +8,6 @@ app_service_account_email = "mcp-container@mcp-duxca-prod.iam.gserviceaccount.co
 # Numeric IDs (immutable) for the WIF attribute condition
 github_repository_id       = "1405672968"
 github_repository_owner_id = "2429325"
+
+region      = "asia-northeast1"
+bucket_name = "mcp-duxca-prod-litestream"

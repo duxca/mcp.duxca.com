@@ -43,7 +43,7 @@ variable "terraform_state_bucket" {
 }
 
 variable "storage_state_prefix" {
-  description = "Terraform remote state prefix for terraform_gcp_storage"
+  description = "Terraform remote state prefix for the foundation stack (terraform_ci, formerly terraform_gcp_storage)"
   type        = string
-  default     = "mcp.duxca.com/gcp_storage"
+  default     = "mcp.duxca.com/ci"
 }

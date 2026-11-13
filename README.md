@@ -170,10 +170,11 @@ curl -si -X POST http://127.0.0.1:8000/relay/v1 \
 ビルドして Cloud Run（プロジェクト `mcp-duxca-prod`、asia-northeast1）へデプロイする。
 手動起動（workflow_dispatch）もでき、`deploy_app=false` ならビルドと push だけで止まる。
 
-- 構成は terraform: `terraform_ci`（WIF とデプロイ用 SA）、`terraform_gcp_storage`
-  （Litestream 用バケット、Artifact Registry、Secret Manager）、`terraform_gcp_app`
-  （Cloud Run とドメインマッピング）、`terraform_cf`（DNS）。状態は
-  `gs://mcp-duxca-prod-terraform-state`。
+- 構成は terraform: `terraform_ci`（WIF とデプロイ用 SA に加え、Litestream 用
+  バケット、Artifact Registry、Secret Manager、実行用 SA などの土台一式。変更時のみ
+  手動で apply する）、`terraform_gcp_app`（Cloud Run とドメインマッピング）、
+  `terraform_cf`（DNS）。状態は `gs://mcp-duxca-prod-terraform-state`。
+  アプリ側は土台の出力を `terraform_ci` の state から読む。
 - DB は SQLite + Litestream で `gs://mcp-duxca-prod-litestream/mcp.db` に複製される。
   起動時に復元し、実行中は WAL を送り続ける。
 - 秘密は GitHub Secrets の `CLOUDFLARE_API_TOKEN`（terraform_cf 用）と Secret Manager の
