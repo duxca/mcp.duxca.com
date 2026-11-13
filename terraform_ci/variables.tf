@@ -75,3 +75,9 @@ variable "docker_registry" {
   type        = string
   default     = "cloud-run-source-deploy"
 }
+
+variable "app_service_name" {
+  description = "Cloud Run service name of the app"
+  type        = string
+  default     = "mcp-duxca-com"
+}

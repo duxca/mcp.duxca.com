@@ -70,10 +70,3 @@ resource "google_cloud_run_service" "mcp" {
 
   autogenerate_revision_name = true
 }
-
-resource "google_cloud_run_service_iam_member" "public_access" {
-  service  = google_cloud_run_service.mcp.name
-  location = google_cloud_run_service.mcp.location
-  role     = "roles/run.invoker"
-  member   = "allUsers"
-}
