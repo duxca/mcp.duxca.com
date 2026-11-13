@@ -20,14 +20,10 @@ locals {
     "sts.googleapis.com",
   ])
 
+  # プロジェクトレベルで残すのは Cloud Run のデプロイだけ。それ以外は
+  # リソース単位のバインディング（deployer_scoped.tf）に寄せた
   project_roles = toset([
-    "roles/artifactregistry.admin",
-    "roles/artifactregistry.writer",
-    "roles/iam.serviceAccountAdmin",
-    "roles/run.admin",
-    "roles/secretmanager.admin",
-    "roles/serviceusage.serviceUsageAdmin",
-    "roles/storage.admin",
+    "roles/run.developer",
   ])
 }
 
