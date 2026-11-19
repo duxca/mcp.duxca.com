@@ -15,6 +15,7 @@ mod routes;
 mod store;
 #[cfg(test)]
 pub(crate) mod tests;
+mod web;
 mod webhook;
 
 use crate::db::Db;
