@@ -3,7 +3,7 @@
 Grok / Claude アプリから呼べる **MCP ゲートウェイ**（Rust / Axum）。
 
 参考実装は pascal 上の `~/Github/mcp-test`（Python / Starlette）。
-公開は Cloud Run で、`terraform_gcp_app` の Cloud Run domain mapping と `terraform_cf` の Cloudflare DNS record（DNS-only の CNAME）で `https://mcp.duxca.com` に載せる。MCP エンドポイントは組み込みの relay（`/relay/v1`）だけ。
+公開は Cloud Run で、`terraform_ci` の Cloud Run domain mapping と `terraform_cf` の Cloudflare DNS record（DNS-only の CNAME）で `https://mcp.duxca.com` に載せる。MCP エンドポイントは組み込みの relay（`/relay/v1`）だけ。
 
 ## ローカル起動
 
@@ -189,8 +189,8 @@ curl -si -X POST http://127.0.0.1:8000/relay/v1 \
 手動起動（workflow_dispatch）もでき、`deploy_app=false` ならビルドと push だけで止まる。
 
 - 構成は terraform: `terraform_ci`（WIF とデプロイ用 SA に加え、Litestream 用
-  バケット、Artifact Registry、Secret Manager、実行用 SA などの土台一式。変更時のみ
-  手動で apply する）、`terraform_gcp_app`（Cloud Run とドメインマッピング）、
+  バケット、Artifact Registry、Secret Manager、実行用 SA、ドメインマッピングなどの
+  土台一式。変更時のみ手動で apply する）、`terraform_gcp_app`（Cloud Run）、
   `terraform_cf`（DNS）。状態は `gs://mcp-duxca-prod-terraform-state`。
   アプリ側は土台の出力を `terraform_ci` の state から読む。
 - DB は SQLite + Litestream で `gs://mcp-duxca-prod-litestream/mcp.db` に複製される。
