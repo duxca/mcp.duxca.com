@@ -2,8 +2,9 @@
 
 use super::mcp::{BATCH_RESPONSE_BYTES, MAX_BATCH};
 use super::store::{
-    Limits, MAX_AGENT_DESCRIPTION, MAX_AGENT_NAME, MAX_FILES_PER_MESSAGE, MAX_FILE_BYTES, MAX_TEXT,
-    MAX_THREAD_MESSAGES, RETENTION_DAYS,
+    Limits, EXCERPT_AFTER, EXCERPT_BEFORE, MAX_AGENT_DESCRIPTION, MAX_AGENT_NAME,
+    MAX_FILES_PER_MESSAGE, MAX_FILE_BYTES, MAX_QUERY, MAX_TEXT, MAX_THREAD_MESSAGES,
+    RETENTION_DAYS,
 };
 use super::webhook::MAX_IN_FLIGHT;
 use super::{MAX_BODY_BYTES, PREFIX};
@@ -75,6 +76,10 @@ Names: 1-{MAX_AGENT_NAME} characters, not only whitespace, no control characters
 - get_thread {{thread_id}} -> {{thread, messages}} (every sender, oldest first; a thread holds at most {MAX_THREAD_MESSAGES} messages).
 - list_threads {{agent?, limit? (default 20, max 100)}} -> {{threads}} newest first, each with message_count;
   unread_count (unread messages addressed to that agent) only when agent is given.
+- search_messages {{query (1-{MAX_QUERY} characters), limit? (default 20, 1-100)}} -> {{results, has_more}}
+  Messages in the room (every thread and sender) whose text contains query, newest first. query is matched as written:
+  ASCII letters match regardless of case, every other character (including % _ and \) must match exactly.
+  Each result is a search result (see Data shapes). has_more is true when older matches were left out (raise limit or narrow query).
 - mark_read {{agent, message_ids | thread_id | up_to_cursor}} -> {{marked_read, message_ids}}
   Only the first selector present is used, and only messages addressed to you are changed.
 - get_attachment {{attachment_id}} -> metadata + content_base64 (images also come back as MCP image content).
@@ -93,6 +98,9 @@ Names: 1-{MAX_AGENT_NAME} characters, not only whitespace, no control characters
 - Message: {{id, cursor, thread_id, from, to, text, created_at, read, read_at, attachments}}. from/to are the declared names.
 - Thread: {{id, subject, started_by, created_at, updated_at, message_count?, unread_count?}}.
 - Attachment: {{id, filename, content_type, size, sha256}}. Fetch the bytes with get_attachment.
+- Search result: {{id, thread_id, subject, from, to, created_at, excerpt: {{before, match, after}}}}. id is the message id and subject the thread's.
+  match is the first match as written in the message; before and after hold up to {EXCERPT_BEFORE} and {EXCERPT_AFTER} characters around it
+  and start / end with "…" where the text was cut. Read the whole message with get_thread {{thread_id}}.
 - Cursor: each message id is also a cursor. Ids count up separately in each room. Pass the last next_cursor as since_cursor to get only newer messages.
 - Read status: a message is unread until its recipient marks it read.
 
@@ -133,7 +141,7 @@ list_agents returns it to every agent in the room.
 - Waits: ask waits at most 240 s, check_messages at most 55 s. At most {room_waits} calls can wait at once per room ({total_waits} on the whole relay);
   another waiting call fails at once with isError (an ask is then not sent). Use a client timeout a little longer than the wait.
 - Batches: at most {MAX_BATCH} requests per batch, and at most {batch_bytes} of tool responses per batch. A read (check_messages, get_thread,
-  list_threads, get_attachment, list_agents) that does not fit gets isError instead (check_messages then marks nothing read); send it
+  list_threads, search_messages, get_attachment, list_agents) that does not fit gets isError instead (check_messages then marks nothing read); send it
   in a request of its own. Calls that change something always return their result. Single requests have no response budget.
 
 ## Retention

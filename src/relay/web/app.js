@@ -11,6 +11,10 @@ const REDIRECT_URI = `${ORIGIN}${CALLBACK_PATH}`;
 const MAX_TEXT = 20000;
 const MAX_SUBJECT = 200;
 const THREAD_LIMIT = 100;
+const MAX_QUERY = 200;
+const SEARCH_LIMIT = 50;
+// 一覧に出す抜粋の一致より前の文字数（サーバは 60 文字まで返す）。後ろは CSS で 3 行に切る
+const EXCERPT_BEFORE = 20;
 const POLL_WAIT_SECONDS = 55;
 const PARTICIPANT_BATCH = 10;
 const TIMEOUT_MS = {
@@ -90,6 +94,12 @@ function formatDate(iso) {
   return Number.isNaN(d.getTime()) ? String(iso ?? '') : dateFormat.format(d);
 }
 
+/** 末尾の n 文字にし、切ったら … を付ける。サロゲートペアは割らない。 */
+function tail(s, n) {
+  const chars = Array.from(s ?? '');
+  return chars.length <= n ? chars.join('') : `…${chars.slice(-n).join('')}`;
+}
+
 function formatSize(n) {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
@@ -98,7 +108,8 @@ function formatSize(n) {
 
 const idNum = (id) => Number(id) || 0;
 const maxId = (messages) => messages.reduce((m, x) => Math.max(m, idNum(x.id)), 0);
-const threadHash = (id) => `#/t/${encodeURIComponent(id)}`;
+const threadHash = (id, messageId) => `#/t/${encodeURIComponent(id)}${messageId ? `?${new URLSearchParams({ m: messageId })}` : ''}`;
+const searchHash = (q) => (q ? `#/search?${new URLSearchParams({ q })}` : '#/search');
 const threadsHash = (agent) => (agent ? `#/threads?${new URLSearchParams({ agent })}` : '#/threads');
 const newHash = (to) => (to ? `#/new?${new URLSearchParams({ to })}` : '#/new');
 
@@ -402,14 +413,17 @@ const idle = () => ({ phase: 'idle', error: null, at: 0 });
 
 const S = {
   signedIn: false,
-  route: { list: 'threads', agent: null, thread: null, compose: null },
+  route: { list: 'threads', agent: null, query: null, thread: null, focus: null, compose: null },
   listHash: '#/threads',
   agents: { st: idle(), items: [], includeSeen: false },
   threads: { st: idle(), items: [] },
+  // for: 結果がどの検索語のものか
+  search: { st: idle(), for: '', items: [], hasMore: false },
   // thread id -> { sig, names }。参加者はメッセージの from/to から求める（サーバに台帳は無い）
   parts: { st: idle(), map: readParticipants(), done: 0, total: 0 },
   // fresh: 開いてから届いた・開いたときに未読だったメッセージ（既読にしたあとも印を残す）
-  conv: { st: idle(), id: null, thread: null, messages: [], fresh: new Set() },
+  // focus: 読み込めたらそこまでスクロールするメッセージ id（検索結果から開いたとき）
+  conv: { st: idle(), id: null, thread: null, messages: [], fresh: new Set(), focus: null },
   // thread id（新規会話は "new"）-> 送信中・失敗したメッセージ
   pending: new Map(),
   drafts: new Map(),
@@ -461,7 +475,7 @@ function rememberParticipants(thread, messages) {
 function loader(slot, fetcher, commit, render) {
   let ctrl = null;
   let seq = 0;
-  return async () => {
+  const run = async () => {
     ctrl?.abort();
     ctrl = new AbortController();
     const my = ++seq;
@@ -478,6 +492,12 @@ function loader(slot, fetcher, commit, render) {
     }
     render();
   };
+  /** 走っている取得を止め、結果も捨てる。 */
+  run.cancel = () => {
+    ctrl?.abort();
+    seq += 1;
+  };
+  return run;
 }
 
 const loadAgents = loader(
@@ -537,6 +557,10 @@ const loadConv = loader(
     S.conv.messages = r.messages ?? [];
     rememberParticipants(r.thread, S.conv.messages);
     dropDelivered(S.conv.id);
+    if (S.conv.focus && !S.conv.messages.some((m) => m.id === S.conv.focus)) {
+      S.conv.focus = null;
+      notify('検索で選んだメッセージがこのスレッドに無かった（送信から 7 日で消える）。');
+    }
     const unread = S.conv.messages.filter((m) => m.to === ME && !m.read).map((m) => m.id);
     for (const id of unread) S.conv.fresh.add(id);
     if (unread.length) markRead(S.conv.id, { thread_id: S.conv.id });
@@ -546,6 +570,41 @@ const loadConv = loader(
     renderList();
   },
 );
+
+const loadSearch = loader(
+  S.search,
+  (signal) => tool('search_messages', { query: S.search.for, limit: SEARCH_LIMIT }, { signal }),
+  (r) => {
+    S.search.items = Array.isArray(r.results) ? r.results : [];
+    S.search.hasMore = Boolean(r.has_more);
+  },
+  () => renderList(),
+);
+
+/** 検索語が変わったときだけ検索し直す（スレッドから戻ったときは結果をそのまま見せる）。 */
+function runSearch() {
+  const q = S.route.query ?? '';
+  if (q === S.search.for && S.search.st.phase !== 'idle') return;
+  loadSearch.cancel();
+  S.search.for = q;
+  S.search.items = [];
+  S.search.hasMore = false;
+  S.search.st = idle();
+  if (q.trim()) loadSearch();
+}
+
+function submitSearch() {
+  const input = ui.search.input;
+  const q = input.value;
+  if (!q.trim()) {
+    input.focus();
+    return;
+  }
+  // 同じ語でもう一度押されたら取り直す
+  if (q === S.search.for) loadSearch();
+  const hash = searchHash(q);
+  if (location.hash !== hash) location.hash = hash;
+}
 
 async function markRead(threadId, selector) {
   try {
@@ -841,8 +900,12 @@ function buildShell() {
   ui.conn = h('span', { class: 'conn', role: 'status' });
   ui.tabAgents = h('a', { href: '#/agents' }, 'エージェント');
   ui.tabThreads = h('a', { href: '#/threads' }, 'スレッド');
+  ui.tabSearch = h('a', { href: '#/search' }, '検索');
   ui.notices = h('div', { class: 'notices' });
-  ui.listPane = h('section', { class: 'pane list-pane', 'aria-label': '一覧' });
+  ui.search = buildSearch();
+  ui.listBody = h('div', { class: 'list-body' });
+  // 検索欄は描き直さない（入力中にフォーカスを失わないように）
+  ui.listPane = h('section', { class: 'pane list-pane', 'aria-label': '一覧' }, ui.search.form, ui.listBody);
   ui.convHead = h('div', { class: 'pane-head' });
   ui.convSub = h('div');
   ui.convStatus = h('div');
@@ -855,7 +918,7 @@ function buildShell() {
   document.getElementById('app').replaceChildren(
     h('header', { class: 'top' },
       h('h1', {}, 'relay'),
-      h('nav', { class: 'tabs' }, ui.tabAgents, ui.tabThreads),
+      h('nav', { class: 'tabs' }, ui.tabAgents, ui.tabThreads, ui.tabSearch),
       ui.conn,
       h('button', { type: 'button', class: 'link', onclick: logout }, 'ログアウト')),
     ui.notices,
@@ -895,6 +958,24 @@ function buildLogin() {
       button.disabled = phase === 'loading';
     },
   };
+}
+
+function buildSearch() {
+  const input = h('input', {
+    type: 'search',
+    maxlength: MAX_QUERY,
+    placeholder: '本文を検索',
+    'aria-label': '検索語',
+    enterkeyhint: 'search',
+    autocomplete: 'off',
+  });
+  const button = h('button', { type: 'submit', class: 'primary' }, '検索');
+  const form = h('form', { class: 'pane-head search', role: 'search', hidden: true }, input, button);
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    submitSearch();
+  });
+  return { form, input };
 }
 
 function buildComposer() {
@@ -1001,12 +1082,16 @@ function renderTitle() {
 
 function renderList() {
   if (!ui.listPane) return;
-  ui.tabAgents.toggleAttribute('aria-current', false);
-  ui.tabThreads.toggleAttribute('aria-current', false);
-  const tab = S.route.list === 'agents' ? ui.tabAgents : ui.tabThreads;
-  tab.setAttribute('aria-current', 'page');
-  const view = S.route.list === 'agents' ? agentsView() : threadsView();
-  ui.listPane.replaceChildren(...view.filter(Boolean));
+  const { list } = S.route;
+  const tabs = { agents: ui.tabAgents, threads: ui.tabThreads, search: ui.tabSearch };
+  for (const [name, tab] of Object.entries(tabs)) {
+    if (name === list) tab.setAttribute('aria-current', 'page');
+    else tab.removeAttribute('aria-current');
+  }
+  ui.tabSearch.setAttribute('href', searchHash(S.search.for));
+  ui.search.form.hidden = list !== 'search';
+  const view = { agents: agentsView, search: searchView }[list]?.() ?? threadsView();
+  ui.listBody.replaceChildren(...view.filter(Boolean));
 }
 
 function agentsView() {
@@ -1085,6 +1170,37 @@ function threadsView() {
   return out;
 }
 
+function searchView() {
+  const { st, items, hasMore } = S.search;
+  const q = S.search.for;
+  if (!q.trim()) {
+    return [h('p', { class: 'empty' },
+      `本文の一部を入れて検索する。この部屋のすべてのスレッドから、新しい順に ${SEARCH_LIMIT} 件まで出す。`)];
+  }
+  const out = [statusLine(st, '検索結果', loadSearch, items.length > 0)];
+  if (st.phase === 'ok') {
+    out.push(h('div', { class: 'pane-sub' },
+      `「${q}」を含むメッセージ: ${items.length}${hasMore ? ' 件以上' : ' 件'}`));
+    if (!items.length) out.push(h('p', { class: 'empty' }, '見つからなかった。メッセージは送信から 7 日で消える。'));
+  }
+  out.push(h('ul', { class: 'list' }, items.map((r) => {
+    const ex = r.excerpt ?? {};
+    const current = S.route.thread === r.thread_id && S.route.focus === r.id;
+    return h('li', {},
+      h('a', { class: 'item', href: threadHash(r.thread_id, r.id), 'aria-current': current ? 'true' : null },
+        h('div', { class: 'row' }, h('span', { class: 'title' }, r.subject || '（件名なし）')),
+        h('div', { class: 'meta' }, `${r.from} → ${r.to} · ${formatDate(r.created_at)}`),
+        h('div', { class: 'excerpt' },
+          tail(ex.before, EXCERPT_BEFORE),
+          h('mark', {}, ex.match ?? ''),
+          ex.after ?? '')));
+  })));
+  if (hasMore) {
+    out.push(h('p', { class: 'more' }, `新しい順に ${SEARCH_LIMIT} 件まで表示している。語を足して絞り込む。`));
+  }
+  return out;
+}
+
 function renderConv(opts = {}) {
   if (!ui.convPane) return;
   const key = composerKey();
@@ -1121,12 +1237,19 @@ function renderMessages(messages, pending, key, opts, emptyText) {
   for (const p of pending) nodes.push(pendingView(key, p));
   if (!nodes.length && emptyText) nodes.push(h('p', { class: 'placeholder' }, emptyText));
   box.replaceChildren(...nodes);
-  if (opts.toBottom || nearBottom || opts.reset) box.scrollTop = box.scrollHeight;
+  const focus = S.conv.focus ? messages.findIndex((m) => m.id === S.conv.focus) : -1;
+  if (focus >= 0) {
+    S.conv.focus = null;
+    nodes[focus].scrollIntoView({ block: 'center' });
+  } else if (opts.toBottom || nearBottom || opts.reset) {
+    box.scrollTop = box.scrollHeight;
+  }
 }
 
 function messageView(m) {
   const mine = m.from === ME;
-  return h('article', { class: mine ? 'msg mine' : 'msg' },
+  const hit = S.route.focus === m.id;
+  return h('article', { class: `msg${mine ? ' mine' : ''}${hit ? ' hit' : ''}`, 'data-id': m.id },
     h('div', { class: 'meta' },
       mine ? null : h('span', { class: 'from' }, m.from),
       m.to !== ME ? h('span', {}, `→ ${m.to}`) : null,
@@ -1227,7 +1350,7 @@ function updateComposerState() {
 }
 
 // ---------------------------------------------------------------------------
-// 画面の切り替え（#/agents, #/threads?agent=…, #/t/<thread_id>, #/new?to=…）
+// 画面の切り替え（#/agents, #/threads?agent=…, #/search?q=…, #/t/<thread_id>?m=<message_id>, #/new?to=…）
 
 function parseRoute() {
   const raw = location.hash.replace(/^#/, '');
@@ -1236,9 +1359,10 @@ function parseRoute() {
   const q = new URLSearchParams(at < 0 ? '' : raw.slice(at + 1));
   if (path === '/agents') return { list: 'agents' };
   if (path === '/threads') return { list: 'threads', agent: q.get('agent') || null };
+  if (path === '/search') return { list: 'search', query: q.get('q') ?? '' };
   if (path.startsWith('/t/') && path.length > 3) {
     try {
-      return { thread: decodeURIComponent(path.slice(3)) };
+      return { thread: decodeURIComponent(path.slice(3)), focus: q.get('m') || null };
     } catch {
       return null;
     }
@@ -1255,16 +1379,24 @@ function route() {
     r = parseRoute();
   }
   const prevThread = S.route.thread;
+  const prevFocus = S.route.focus;
   const prevCompose = S.route.compose;
   if (r.list) {
-    S.route = { list: r.list, agent: r.agent ?? null, thread: null, compose: null };
+    S.route = { list: r.list, agent: r.agent ?? null, query: r.query ?? null, thread: null, focus: null, compose: null };
     S.listHash = location.hash;
     if (r.list === 'agents' && S.agents.st.phase === 'idle') loadAgents();
     if (r.list === 'threads' && S.threads.st.phase === 'idle') loadThreads();
+    if (r.list === 'search') {
+      ui.search.input.value = r.query;
+      runSearch();
+    }
   } else {
-    S.route = { ...S.route, thread: r.thread ?? null, compose: r.compose ?? null };
+    S.route = { ...S.route, thread: r.thread ?? null, focus: r.focus ?? null, compose: r.compose ?? null };
   }
   ui.layout.dataset.pane = r.list ? 'list' : 'conv';
+  if (S.route.thread && (S.route.thread !== prevThread || S.route.focus !== prevFocus)) {
+    S.conv.focus = S.route.focus;
+  }
   if (S.route.compose && prevCompose?.to !== S.route.compose.to) S.toChoice.delete('new');
   if (S.route.thread && S.route.thread !== prevThread) {
     if (S.conv.id !== S.route.thread) {
@@ -1279,6 +1411,7 @@ function route() {
     renderConv({ reset: S.route.compose && !prevCompose });
   }
   renderList();
+  if (r.list === 'search' && !r.query) ui.search.input.focus();
 }
 
 // ---------------------------------------------------------------------------
@@ -1325,7 +1458,7 @@ async function boot() {
   renderConn();
   if (location.pathname === CALLBACK_PATH) {
     ui.layout.dataset.pane = 'list';
-    ui.listPane.replaceChildren(h('p', { class: 'status loading', role: 'status' }, h('span', {}, 'ログイン処理中…')));
+    ui.listBody.replaceChildren(h('p', { class: 'status loading', role: 'status' }, h('span', {}, 'ログイン処理中…')));
     try {
       await handleCallback();
     } catch (e) {

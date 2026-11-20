@@ -774,6 +774,239 @@ async fn storage_limits_fail_as_tool_errors() {
 }
 
 // ---------------------------------------------------------------------------
+// 検索
+
+fn hit_ids(out: &Value) -> Vec<&str> {
+    out["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect()
+}
+
+/// 抜粋をつないだもの（切り詰めの無い短い本文なら本文そのもの）。
+fn hit_texts(out: &Value) -> Vec<String> {
+    out["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            let e = &r["excerpt"];
+            ["before", "match", "after"]
+                .iter()
+                .map(|k| e[k].as_str().unwrap())
+                .collect()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn search_messages_finds_text_in_every_thread_newest_first() {
+    let (_h, c) = setup().await;
+    let send = |args: Value| {
+        let c = c.clone();
+        async move { c.ok("send_message", args).await["message"].clone() }
+    };
+    let first = send(json!({ "agent": "muse", "to": "grok", "text": "Deploy the relay tonight", "subject": "deploy plan" })).await;
+    let thread = first["thread_id"].clone();
+    send(json!({ "agent": "grok", "to": "muse", "text": "unrelated", "subject": "misc" })).await;
+    let reply = send(json!({ "agent": "grok", "to": "muse", "text": "ok, I will deploy after the 本番 check", "thread_id": thread })).await;
+    let last =
+        send(json!({ "agent": "user", "to": "muse", "text": "redeploy? 本番デプロイは明日" }))
+            .await;
+    let id = |m: &Value| m["id"].as_str().unwrap().to_string();
+
+    let r = c.ok("search_messages", json!({ "query": "deploy" })).await;
+    assert_eq!(hit_ids(&r), [id(&last), id(&reply), id(&first)]);
+    assert_eq!(r["has_more"], false);
+    assert_eq!(
+        r["results"][1],
+        json!({
+            "id": reply["id"], "thread_id": thread, "subject": "deploy plan",
+            "from": "grok", "to": "muse", "created_at": reply["created_at"],
+            "excerpt": { "before": "ok, I will ", "match": "deploy", "after": " after the 本番 check" },
+        })
+    );
+    // 一致は本文に書かれたとおりの形で返る。件名の無いスレッドは本文の頭が件名
+    assert_eq!(
+        r["results"][2]["excerpt"],
+        json!({ "before": "", "match": "Deploy", "after": " the relay tonight" })
+    );
+    assert_eq!(r["results"][0]["subject"], "redeploy? 本番デプロイは明日");
+
+    // ASCII の大文字小文字は問わない。件名だけの一致は拾わない（本文の検索）
+    assert_eq!(
+        hit_ids(&c.ok("search_messages", json!({ "query": "DEPLOY" })).await),
+        [id(&last), id(&reply), id(&first)]
+    );
+    assert_eq!(
+        hit_ids(&c.ok("search_messages", json!({ "query": "本番" })).await),
+        [id(&last), id(&reply)]
+    );
+    assert_eq!(
+        c.ok("search_messages", json!({ "query": "misc" })).await,
+        json!({ "results": [], "has_more": false })
+    );
+
+    // 長い本文は一致の前後だけ
+    let long = send(json!({ "agent": "muse", "to": "grok", "text": format!("{}needle{}", "x".repeat(100), "y".repeat(200)) })).await;
+    let r = c.ok("search_messages", json!({ "query": "needle" })).await;
+    assert_eq!(hit_ids(&r), [id(&long)]);
+    assert_eq!(
+        r["results"][0]["excerpt"],
+        json!({ "before": format!("…{}", "x".repeat(60)), "match": "needle", "after": format!("{}…", "y".repeat(120)) })
+    );
+
+    // 検索は読むだけ（既読は変わらない）
+    let unread = c.ok("check_messages", json!({ "agent": "muse" })).await["unread_total"].clone();
+    assert_eq!(unread, 3);
+
+    for (args, error) in [
+        (json!({}), "\"query\" is required"),
+        (json!({ "query": "" }), "1-200 characters"),
+        (json!({ "query": "  " }), "1-200 characters"),
+        (json!({ "query": "x".repeat(201) }), "1-200 characters"),
+        (json!({ "query": 7 }), "1-200 characters"),
+    ] {
+        let text = c.err("search_messages", args).await;
+        assert!(text.starts_with("Error: \"query\""), "{text}");
+        assert!(text.contains(error), "{text}");
+    }
+}
+
+#[tokio::test]
+async fn search_messages_matches_like_wildcards_literally() {
+    let (_h, c) = setup().await;
+    for text in [
+        "progress: 100% done",
+        "progress: 100 percent",
+        "use snake_case here",
+        "use snakeXcase here",
+        r"path C:\temp\new",
+        "path C:temp",
+        "50%_off",
+    ] {
+        c.ok(
+            "send_message",
+            json!({ "agent": "muse", "to": "grok", "text": text }),
+        )
+        .await;
+    }
+    for (query, found) in [
+        ("100%", vec!["progress: 100% done"]),
+        ("%", vec!["50%_off", "progress: 100% done"]),
+        ("_", vec!["50%_off", "use snake_case here"]),
+        ("snake_case", vec!["use snake_case here"]),
+        (r"C:\temp", vec![r"path C:\temp\new"]),
+        (r"\", vec![r"path C:\temp\new"]),
+        ("%_", vec!["50%_off"]),
+        ("%%", vec![]),
+        ("__", vec![]),
+        (r"\%", vec![]),
+    ] {
+        let r = c.ok("search_messages", json!({ "query": query })).await;
+        assert_eq!(hit_texts(&r), found, "{query}");
+    }
+}
+
+#[tokio::test]
+async fn search_messages_stays_in_the_callers_room() {
+    let (h, mine) = setup().await;
+    h.allowed.write().unwrap().insert("1001".into());
+    let theirs = client_for(&h, "other").await;
+    let search = |c: &Client, q: &str| {
+        let (c, q) = (c.clone(), q.to_string());
+        async move { c.ok("search_messages", json!({ "query": q })).await }
+    };
+    assert_eq!(
+        search(&theirs, "secret").await,
+        json!({ "results": [], "has_more": false })
+    );
+    mine.ok(
+        "send_message",
+        json!({ "agent": "muse", "to": "grok", "text": "secret plan A" }),
+    )
+    .await;
+    assert_eq!(hit_texts(&search(&mine, "secret").await), ["secret plan A"]);
+    assert_eq!(
+        search(&theirs, "secret").await,
+        json!({ "results": [], "has_more": false })
+    );
+    theirs
+        .ok(
+            "send_message",
+            json!({ "agent": "muse", "to": "grok", "text": "secret plan B" }),
+        )
+        .await;
+    assert_eq!(hit_texts(&search(&mine, "secret").await), ["secret plan A"]);
+    assert_eq!(
+        hit_texts(&search(&theirs, "secret").await),
+        ["secret plan B"]
+    );
+    assert_eq!(
+        hit_texts(&search(&theirs, "plan A").await),
+        Vec::<String>::new()
+    );
+}
+
+#[tokio::test]
+async fn search_messages_returns_at_most_limit_newest_hits() {
+    let (_h, c) = setup().await;
+    let mut hits = Vec::new();
+    for i in 0..105 {
+        let m = c
+            .ok(
+                "send_message",
+                json!({ "agent": "muse", "to": "grok", "text": format!("hit {i}") }),
+            )
+            .await;
+        hits.push(m["message"]["id"].as_str().unwrap().to_string());
+        if i % 10 == 0 {
+            c.ok(
+                "send_message",
+                json!({ "agent": "muse", "to": "grok", "text": "miss" }),
+            )
+            .await;
+        }
+    }
+    let newest = |n: usize| -> Vec<String> { hits.iter().rev().take(n).cloned().collect() };
+    for (limit, n) in [
+        (Value::Null, 20),
+        (json!(3), 3),
+        (json!("5"), 5),
+        (json!(0), 20),
+        (json!(-4), 1),
+        (json!(100), 100),
+        (json!(1000), 100),
+    ] {
+        let mut args = json!({ "query": "hit" });
+        if !limit.is_null() {
+            args["limit"] = limit.clone();
+        }
+        let r = c.ok("search_messages", args).await;
+        assert_eq!(hit_ids(&r), newest(n), "limit {limit}");
+        assert_eq!(r["has_more"], true, "limit {limit}");
+    }
+    // "hit 1" は 1, 10-19, 100-104 の 16 件。ちょうど収まれば has_more は false
+    for (limit, more) in [(16, false), (15, true)] {
+        let r = c
+            .ok(
+                "search_messages",
+                json!({ "query": "hit 1", "limit": limit }),
+            )
+            .await;
+        assert_eq!(
+            r["results"].as_array().unwrap().len(),
+            15 + usize::from(!more)
+        );
+        assert_eq!(r["has_more"], more);
+        assert_eq!(r["results"][0]["excerpt"]["match"], "hit 1");
+        assert_eq!(r["results"][0]["id"].as_str().unwrap(), hits[104]);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MCP プロトコル
 
 #[tokio::test]
@@ -817,6 +1050,7 @@ async fn mcp_initialize_lists_symmetric_tools() {
             "check_messages",
             "get_thread",
             "list_threads",
+            "search_messages",
             "mark_read",
             "get_attachment",
             "list_agents",
@@ -835,6 +1069,16 @@ async fn mcp_initialize_lists_symmetric_tools() {
     assert_eq!(required("check_messages"), json!(["agent"]));
     assert_eq!(required("mark_read"), json!(["agent"]));
     assert_eq!(required("list_threads"), json!([]));
+    assert_eq!(required("search_messages"), json!(["query"]));
+    let search = tools
+        .iter()
+        .find(|t| t["name"] == "search_messages")
+        .unwrap();
+    assert_eq!(search["annotations"]["readOnlyHint"], true);
+    assert_eq!(
+        search["inputSchema"]["properties"]["limit"],
+        json!({ "type": "integer", "default": 20, "minimum": 1, "maximum": 100 })
+    );
     assert_eq!(required("list_agents"), json!([]));
     let list_agents = tools.iter().find(|t| t["name"] == "list_agents").unwrap();
     assert_eq!(
@@ -1072,6 +1316,14 @@ async fn retired_paths_are_gone_and_docs_describe_the_new_design() {
         assert!(
             docs.contains("- register_agent {agent, description? (max 500 characters, public),")
         );
+        assert!(docs.contains(
+            "- search_messages {query (1-200 characters), limit? (default 20, 1-100)} -> {results, has_more}"
+        ));
+        assert!(docs.contains("(including % _ and \\) must match exactly"));
+        assert!(docs.contains(
+            "- Search result: {id, thread_id, subject, from, to, created_at, excerpt: {before, match, after}}"
+        ));
+        assert!(docs.contains("up to 60 and 120 characters around it"));
         assert!(
             docs.contains("By default only the agents currently registered with register_agent")
         );

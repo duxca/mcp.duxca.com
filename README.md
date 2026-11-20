@@ -79,9 +79,12 @@ stdio の MCP バックエンド（`POST /{service}/{version}`、`/adb/v1` な�
   - 部屋ごと: 10000 件、本文などのデータ 32 MB（概算）、添付 32 MB、登録 100 件。全体: 20000 件、データ 64 MB、添付 `RELAY_MAX_TOTAL_STORAGE_BYTES`（既定 64 MB。部屋ごとの添付はその半分）
   - 同時に待機できる `ask` / `check_messages` は部屋ごと 16 件、全体 64 件。バッチは 32 件まで、応答は合計 16 MB まで
 - 待機は `ask` が最大 240 秒（既定 55 秒）、`check_messages` が最大 55 秒。Ctrl+C では待機中のものも即座に返して止まる
+- `search_messages` は呼び出し元の部屋の全スレッドから、本文の部分一致でメッセージを新しい順に返す（既定 20 件、最大 100 件）
+  - 引数は `query`（1–200 文字）と `limit`。返り値は `{results: [{id, thread_id, subject, from, to, created_at, excerpt: {before, match, after}}], has_more}`。抜粋は一致の前 60 文字・後ろ 120 文字まで
+  - SQLite の `LIKE … ESCAPE '\'` で部屋のメッセージを新しい方から舐める（索引は無い。部屋あたり最大 1 万件）。検索語の `%` `_` `\` は文字そのものとして扱い、大文字小文字は ASCII だけ区別しない
 
-ツール: `send_message` / `ask` / `check_messages` / `get_thread` / `list_threads` / `mark_read` / `get_attachment` /
-`list_agents` / `register_agent` / `unregister_agent`。引数と返り値は `GET /relay/v1/docs` が正。
+ツール: `send_message` / `ask` / `check_messages` / `get_thread` / `list_threads` / `search_messages` / `mark_read` /
+`get_attachment` / `list_agents` / `register_agent` / `unregister_agent`。引数と返り値は `GET /relay/v1/docs` が正。
 
 | Method | Path | 認証 | 説明 |
 |--------|------|------|------|
@@ -102,9 +105,11 @@ stdio の MCP バックエンド（`POST /{service}/{version}`、`/adb/v1` な�
 - `{PUBLIC_URL}/relay/callback` が `OAUTH_REDIRECT_ALLOWLIST` に要る（本番は `terraform_gcp_app/prod.tfvars` に入れてある）。
   ローカルは既定の allowlist の `http://127.0.0.1/` がポートを問わず通すので、`PUBLIC_URL` と同じオリジン（例 `http://127.0.0.1:8000/relay/`）で開けばよい。
   `localhost` と `127.0.0.1` を取り違えると resource が合わず `invalid_target` になる
-- 使うツールは `list_agents` `list_threads` `get_thread` `send_message` `check_messages` `mark_read` `register_agent`（と添付の `get_attachment`）。
+- 使うツールは `list_agents` `list_threads` `get_thread` `send_message` `check_messages` `mark_read` `register_agent` `search_messages`（と添付の `get_attachment`）。
   `user` が未登録のときだけ、ログイン直後に webhook 無しで `register_agent` する（既にあれば説明文も持ち主も触らない）
 - 受信は `check_messages`（`wait_seconds=55`）の long-poll。タブが背面の間は止める。スレッドの参加者はメッセージの from/to から求める
+- 「検索」タブ（`#/search?q=…`）は `search_messages`（`limit=50`）の結果を、件名・送り主 → 宛先・時刻・一致箇所の抜粋で並べる。
+  押すと `#/t/<thread_id>?m=<message_id>` でスレッドを開き、そのメッセージまでスクロールして枠で示す。一覧に戻っても結果は取り直さない（「更新」で取り直す）
 - 本文は DOM のテキストとしてだけ描く（Markdown も HTML も解釈しない）。CSP は `default-src 'none'`、接続先は自オリジンだけ、Trusted Types を要求
 
 ### 会話ログ

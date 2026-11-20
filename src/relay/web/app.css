@@ -12,6 +12,7 @@
   --error-bg: #fdecea;
   --warn-bg: #fff4e5;
   --ok: #188038;
+  --mark: #fde293;
   --top-h: 3rem;
   color-scheme: light dark;
 }
@@ -31,6 +32,7 @@
     --error-bg: #3c1f1e;
     --warn-bg: #3a2f1c;
     --ok: #81c995;
+    --mark: #6b5500;
   }
 }
 
@@ -96,8 +98,9 @@ a { color: var(--accent); }
   flex: none;
 }
 .top h1 { font-size: 1.05rem; margin: 0 .3rem 0 .2rem; }
-.tabs { display: flex; gap: .1rem; }
+.tabs { display: flex; gap: .1rem; flex: none; }
 .tabs a {
+  white-space: nowrap;
   display: inline-flex;
   align-items: center;
   min-height: 2.5rem;
@@ -120,9 +123,11 @@ a { color: var(--accent); }
   white-space: nowrap;
 }
 .conn span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.top button.link { white-space: nowrap; flex: none; }
 @media (max-width: 480px) {
+  .top { gap: .3rem; }
   .top h1 { display: none; }
-  .tabs a { padding: 0 .5rem; }
+  .tabs a { padding: 0 .4rem; }
 }
 .conn::before { content: "●"; color: var(--muted); }
 .conn.waiting::before { color: var(--ok); }
@@ -253,6 +258,28 @@ a { color: var(--accent); }
 }
 
 /* 一覧 */
+.list-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.search input {
+  flex: 1;
+  min-width: 0;
+  min-height: 2.25rem;
+  /* iOS が拡大しないよう 16px 以上 */
+  font-size: 16px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  padding: .35rem .5rem;
+}
+mark {
+  background: var(--mark);
+  color: inherit;
+  border-radius: 2px;
+}
 .list {
   list-style: none;
   margin: 0;
@@ -282,6 +309,17 @@ a { color: var(--accent); }
 }
 .list .desc, .list .meta { font-size: .85rem; color: var(--muted); overflow-wrap: anywhere; }
 .list .desc { white-space: pre-wrap; margin-top: .15rem; }
+.list .excerpt {
+  font-size: .9rem;
+  margin-top: .15rem;
+  overflow-wrap: anywhere;
+  /* 一致は前を短く切ってあるので 1 行目か 2 行目に来る */
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  overflow: hidden;
+}
 .list .actions { display: flex; gap: .4rem; padding: 0 .8rem .6rem; }
 .list .actions a { font-size: .9rem; }
 .empty { padding: 1.5rem .8rem; color: var(--muted); }
@@ -323,6 +361,7 @@ a { color: var(--accent); }
 .msg.mine { align-self: flex-end; background: var(--mine); }
 .msg.pending { opacity: .75; border-style: dashed; }
 .msg.failed { opacity: 1; border-color: var(--error); }
+.msg.hit { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent); }
 .msg .meta { font-size: .75rem; color: var(--muted); display: flex; flex-wrap: wrap; gap: 0 .5rem; }
 .msg .meta .from { font-weight: 600; color: var(--text); }
 .msg .meta .new { font-weight: 600; color: var(--accent); }
