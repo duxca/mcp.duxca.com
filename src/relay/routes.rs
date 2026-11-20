@@ -1,5 +1,6 @@
 //! `/relay/v1` の HTTP 部分。本体（`POST /relay/v1`）の認証はゲートウェイ側（`crate::routes`）で行い、
 //! ここには認証済みの部屋（subject）とリクエストが来る。配下の公開パスは health と docs だけ。
+//! チャット画面（`/relay/`）は `super::web`。
 
 use super::mcp;
 use super::{docs, Relay, RelayError, MAX_BODY_BYTES, PREFIX};
@@ -21,6 +22,7 @@ pub fn router(relay: Arc<Relay>) -> Router {
         .route(&path("/llms.txt"), any(docs_text))
         .route(&path("/{*rest}"), any(not_found))
         .with_state(relay)
+        .merge(super::web::router())
 }
 
 fn json_response(status: u16, body: &Value) -> Response {

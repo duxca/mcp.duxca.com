@@ -51,7 +51,7 @@ cargo run   # Tunnel 無しのゲートウェイ単体（PUBLIC_URL 必須）
 `/` と `/health` は無い（空の 404）。旧パス `/mcp/v3` は廃止（サブドメイン `mcp.` と重複するため）。
 stdio の MCP バックエンド（`POST /{service}/{version}`、`/adb/v1` など）は撤去した。いまは 404 を返す。
 
-加えて、組み込みの relay が常に `/relay/v1`（MCP）と `/relay/v1/{health,docs,llms.txt,docs.md}` に生える（次節）。
+加えて、組み込みの relay が常に `/relay/v1`（MCP）と `/relay/v1/{health,docs,llms.txt,docs.md}` に生え、`/relay/` にブラウザ用のチャット画面がある（次節）。
 
 ## relay（エージェント間メッセージ、`/relay/v1`）
 
@@ -88,6 +88,24 @@ stdio の MCP バックエンド（`POST /{service}/{version}`、`/adb/v1` な�
 | POST | `/relay/v1` | OAuth Bearer（resource = relay） | MCP JSON-RPC（stateless streamable HTTP、バッチ可）。GET は 405、DELETE は 200 |
 | GET | `/relay/v1/health` | なし | `{"status":"ok"}` |
 | GET | `/relay/v1/docs`（`/llms.txt`, `/docs.md`） | なし | エージェント向けの使い方（テキスト） |
+| GET | `/relay/`（`/relay/callback`） | なし | チャット画面（静的ファイル、CSP 付き）。`/relay` は `/relay/` へ 308 |
+| GET | `/relay/app.js`, `/relay/app.css` | なし | 画面のスクリプトとスタイル |
+
+### チャット画面（`/relay/`）
+
+持ち主がブラウザから agent `user` として relay のエージェントと会話する画面。ファイルは `src/relay/web/` にあり、
+`include_str!` でバイナリに埋め込む（ビルド手順は増えない）。
+
+- 認可は画面が自分で行う。初回に `POST /register` で公開クライアント（`token_endpoint_auth_method: none`、
+  redirect_uri は `{PUBLIC_URL}/relay/callback` だけ）を登録し、authorization code + PKCE（S256）、`resource={PUBLIC_URL}/relay/v1`。
+  アクセストークンはメモリ、リフレッシュトークンと client_id は localStorage。401 なら refresh を 1 回試し、駄目ならログインし直す
+- `{PUBLIC_URL}/relay/callback` が `OAUTH_REDIRECT_ALLOWLIST` に要る（本番は `terraform_gcp_app/prod.tfvars` に入れてある）。
+  ローカルは既定の allowlist の `http://127.0.0.1/` がポートを問わず通すので、`PUBLIC_URL` と同じオリジン（例 `http://127.0.0.1:8000/relay/`）で開けばよい。
+  `localhost` と `127.0.0.1` を取り違えると resource が合わず `invalid_target` になる
+- 使うツールは `list_agents` `list_threads` `get_thread` `send_message` `check_messages` `mark_read` `register_agent`（と添付の `get_attachment`）。
+  `user` が未登録のときだけ、ログイン直後に webhook 無しで `register_agent` する（既にあれば説明文も持ち主も触らない）
+- 受信は `check_messages`（`wait_seconds=55`）の long-poll。タブが背面の間は止める。スレッドの参加者はメッセージの from/to から求める
+- 本文は DOM のテキストとしてだけ描く（Markdown も HTML も解釈しない）。CSP は `default-src 'none'`、接続先は自オリジンだけ、Trusted Types を要求
 
 ### 会話ログ
 

@@ -2419,3 +2419,137 @@ async fn untrusted_values_cannot_forge_log_lines() {
         "forged line in:\n{out}"
     );
 }
+
+/// `/relay/` のチャット画面。静的ファイルは CSP 付きで返し、既存の relay と OAuth の経路は変えない。
+#[tokio::test]
+async fn relay_chat_page_is_served_with_a_strict_csp() {
+    let h = harness();
+    for path in ["/relay/", "/relay/callback?code=c&state=s"] {
+        let r = get(&h.app, path).await;
+        assert_eq!(r.status, StatusCode::OK, "{path}");
+        assert_eq!(
+            r.headers[header::CONTENT_TYPE],
+            "text/html; charset=utf-8",
+            "{path}"
+        );
+        assert_eq!(r.headers[header::CACHE_CONTROL], "no-store", "{path}");
+        assert_eq!(r.headers[header::REFERRER_POLICY], "no-referrer", "{path}");
+        assert!(r.body.contains(r#"src="/relay/app.js""#), "{path}");
+        let csp = r.headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+        for directive in [
+            "default-src 'none'",
+            "script-src 'self'",
+            "connect-src 'self'",
+            "frame-ancestors 'none'",
+            "require-trusted-types-for 'script'",
+        ] {
+            assert!(csp.contains(directive), "{path}: {csp}");
+        }
+        assert!(!csp.contains("unsafe-inline"), "{csp}");
+    }
+
+    let r = get(&h.app, "/relay").await;
+    assert_eq!(r.status, StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(r.headers[header::LOCATION], "/relay/");
+
+    for (path, content_type) in [
+        ("/relay/app.js", "text/javascript; charset=utf-8"),
+        ("/relay/app.css", "text/css; charset=utf-8"),
+    ] {
+        let r = get(&h.app, path).await;
+        assert_eq!(r.status, StatusCode::OK, "{path}");
+        assert_eq!(r.headers[header::CONTENT_TYPE], content_type, "{path}");
+        assert_eq!(r.headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        assert!(r.headers.contains_key(header::CONTENT_SECURITY_POLICY));
+    }
+    // 画面は本文を HTML として解釈させない
+    let js = get(&h.app, "/relay/app.js").await.body;
+    for sink in [
+        "innerHTML",
+        "outerHTML",
+        "insertAdjacentHTML",
+        "document.write",
+        "eval(",
+    ] {
+        assert!(!js.contains(sink), "{sink}");
+    }
+
+    assert_eq!(
+        get(&h.app, "/relay/unknown").await.status,
+        StatusCode::NOT_FOUND
+    );
+    let r = send(
+        &h.app,
+        Request::post("/relay/").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::METHOD_NOT_ALLOWED);
+
+    // 既存の relay の経路はそのまま
+    let r = get(&h.app, "/relay/v1/health").await;
+    assert_eq!(
+        (r.status, r.json()),
+        (StatusCode::OK, json!({ "status": "ok" }))
+    );
+    assert!(!r.headers.contains_key(header::CONTENT_SECURITY_POLICY));
+    assert_eq!(mcp(&h.app, None, 1).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        get(&h.app, "/relay/v1/nope").await.status,
+        StatusCode::NOT_FOUND
+    );
+}
+
+/// 画面はログインの前に、保存してある client_id がまだ有効かを `/revoke` で確かめる。
+#[tokio::test]
+async fn revoke_tells_a_forgotten_client_from_a_known_one() {
+    let h = harness();
+    let client_id = register_client(&h.app).await;
+    let known = post_form(
+        &h.app,
+        "/revoke",
+        &[("client_id", &client_id), ("token", "probe")],
+    )
+    .await;
+    assert_eq!(known.status, StatusCode::OK, "{}", known.body);
+    let unknown = post_form(
+        &h.app,
+        "/revoke",
+        &[("client_id", "no-such-client"), ("token", "probe")],
+    )
+    .await;
+    assert_eq!(unknown.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(unknown.json()["error"], "invalid_client");
+}
+
+/// 本番の redirect allowlist（terraform_gcp_app/prod.tfvars）。起動時に読めないと落ちるので、ここで読む。
+#[test]
+fn prod_redirect_allowlist_admits_the_relay_chat_callback() {
+    let tfvars = include_str!("../terraform_gcp_app/prod.tfvars");
+    let value = tfvars
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("oauth_redirect_allowlist"))
+        .and_then(|rest| rest.trim().strip_prefix('='))
+        .map(|v| v.trim().trim_matches('"'))
+        .expect("oauth_redirect_allowlist in prod.tfvars");
+    let allowlist = RedirectAllowlist::parse(value.split(',')).unwrap();
+    for ok in [
+        "https://mcp.duxca.com/relay/callback",
+        "https://claude.ai/api/mcp/auth_callback",
+        "https://grok.com/oauth/callback",
+        // ローカル開発の画面（PUBLIC_URL=http://127.0.0.1:8000）。ポート無しのループバック項目はポートを問わない
+        "http://127.0.0.1:8000/relay/callback",
+        "http://localhost:8000/relay/callback",
+    ] {
+        assert!(allowlist.allows(ok), "{ok}");
+    }
+    for bad in [
+        "https://mcp.duxca.com/relay/callback/x",
+        "https://mcp.duxca.com/relay/",
+        "https://mcp.duxca.com/relay/callback#x",
+        "http://mcp.duxca.com/relay/callback",
+        "https://mcp.duxca.com:8443/relay/callback",
+        "https://evil.mcp.duxca.com/relay/callback",
+    ] {
+        assert!(!allowlist.allows(bad), "{bad}");
+    }
+}
