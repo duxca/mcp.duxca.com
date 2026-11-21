@@ -41,6 +41,11 @@ pub const MAX_THREAD_MESSAGES: usize = 500;
 pub const MAX_AGENT_NAME: usize = 64;
 /// register_agent の description（役割の自己紹介）。text と同じく UTF-16 で数える。
 pub const MAX_AGENT_DESCRIPTION: usize = 500;
+/// search_messages の検索語。text と同じく UTF-16 で数える。
+pub const MAX_QUERY: usize = 200;
+/// search_messages の抜粋に入れる、一致箇所の前と後ろの文字数。
+pub const EXCERPT_BEFORE: usize = 60;
+pub const EXCERPT_AFTER: usize = 120;
 /// メッセージ（と添付）を残す日数。スレッドは最後のメッセージと一緒に消える。登録は消さない。
 pub const RETENTION_DAYS: i64 = 7;
 const RETENTION_MS: i64 = RETENTION_DAYS * 24 * 60 * 60 * 1000;
@@ -218,6 +223,27 @@ pub struct ThreadView {
     pub message_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unread_count: Option<usize>,
+}
+
+/// 一致箇所（`match`）とその前後。切り詰めた側には `…` が付く。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Excerpt {
+    pub before: String,
+    #[serde(rename = "match")]
+    pub matched: String,
+    pub after: String,
+}
+
+/// search_messages の 1 件。本文の全体は get_thread で読む。
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchHit {
+    pub id: String,
+    pub thread_id: String,
+    pub subject: String,
+    pub from: String,
+    pub to: String,
+    pub created_at: String,
+    pub excerpt: Excerpt,
 }
 
 /// `get_attachment` 用。
@@ -489,6 +515,68 @@ fn utf16_prefix(s: &str, n: usize) -> &str {
         }
     }
     s
+}
+
+/// search_messages の検索語。照合は書かれたとおり（前後の空白も含む）に行う。
+/// NUL は SQLite の LIKE がそこで文字列を打ち切るので断る。
+fn search_query(v: &Value) -> Result<String, RelayError> {
+    match v {
+        Value::String(s)
+            if !js::trim(s).is_empty() && utf16_len(s) <= MAX_QUERY && !s.contains('\0') =>
+        {
+            Ok(s.clone())
+        }
+        Value::Null => Err(RelayError::bad_request("\"query\" is required")),
+        _ => Err(RelayError::bad_request(format!(
+            "\"query\" must be a string of 1-{MAX_QUERY} characters, not only whitespace"
+        ))),
+    }
+}
+
+/// 部分一致の LIKE パターン（`ESCAPE '\'` で使う）。検索語の `\` `%` `_` は文字そのものにする。
+fn like_pattern(query: &str) -> String {
+    let mut pattern = String::with_capacity(query.len() + 2);
+    pattern.push('%');
+    for c in query.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            pattern.push('\\');
+        }
+        pattern.push(c);
+    }
+    pattern.push('%');
+    pattern
+}
+
+/// `text` の中で最初に `query` と一致する箇所と、その前後（`EXCERPT_BEFORE` / `EXCERPT_AFTER` 文字）。
+/// SQLite の LIKE と同じく、大文字小文字は ASCII だけ同一視する。
+fn excerpt(text: &str, query: &str) -> Excerpt {
+    let q = query.as_bytes();
+    let found = text.char_indices().find_map(|(start, _)| {
+        let end = start + q.len();
+        let bytes = text.as_bytes().get(start..end)?;
+        (bytes.eq_ignore_ascii_case(q) && text.is_char_boundary(end)).then_some((start, end))
+    });
+    // LIKE が一致した行しか来ないので、見つからないのは NUL を含む本文くらい。先頭から出す
+    let (start, end) = found.unwrap_or((0, 0));
+    let head = &text[..start];
+    let tail = &text[end..];
+    let before = match head
+        .char_indices()
+        .rev()
+        .nth(EXCERPT_BEFORE.saturating_sub(1))
+    {
+        Some((i, _)) if i > 0 => format!("…{}", &head[i..]),
+        _ => head.to_string(),
+    };
+    let after = match tail.char_indices().nth(EXCERPT_AFTER) {
+        Some((i, _)) => format!("{}…", &tail[..i]),
+        None => tail.to_string(),
+    };
+    Excerpt {
+        before,
+        matched: text[start..end].to_string(),
+        after,
+    }
 }
 
 /// `wait` の秒数（null / 空文字は 0、上限 280）。
@@ -1189,6 +1277,53 @@ impl Store {
         Ok(json!({ "threads": threads }))
     }
 
+    /// 部屋内のメッセージ（全スレッド・全送り主）を本文の部分一致で新しい順に。`has_more` はまだ一致があるか。
+    /// いまは LIKE で部屋のメッセージを新しい方から舐める（部屋あたり高々 `room_messages` 件）。
+    /// 索引（FTS など）に替えるときも、この引数と返り値のまま中だけを差し替える。
+    pub fn search_messages(
+        &self,
+        room: &str,
+        query: &Value,
+        limit: &Value,
+    ) -> Result<Value, RelayError> {
+        let query = search_query(query)?;
+        let limit = clamp_limit(limit, 20.0, 100.0);
+        let rows = self.db.read(|c| {
+            c.prepare_cached(
+                "SELECT m.id, m.thread_id, t.subject, m.sender, m.recipient, m.created_at, m.text \
+                 FROM relay_messages AS m JOIN relay_threads AS t ON t.room = m.room AND t.id = m.thread_id \
+                 WHERE m.room = ?1 AND m.text LIKE ?2 ESCAPE '\\' ORDER BY m.id DESC LIMIT ?3",
+            )?
+            .query_map(
+                params![room, like_pattern(&query), limit as i64 + 1],
+                |r| {
+                    let hit = SearchHit {
+                        id: r.get::<_, i64>(0)?.to_string(),
+                        thread_id: r.get(1)?,
+                        subject: r.get(2)?,
+                        from: r.get(3)?,
+                        to: r.get(4)?,
+                        created_at: iso_ms(r.get(5)?),
+                        excerpt: Excerpt::default(),
+                    };
+                    Ok((hit, r.get::<_, String>(6)?))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()
+        })?;
+        let has_more = rows.len() > limit;
+        // 抜粋は DB のロックを放してから作る（接続は OAuth と共有している）
+        let hits: Vec<SearchHit> = rows
+            .into_iter()
+            .take(limit)
+            .map(|(hit, text)| SearchHit {
+                excerpt: excerpt(&text, &query),
+                ..hit
+            })
+            .collect();
+        Ok(json!({ "results": hits, "has_more": has_more }))
+    }
+
     /// `agent` 宛てのメッセージを既読にする。`message_ids` > `thread_id` > `up_to_cursor`。
     pub fn mark_read(&self, room: &str, agent: &str, body: &Value) -> Result<Value, RelayError> {
         let empty = Map::new();
@@ -1513,6 +1648,68 @@ mod store_tests {
         assert_eq!(utf16_prefix("a😀b", 2), "a");
         assert_eq!(utf16_prefix("a😀b", 3), "a😀");
         assert_eq!(utf16_prefix("abc", 80), "abc");
+    }
+
+    #[test]
+    fn like_patterns_escape_the_wildcards() {
+        assert_eq!(like_pattern("abc"), "%abc%");
+        assert_eq!(like_pattern(r"100%_\n"), r"%100\%\_\\n%");
+        assert_eq!(like_pattern("本番"), "%本番%");
+    }
+
+    #[test]
+    fn excerpts_cut_around_the_first_match() {
+        let parts = |e: Excerpt| (e.before, e.matched, e.after);
+        let s = |v: &str| v.to_string();
+        assert_eq!(
+            parts(excerpt("say Hello, hello", "hello")),
+            (s("say "), s("Hello"), s(", hello"))
+        );
+        // ASCII 以外は大文字小文字を同一視しない（LIKE と同じ）
+        assert_eq!(parts(excerpt("Ä and ä", "ä")), (s("Ä and "), s("ä"), s("")));
+        let text = format!("{}NEEDLE{}", "あ".repeat(100), "😀".repeat(200));
+        assert_eq!(
+            parts(excerpt(&text, "needle")),
+            (
+                format!("…{}", "あ".repeat(60)),
+                s("NEEDLE"),
+                format!("{}…", "😀".repeat(120))
+            )
+        );
+        // ちょうど収まるなら … は付けない
+        let text = format!("{}x{}", "a".repeat(60), "b".repeat(120));
+        assert_eq!(
+            parts(excerpt(&text, "x")),
+            ("a".repeat(60), s("x"), "b".repeat(120))
+        );
+        // 一致しない（LIKE が NUL で打ち切った本文）なら先頭から
+        assert_eq!(parts(excerpt("a\0b", "zz")), (s(""), s(""), s("a\0b")));
+    }
+
+    #[test]
+    fn search_queries_are_validated() {
+        for ok in ["a", " a ", "100%", "本番", "😀", &"x".repeat(200), "a\nb"] {
+            assert_eq!(search_query(&json!(ok)).unwrap(), ok);
+        }
+        assert_eq!(
+            search_query(&Value::Null).unwrap_err().message,
+            "\"query\" is required"
+        );
+        for bad in [
+            json!(""),
+            json!(" \n\u{3000}"),
+            json!("x".repeat(201)),
+            json!("😀".repeat(101)),
+            json!("a\u{0}b"),
+            json!(1),
+            json!(["a"]),
+        ] {
+            assert_eq!(
+                search_query(&bad).unwrap_err().message,
+                "\"query\" must be a string of 1-200 characters, not only whitespace",
+                "{bad}"
+            );
+        }
     }
 
     #[test]
